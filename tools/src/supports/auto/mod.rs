@@ -3,6 +3,7 @@ use common::{
     units::{Milimeter, Milimeters},
 };
 use nalgebra::Vector3;
+use rayon::prelude::*;
 use slicer::geometry::{
     mesh::{HalfEdgeMesh, Mesh},
     partitioning::Bvh,
@@ -88,7 +89,7 @@ impl AutoPlacement {
         let tip_length = self.support.tip_length.get::<Milimeter>();
         let contact_depth = self.support.contact_depth.get::<Milimeter>();
         overhangs
-            .into_iter()
+            .into_par_iter()
             .filter_map(|x| {
                 let routed = route_support(
                     mesh,

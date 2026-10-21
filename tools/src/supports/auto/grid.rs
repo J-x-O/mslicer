@@ -10,6 +10,7 @@
 
 use common::progress::Progress;
 use nalgebra::Vector3;
+use rayon::prelude::*;
 use slicer::geometry::{Hit, bounds::Bounds3D, mesh::Mesh, partitioning::Bvh};
 
 /// Target number of cells over the model footprint (from the plan, §1.1).
@@ -105,35 +106,40 @@ pub fn sample_surface(
 
     progress.set_total(grid.cell_count() as u64);
 
-    let mut samples = Vec::new();
-    for row in 0..grid.height {
-        for col in 0..grid.width {
-            let xy = grid.cell_centre(col, row);
-            let origin = Vector3::new(xy.x, xy.y, z_top);
+    // Every grid column is an independent vertical ray; cast them in parallel
+    // and flatten the per-column downward-facing samples (plan §9.5 calls the
+    // ray grid the dominant cost).
+    (0..grid.height)
+        .into_par_iter()
+        .flat_map_iter(|row| {
+            (0..grid.width).map(move |col| {
+                let xy = grid.cell_centre(col, row);
+                let origin = Vector3::new(xy.x, xy.y, z_top);
 
-            // Hits arrive sorted by `t` (distance); even indices are entries
-            // (top surfaces), odd indices are exits (downward surfaces).
-            // Hits arrive sorted by `t` (distance). A ray that grazes the
-            // shared diagonal of a quads hits both of its triangles at the same
-            // `t`, so collapse near-duplicate crossings before pairing into
-            // (entry, exit) intervals. Even indices are entries (top surfaces),
-            // odd indices are exits (downward surfaces).
-            let raw = bvh.intersect_ray_all(mesh, origin, -Vector3::z());
-            for exit in collapse_coplanar(raw).into_iter().skip(1).step_by(2) {
-                samples.push(SurfaceSample {
-                    pos: mesh.transform(&exit.position),
-                    normal: mesh.transform_normal(&mesh.normal(exit.face)).normalize(),
-                    face: exit.face,
-                    col,
-                    row,
-                });
-            }
-
-            progress.add_complete(1);
-        }
-    }
-
-    samples
+                // Hits arrive sorted by `t` (distance); even indices are entries
+                // (top surfaces), odd indices are exits (downward surfaces). A
+                // ray that grazes the shared diagonal of a quads hits both of its
+                // triangles at the same `t`, so collapse near-duplicate crossings
+                // before pairing into (entry, exit) intervals.
+                let raw = bvh.intersect_ray_all(mesh, origin, -Vector3::z());
+                let samples: Vec<SurfaceSample> = collapse_coplanar(raw)
+                    .into_iter()
+                    .skip(1)
+                    .step_by(2)
+                    .map(|exit| SurfaceSample {
+                        pos: mesh.transform(&exit.position),
+                        normal: mesh.transform_normal(&mesh.normal(exit.face)).normalize(),
+                        face: exit.face,
+                        col,
+                        row,
+                    })
+                    .collect();
+                progress.add_complete(1);
+                samples
+            })
+        })
+        .flatten()
+        .collect()
 }
 
 /// Collapses hits that share (nearly) the same distance along the ray, which
