@@ -6,6 +6,7 @@ use egui_phosphor::regular::{INFO, MAGNIFYING_GLASS};
 use egui_wgpu::Callback;
 use nalgebra::{Matrix4, Rotation3, Vector2, Vector3};
 use slicer::geometry::bounds::Bounds2D;
+use tools::supports::PartKind;
 
 use crate::{
     core::{
@@ -292,20 +293,30 @@ fn paint_hover_overlay(ui: &mut Ui, app: &mut App, hover: GeometryHit, px: Pos2)
                                 ui.label(format!("#{}", id.raw()));
                                 ui.end_row();
 
+                                let tip_cone =
+                                    support.parts.iter().find(|p| p.kind == PartKind::TipCone);
+                                let pillar =
+                                    support.parts.iter().find(|p| p.kind == PartKind::Pillar);
+
                                 ui.label("Radius");
                                 ui.label(format!(
                                     "{:.2}mm ({:.2}mm tip)",
-                                    support.radius, support.tip_radius
+                                    tip_cone.map(|p| p.radius_b).unwrap_or(0.0),
+                                    tip_cone.map(|p| p.radius_a).unwrap_or(0.0),
                                 ));
                                 ui.end_row();
 
                                 ui.label("Touch Point");
                                 ui.vertical(|ui| {
-                                    ui.label(format_vector(&support.points[0]));
+                                    ui.label(format_vector(&support.point.pos));
 
                                     if detail {
-                                        ui.label(format_vector(&support.points[1]));
-                                        ui.label(format_vector(&support.points[2]));
+                                        if let Some(tip) = tip_cone {
+                                            ui.label(format_vector(&tip.b));
+                                        }
+                                        if let Some(p) = pillar {
+                                            ui.label(format_vector(&p.a));
+                                        }
                                     }
                                 });
                                 ui.end_row();
