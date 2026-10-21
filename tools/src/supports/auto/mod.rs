@@ -1,18 +1,17 @@
-use std::f32::consts::TAU;
-
 use common::{
     progress::Progress,
     units::{Milimeter, Milimeters},
 };
 use nalgebra::Vector3;
 use slicer::geometry::{
-    mesh::{HalfEdgeMesh, Mesh, orthogonal_basis},
+    mesh::{HalfEdgeMesh, Mesh},
     partitioning::Bvh,
 };
 use tracing::info;
 
 use crate::supports::mesh::SupportPreset;
 
+pub mod collision;
 pub mod detect;
 pub mod grid;
 pub mod points;
@@ -135,12 +134,12 @@ pub fn route_support(
             return None;
         }
 
-        if !intersect_cylinder(mesh, bvh, radius, (position, joint))
-            && !intersect_cylinder(mesh, bvh, radius, (joint, joint.xy().to_homogeneous()))
+        if !collision::link_test(mesh, bvh, position, joint, radius)
+            && !collision::main_test(mesh, bvh, joint, joint.xy().to_homogeneous(), radius)
         {
             // Steepen the arm further while it stays clear of the model.
             while joint.z > 2.0
-                && !intersect_cylinder(mesh, bvh, radius, (position, joint - Vector3::z()))
+                && !collision::link_test(mesh, bvh, position, joint - Vector3::z(), radius)
             {
                 joint.z -= 1.0
             }
@@ -159,30 +158,6 @@ pub fn route_support(
 fn intersect_tip(mesh: &Mesh, bvh: &Bvh, contact: Vector3<f32>, end: Vector3<f32>) -> bool {
     let start = contact + (end - contact).normalize() * 0.01;
     bvh.intersect_segment(mesh, start, end).is_some()
-}
-
-fn intersect_cylinder(
-    mesh: &Mesh,
-    bvh: &Bvh,
-    radius: f32,
-    (start, end): (Vector3<f32>, Vector3<f32>),
-) -> bool {
-    let n = 4;
-
-    let [u, v] = orthogonal_basis((end - start).normalize());
-    for i in 0..n {
-        let t = i as f32 / n as f32 * TAU;
-        let offset = (u * t.cos() + v * t.sin()) * radius;
-
-        if bvh
-            .intersect_segment(mesh, start + offset, end + offset)
-            .is_some()
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 impl Default for PlacementConfig {
