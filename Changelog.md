@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.10.0 &mdash; Coming Soon™
+## v0.10.0 &mdash; October 21st, 2026
 
 - Merge lift and retract distance settings.
   In practice they should always be the same and the setting was only supported by `.goo`
@@ -105,12 +105,12 @@
 - Notes panel
 - Only re-calculate model bounds when they change
 - Camera 'View All' button to change the target/distance to show all visible models
-- Use 32 bit integer for run lengths
 - Shift drag to select multiple models
 - Combine MeshDefective and MeshVolume into one task (MeshAnalysis)
 - Don't build acceleration structures by default
 - Use bilinear interpolation when SSAO scale is < 1
-- Image tool
+- Image Layer tool
+- Show tool descriptions on hover
 
 ## v0.9.2 &mdash; August 30th, 2026
 

@@ -3,6 +3,8 @@
 This is just a place for me to remember and plan features I want to add and bugs to fix.
 Feel free to help out :eyes:.
 
+after releasing v0.10.0 start using feature branches.
+
 ## Bugs
 
 - check if slicing with spacemouse button causes crash
@@ -12,6 +14,7 @@ Feel free to help out :eyes:.
 - if you make changes to a project in the time that it takes for another project to load, your changes will be deleted
   - lock while loading project or saving before close!
 - don't allow starting multiple build acc structure tasks!
+- sliced memory usage doesn't consider arc repeated layers
 
 ## Features
 
@@ -36,6 +39,9 @@ Feel free to help out :eyes:.
 - two stage lift config!! (how have i left this unimplemented for so long!)
 - slice config presets
 - configurable (and viewable) key binds
+- render scale!
+- only render viewport on change (will require `scene_dirty` flag)
+- temporal accumulation (w jitter), sucks but ig thats just how you do rendering these days
 
 ## Documentation
 
