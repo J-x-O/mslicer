@@ -229,10 +229,19 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         }
 
         let intersection = model.mesh.transform(&intersection.position);
-        let start = intersection + normal * config.tip_length.get::<Milimeter>();
 
         let radius = (config.radius + config.margin).get::<Milimeter>();
-        if let Some(middle) = route_support(&model.mesh, bvh, radius, intersection, start) {
+        let tip_length = config.tip_length.get::<Milimeter>();
+        let contact_depth = config.contact_depth.get::<Milimeter>();
+        if let Some((start, middle)) = route_support(
+            &model.mesh,
+            bvh,
+            radius,
+            tip_length,
+            contact_depth,
+            intersection,
+            normal,
+        ) {
             let (r, p) = (config.radius.get::<Milimeter>(), 100);
             builder.add_cylinder((intersection, start), (tip_r, r), p);
             builder.add_cylinder((start, middle), (r, r), p);

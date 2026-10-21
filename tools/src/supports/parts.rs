@@ -134,48 +134,66 @@ impl SupportSet {
         let foot_xy = joint.xy();
         let foot = Foot::Plate { xy: foot_xy };
 
+        let normal = {
+            let d = tip - contact;
+            if d.magnitude_squared() > f32::EPSILON {
+                d.normalize()
+            } else {
+                -Vector3::z()
+            }
+        };
+
+        let mut parts = vec![
+            Part {
+                kind: PartKind::ContactSphere,
+                a: contact,
+                b: contact,
+                radius_a: tip_radius,
+                radius_b: tip_radius,
+                shape: Shape::Round,
+            },
+            Part {
+                kind: PartKind::TipCone,
+                a: contact,
+                b: tip,
+                radius_a: tip_radius,
+                radius_b: radius,
+                shape: Shape::Round,
+            },
+        ];
+
+        // The link only exists when the pillar sits laterally from the tip end.
+        // A straight drop has `tip == joint`, so there is no link; emitting a
+        // zero-length cylinder would feed a degenerate normal into the mesher.
+        if (tip - joint).magnitude_squared() > f32::EPSILON {
+            parts.push(Part {
+                kind: PartKind::Link,
+                a: tip,
+                b: joint,
+                radius_a: radius,
+                radius_b: radius,
+                shape: Shape::Round,
+            });
+        }
+
+        parts.push(Part {
+            kind: PartKind::Pillar,
+            a: joint,
+            b: joint.xy().push(0.0),
+            radius_a: radius,
+            radius_b: radius,
+            shape: Shape::Round,
+        });
+
         self.supports.push(Support {
             id,
             point: SupportPoint {
                 pos: contact,
-                normal: (tip - contact).normalize(),
+                normal,
                 kind: PointKind::Contact,
                 depth: 0.0,
             },
-            parts: vec![
-                Part {
-                    kind: PartKind::ContactSphere,
-                    a: contact,
-                    b: contact,
-                    radius_a: tip_radius,
-                    radius_b: tip_radius,
-                    shape: Shape::Round,
-                },
-                Part {
-                    kind: PartKind::TipCone,
-                    a: contact,
-                    b: tip,
-                    radius_a: tip_radius,
-                    radius_b: radius,
-                    shape: Shape::Round,
-                },
-                Part {
-                    kind: PartKind::Link,
-                    a: tip,
-                    b: joint,
-                    radius_a: radius,
-                    radius_b: radius,
-                    shape: Shape::Round,
-                },
-                Part {
-                    kind: PartKind::Pillar,
-                    a: joint,
-                    b: joint.xy().push(0.0),
-                    radius_a: radius,
-                    radius_b: radius,
-                    shape: Shape::Round,
-                },
-            ],
+            parts,
             foot,
             group: 0,
         });

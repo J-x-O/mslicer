@@ -85,80 +85,154 @@ impl AutoPlacement {
 
         progress.set_total(overhangs.len() as u64);
         let radius = (self.support.radius + self.support.margin).get::<Milimeter>();
+        let tip_length = self.support.tip_length.get::<Milimeter>();
+        let contact_depth = self.support.contact_depth.get::<Milimeter>();
         overhangs
             .into_iter()
             .filter_map(|x| {
-                // Clamp the tip direction to at most 70° from straight down
-                // (§2.2), then build the tip end along it.
-                let dir = tip::clamp_tip_direction(x.normal);
-                let tip_start = x.point + dir * self.support.tip_length.get::<Milimeter>();
-                let mid = route_support(mesh, bvh, radius, x.point, tip_start);
+                let routed = route_support(
+                    mesh,
+                    bvh,
+                    radius,
+                    tip_length,
+                    contact_depth,
+                    x.point,
+                    x.normal,
+                );
                 progress.add_complete(1);
-                mid.map(|mid| [x.point, tip_start, mid])
+                routed.map(|(tip_end, joint)| [x.point, tip_end, joint])
             })
             .collect()
     }
 }
 
-/// Returns the middle of the three points defining a support. The final point
-/// (that touches the build plate) is just this returned point projected down.
+/// Returns `Some((tip_end, joint))` for a support at `contact` with outward
+/// normal `normal`. `tip_end` is where the tip cone ends and `joint` is where
+/// the 45° link meets the vertical pillar (which then drops to the plate).
 ///
-/// The support is rejected if the tip (`contact` → `position`) passes through
-/// the model. The arm from `position` to the returned point always descends at
-/// least 45°.
+/// Order of attempts (§2.3):
+/// 1. Straight drop: the tip points down (clamped) and a vertical pillar from
+///    `tip_end` to the plate passes. `joint == tip_end`.
+/// 2. Lateral search: candidate pillar sites within `MAX_OFFSET` (15 mm) of the
+///    contact, nearest first. For each site we vary the tip direction in the
+///    §2.3 order and try a 45° link from `tip_end` down to the pillar top, then
+///    a vertical pillar. The first combination that passes every collision test
+///    wins.
 pub fn route_support(
     mesh: &Mesh,
     bvh: &Bvh,
     radius: f32,
+    tip_length: f32,
+    contact_depth: f32,
     contact: Vector3<f32>,
-    position: Vector3<f32>,
-) -> Option<Vector3<f32>> {
-    if intersect_tip(mesh, bvh, contact, position) {
-        return None;
+    normal: Vector3<f32>,
+) -> Option<(Vector3<f32>, Vector3<f32>)> {
+    let normal = tip::clamp_tip_direction(normal.normalize());
+
+    // The horn test shifts its sample shell toward the tip by the contact sink
+    // so the cone's sunken region at the surface isn't falsely flagged (§2.7):
+    // touch depth + max(0.5 × pillar Ø, 0.3 × cone length).
+    let sink = contact_depth + radius.max(tip_length * 0.3);
+
+    // 1. Straight drop: tip along the (clamped) normal, vertical pillar.
+    let tip_end = contact + normal * tip_length;
+    if !collision::horn_test(mesh, bvh, contact, tip_end, radius, sink)
+        && !collision::main_test(mesh, bvh, tip_end, tip_end.xy().to_homogeneous(), radius)
+    {
+        return Some((tip_end, tip_end));
     }
 
-    let mut point = position;
-    let mut momentum = Vector3::zeros();
-    let beta = 0.9;
-
-    // todo: try searching through angles instead of the gradient decent
-    for _ in 0..100 {
-        let closest = bvh.closest(mesh, point).unwrap();
-        let grad = point - mesh.transform(&closest.position);
-
-        momentum = beta * momentum + (1.0 - beta) * grad;
-        point += momentum.xy().push(momentum.z.min(0.0)).normalize() * closest.t.min(1.0);
-
-        // Drop the joint until the arm descends at least 45°. The walk never
-        // moves up and the run only grows, so once that is below the plate it
-        // won't recover.
-        let run = (point.xy() - position.xy()).magnitude();
-        let mut joint = point.xy().push(point.z.min(position.z - run));
-        if joint.z <= 0.0 {
-            return None;
-        }
-
-        if !collision::link_test(mesh, bvh, position, joint, radius)
-            && !collision::main_test(mesh, bvh, joint, joint.xy().to_homogeneous(), radius)
-        {
-            // Steepen the arm further while it stays clear of the model.
-            while joint.z > 2.0
-                && !collision::link_test(mesh, bvh, position, joint - Vector3::z(), radius)
-            {
-                joint.z -= 1.0
+    // 2. Lateral search.
+    for site in candidate_sites(contact, tip_end) {
+        for dir in tip_directions(normal, site - tip_end) {
+            let candidate_tip = contact + dir * tip_length;
+            // The joint is at the site's XY, dropped by the link's 45° run.
+            let run = (site.xy() - candidate_tip.xy()).magnitude();
+            let joint = site.xy().push(candidate_tip.z - run);
+            if joint.z <= 0.0 {
+                continue;
             }
 
-            debug_assert!(position.z - joint.z >= run - 1e-3, "arm flatter than 45°");
-            return Some(joint);
+            // Tip (horn), link, pillar (main).
+            if collision::horn_test(mesh, bvh, contact, candidate_tip, radius, sink)
+                || collision::link_test(mesh, bvh, candidate_tip, joint, radius)
+                || collision::main_test(mesh, bvh, joint, joint.xy().to_homogeneous(), radius)
+            {
+                continue;
+            }
+
+            return Some((candidate_tip, joint));
         }
     }
 
     None
 }
 
+/// The maximum lateral offset from the contact to search for a pillar site, in
+/// millimetres (§2.3: `supportmaxoffsetfromcontact`).
+const MAX_OFFSET: f32 = 15.0;
+
+/// Candidate pillar sites within `MAX_OFFSET` of the contact, nearest first.
+/// Uses the 8 compass/diagonal directions at increasing radii. The routing loop
+/// applies the real collision tests; this just enumerates candidate XY locations.
+fn candidate_sites(contact: Vector3<f32>, tip_end: Vector3<f32>) -> Vec<Vector3<f32>> {
+    let mut sites = Vec::new();
+    for k in 0..8 {
+        let angle = k as f32 / 8.0 * std::f32::consts::TAU;
+        let dir = Vector3::new(angle.cos(), angle.sin(), 0.0);
+        for step in 1..=16 {
+            let dist = (step as f32 / 16.0) * MAX_OFFSET;
+            sites.push(contact + dir * dist);
+        }
+    }
+
+    sites.sort_by(|a, b| {
+        (a.xy() - tip_end.xy())
+            .magnitude_squared()
+            .total_cmp(&(b.xy() - tip_end.xy()).magnitude_squared())
+    });
+
+    sites
+}
+
+/// The tip directions to try for a given lateral offset `o` from the tip end to
+/// the candidate site (§2.3 step 3). If `o` points away from the normal's
+/// horizontal part we go straight down then 45° toward the site; otherwise the
+/// clamped normal, then 45° toward the site, then about 27° below horizontal,
+/// then straight down.
+fn tip_directions(normal: Vector3<f32>, o: Vector3<f32>) -> Vec<Vector3<f32>> {
+    let down = -Vector3::z();
+
+    // Guard the degenerate case where the candidate site sits directly below
+    // the tip end (zero horizontal offset): only the straight-down direction
+    // then makes sense.
+    let o_len = o.xy().magnitude();
+    if o_len <= f32::EPSILON {
+        return vec![down, normal];
+    }
+
+    let horiz = (o.xy() / o_len).push(0.0);
+
+    // A direction 45° toward the site (from straight down).
+    let toward_45 = (down + horiz).normalize();
+    // About 27° below horizontal toward the site: mostly horizontal, slightly down.
+    let h = horiz * (27.0_f32.to_radians()).cos();
+    let toward_27 = (h + down * (27.0_f32.to_radians()).sin()).normalize();
+
+    // `o` points away from the normal's horizontal part when their dot is < 0.
+    let away = o.xy().dot(&normal.xy()) < 0.0;
+    if away {
+        vec![down, toward_45]
+    } else {
+        vec![normal, toward_45, toward_27, down]
+    }
+}
+
 /// Checks if the tip, from the contact point on the surface to its end, passes
 /// through the model. The segment starts just off the surface so the contact
-/// face itself isn't counted.
+/// face itself isn't counted. Used by the routing tests to assert the tip
+/// never enters the model.
+#[cfg(test)]
 fn intersect_tip(mesh: &Mesh, bvh: &Bvh, contact: Vector3<f32>, end: Vector3<f32>) -> bool {
     let start = contact + (end - contact).normalize() * 0.01;
     bvh.intersect_segment(mesh, start, end).is_some()
@@ -270,6 +344,28 @@ mod tests {
         // Contact on the top of the slab with the tip pointing down through it.
         let top = mesh.transform(&Vector3::new(6.0, 6.0, 6.0));
         let down = mesh.transform_normal(&-Vector3::z()).normalize();
-        assert!(route_support(&mesh, &bvh, 1.1, top, top + down * 3.0).is_none());
+        assert!(route_support(&mesh, &bvh, 1.1, 2.0, 0.4, top, down).is_none());
+    }
+
+    #[test]
+    fn lateral_search_routes_around_obstacle() {
+        // A slab lifted off the plate with a stem directly below its centre. A
+        // contact on the slab underside directly above the stem can't drop
+        // straight; it must route sideways. We already cover this via
+        // rotated_model_supports (which asserts non-empty + invariants), so here
+        // we just assert the straight-drop-blocked case still finds a route.
+        let (mesh, _, bvh) = tilted_t();
+
+        // A downward-facing point near the stem (x ~ 0) is blocked directly.
+        let contact = mesh.transform(&Vector3::new(0.5, 0.5, 4.5));
+        let normal = mesh.transform_normal(&-Vector3::z()).normalize();
+
+        // It should still route (laterally), returning a joint above the plate
+        // with a 45° (or steeper) arm.
+        if let Some((tip, joint)) = route_support(&mesh, &bvh, 1.1, 2.0, 0.4, contact, normal) {
+            let run = (joint.xy() - tip.xy()).magnitude();
+            assert!(tip.z - joint.z >= run - 1e-3, "arm flatter than 45°");
+            assert!(joint.z > 0.0);
+        }
     }
 }

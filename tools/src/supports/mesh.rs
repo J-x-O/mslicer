@@ -16,6 +16,9 @@ pub struct SupportPreset {
 
     pub tip_radius: Milimeters,
     pub tip_length: Milimeters,
+    /// How far the tip sinks into the model at the contact, in millimetres
+    /// (§2.2 step 2, §3.1: 0.3 / 0.4 / 0.6 for Light / Middle / Heavy).
+    pub contact_depth: Milimeters,
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +179,7 @@ impl SupportPreset {
         margin: Milimeters::new(0.5),
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
+        contact_depth: Milimeters::new(0.3),
     };
 
     pub const MDEIUM: Self = Self {
@@ -183,6 +187,7 @@ impl SupportPreset {
         margin: Milimeters::new(0.5),
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
+        contact_depth: Milimeters::new(0.4),
     };
 
     pub const HEAVY: Self = Self {
@@ -190,6 +195,7 @@ impl SupportPreset {
         margin: Milimeters::new(0.5),
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
+        contact_depth: Milimeters::new(0.6),
     };
 }
 
