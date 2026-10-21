@@ -97,6 +97,30 @@ impl Bvh {
 
         self.intersect::<primitive::Segment>(mesh, ray)
     }
+
+    /// Returns every triangle the ray crosses, sorted by distance from the
+    /// origin. Unlike [`Bvh::intersect_ray`], this does not stop at the first
+    /// hit, so it can pair crossings into inside/outside intervals.
+    pub fn intersect_ray_all(
+        &self,
+        mesh: &Mesh,
+        origin: Vector3<f32>,
+        direction: Vector3<f32>,
+    ) -> Vec<Hit> {
+        let (origin, direction) = (
+            mesh.inv_transform(&origin),
+            mesh.inv_transform_normal(&direction),
+        );
+        let ray = Ray { origin, direction };
+
+        let mut hits = Vec::new();
+        if let Some(root) = self.nodes.last() {
+            root.intersect_all(self.nodes.as_ref(), mesh, ray, &mut hits);
+        }
+
+        hits.sort_by(|a, b| a.t.total_cmp(&b.t));
+        hits
+    }
 }
 
 impl BvhNode {
@@ -148,6 +172,29 @@ impl BvhNode {
                 } else if let Some((_, child)) = left.or(right) {
                     arena[child].intersect::<Type>(arena, mesh, ray, out);
                 }
+            }
+        }
+    }
+
+    /// Collects every triangle crossing on a [`primitive::Ray`]. Unlike
+    /// [`BvhNode::intersect`], it never early-outs, so a full traversal yields
+    /// all hits for interval pairing.
+    fn intersect_all(&self, arena: &[BvhNode], mesh: &Mesh, ray: Ray, out: &mut Vec<Hit>) {
+        if self.bounds().intersect::<primitive::Ray>(ray).is_none() {
+            return;
+        }
+
+        match self {
+            BvhNode::Leaf { faces, .. } => faces.iter().for_each(|&face| {
+                let triangle = (mesh.face_verts_raw(face), mesh.normal(face));
+                if let Some((t, position)) = triangle_intersection::<primitive::Ray>(triangle, ray)
+                {
+                    out.push(Hit { position, t, face });
+                }
+            }),
+            BvhNode::Node { left, right, .. } => {
+                arena[*left].intersect_all(arena, mesh, ray, out);
+                arena[*right].intersect_all(arena, mesh, ray, out);
             }
         }
     }

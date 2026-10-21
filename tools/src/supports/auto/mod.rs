@@ -14,6 +14,8 @@ use tracing::info;
 use crate::supports::mesh::SupportPreset;
 
 pub mod detect;
+pub mod grid;
+pub mod points;
 pub mod quazirandom;
 
 pub struct AutoPlacement {
@@ -49,35 +51,37 @@ impl AutoPlacement {
     pub fn generate_supports(
         &self,
         mesh: &Mesh,
-        half_edge: &HalfEdgeMesh,
+        _half_edge: &HalfEdgeMesh,
         bvh: &Bvh,
         progress: &Progress,
     ) -> Vec<[Vector3<f32>; 3]> {
-        let mut overhangs = Vec::new();
-        let min_dist = self.placement.min_spacing;
+        // Stage 1: ray-grid point placement replaces the three detectors. The
+        // old detector path lives on in `detect` but is no longer driven here.
+        let grid = grid::footprint(mesh);
+        let overhangs = grid.map(|g| {
+            let samples = grid::sample_surface(mesh, bvh, &g, progress);
+            let placed = points::place_points(
+                &samples,
+                &g,
+                &self.placement,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
+            (placed, samples.len())
+        });
 
-        let overhanging_faces = self.overhanging_faces(mesh);
-        let mut faces = self.place_face_supports(mesh, &overhanging_faces);
-        let mut edges = self.place_edge_supports(mesh, half_edge, &overhanging_faces);
-        for overhang in edges.iter() {
-            // i know its n²... shut up.
-            faces.retain(|x| (x.point - overhang.point).magnitude() > min_dist);
-        }
-
-        let points = self.place_point_supports(mesh, half_edge);
-        for overhang in points.iter() {
-            faces.retain(|x| (x.point - overhang.point).magnitude() > min_dist);
-            edges.retain(|x| (x.point - overhang.point).magnitude() > min_dist);
-        }
+        let (overhangs, sample_count) = match overhangs {
+            Some((p, n)) => (p, n),
+            None => (Vec::new(), 0),
+        };
 
         info!(
-            "Placed {} supports. {{ point: {}, face: {}, edge: {} }}",
-            points.len() + faces.len() + edges.len(),
-            points.len(),
-            faces.len(),
-            edges.len()
+            "Placed {} supports from {sample_count} surface samples",
+            overhangs.len()
         );
-        overhangs.extend([points, faces, edges].into_iter().flatten());
 
         progress.set_total(overhangs.len() as u64);
         let radius = (self.support.radius + self.support.margin).get::<Milimeter>();
@@ -237,8 +241,18 @@ mod tests {
     fn tilted_t() -> (Mesh, HalfEdgeMesh, Bvh) {
         let (mut verts, mut faces) = (Vec::new(), Vec::new());
         let v = Vector3::new;
-        add_box(&mut verts, &mut faces, v(-10.0, -10.0, 4.0), v(10.0, 10.0, 6.0));
-        add_box(&mut verts, &mut faces, v(-2.0, -2.0, -6.0), v(2.0, 2.0, 4.5));
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(-10.0, -10.0, 4.0),
+            v(10.0, 10.0, 6.0),
+        );
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(-2.0, -2.0, -6.0),
+            v(2.0, 2.0, 4.5),
+        );
 
         let mut mesh = Mesh::new(verts, faces);
         mesh.set_rotation(v(0.3, 0.2, 0.0));
@@ -253,12 +267,16 @@ mod tests {
     fn rotated_model_supports() {
         let (mesh, half_edge, bvh) = tilted_t();
         let bed = Vector3::repeat(Milimeters::new(100.0));
-        let placement = AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
+        let placement =
+            AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
         let supports = placement.generate_supports(&mesh, &half_edge, &bvh, &Progress::new());
         assert!(!supports.is_empty());
 
         for [contact, tip, joint] in supports {
-            assert!(!intersect_tip(&mesh, &bvh, contact, tip), "tip enters the model");
+            assert!(
+                !intersect_tip(&mesh, &bvh, contact, tip),
+                "tip enters the model"
+            );
 
             let run = (joint.xy() - tip.xy()).magnitude();
             assert!(tip.z - joint.z >= run - 1e-3, "arm flatter than 45°");

@@ -300,7 +300,7 @@ Each support is assembled from a fixed catalogue of parts, stacked from the plat
 | --- | --- | --- | --- |
 | Contact sphere (top) | `genUpWardTouch` | Sphere, sunk into the model; off by default on this printer (shape None), so the cone itself sinks in | Ø `supporttouchtipdiameter` 0.5 / 0.8 / 1.0, depth 0.3 / 0.4 / 0.6 |
 | Tip cone ("upward horn") | `genUpWardHorn` | Cone, Pyramid or Skate | Ø 0.3 → 0.8 / 0.4 → 1.2 / 0.6 → 1.5, length 2 / 2 / 3 |
-| Joint | `genJoint` | Sphere at tip end and link ends | Pillar diameter (inferred) |
+| Joint | `genJoint` | Sphere centred on each vertex where two parts meet (see 3.1.1) | 0.52 × `supportmiddlediameter` (see 3.1.1) |
 | Link / main pillar | `genMain` | Cylinder, Prism or Cube | Ø 0.8 / 1.2 / 1.5 |
 | Lower main pillar | `genMain` | Same shape, second diameter | Same as the pillar: the GUI copies `supportmiddlediameter` into the second-diameter field. `supportmiddlediameter2` (1.0 / 2.0 / 2.5) never reaches the algorithm (verified) |
 | Slim (small pillar) | `genSlim` | Sphere- or cone-ended thin rod for short model-to-model gaps | Ø 0.4 / 0.5 / 0.5, at most `supportmaxsmallpillarlength` 3 mm |
@@ -308,6 +308,54 @@ Each support is assembled from a fixed catalogue of parts, stacked from the plat
 | Base | `genBottom` | Skate, Cone, Cube, Cylinder or Prism disc | Ø 10 / 12 / 12, thickness 0.8 / 1.0 / 1.0 |
 | Tail (model landing) | `genDownwardTouch` + `genDownwardHorn` | Downward cone into a lower model surface (tail sphere off by default) | Ø 0.4 / 0.6 / 2.0, depth 0.2 / 0.2 / 0.3 |
 | Brace | `genMainConnSupStruct` | 45° cylinder between pillars | Ø = pillar Ø (`supportcrossdiameter` is not passed; verified) |
+
+### 3.1.1 Joint construction (`genJoint` / `genJointSupStruct`)
+
+Single-sphere-per-vertex. There is **no** "two balls at one tip→stick transition": every joint is a single sphere/part centred exactly on the vertex where two parts meet, with no axial offset. The "two balls" case comes from a support that genuinely has **two** join vertices (model-landing link, slim pillar), not one joint being split. V = verified in the code path, I = inferred. Ghidra addresses are in `out-d2/libCbdModel.so.1`.
+
+**How the joint is built (common path).**
+
+- **Placement (V):** `GenSupportStruct::genJointSupStruct` (0x26d900) takes a centre `P` and half-size `r`, and records a type-9 part as a vertical segment from `(P.x, P.y, P.z + r)` down to `(P.x, P.y, P.z − r)`. The segment is **always vertical**, whatever the adjoining parts' directions.
+- **Ground clip (V):** the joint is dropped entirely if `P.z − r` is below ground height.
+- **Mesh (V):** type 9 goes to `genJoint` (0x26abc0). It emits a **cube** iff `supportmiddleshape` is exactly "Cube", else a **sphere** (default is Cylinder, so a sphere). Mesh radius = half the segment length = exactly `r`, so the ball is centred on `P` with radius `r`. "Centred on the segment midpoint" is I.
+- **Why sometimes skipped (I):** the sizing step runs only when a flag on the part builder is clear; what that flag means was not traced.
+
+**Q1 — one ball vs. two.** No count decision exists inside `genJoint`. Each caller emits one joint per join vertex; ball count = number of such vertices:
+
+| Support kind | Joints | Count |
+| --- | --- | --- |
+| Ground pillar, default (no pre-merge) | Pillar top, where tip cone meets pillar. Emitted in `YgAddSupport::mergeScopeIsolatedNearGrounds` for every pillar entry except lattice items | 1 (V) |
+| Merged pillars (`postMergeMidSups`; `processIsolatedNearGrounds`/`…NearModels`) | One at each member pillar top, plus one at the merge point | 1 per vertex (V); whether this runs in default auto is I |
+| Model landing (`genOneNearModelRelated_0_`) | One at the tip-cone end (top of the slanted link) and one at the link's lower end (where the tail/claw fingers start) | 2 (V); top one skipped when reusing an existing tip cone (I) |
+| Slim pillar, model-to-model (`GenSupportStruct::genSlimSupStruct`) | One at each end of the slim | 2 if small-pillar shape ≠ "None", else 0 (V) |
+| Manual paths | Same vertices as the auto equivalents | — |
+
+`genVerticalToGround` and `connectTwoMainSupsCommon_` emit only tip-cone, link and touch records; their pillar-top ball comes from the merge-scope pass above (V).
+
+**Q2 — radius.** Within one family the radius is a fixed multiple of one diameter setting `D` (V); there is **no** separate joint-diameter setting.
+
+| Case | Radius r | Light / Middle / Heavy (mm) |
+| --- | --- | --- |
+| Ground pillar top (auto) | 0.5·D × 1.04 = 0.52·D, D = `supportmiddlediameter` | 0.416 / 0.624 / 0.780 |
+| Model landing, pillar branch (auto) | 0.52·D × 1.04 = 0.5408·D | 0.433 / 0.649 / 0.811 |
+| Model landing, slim branch (auto) | 0.5408 × `supportmiddlesmallpillardiameter` | 0.216 / 0.270 / 0.270 |
+| Slim end balls | 0.5 × slim Ø | 0.20 / 0.25 / 0.25 |
+| Merge joints (`postMergeMidSups`) | that pillar's own radius × 1.04 | = row 1 if default Ø |
+| Manual | 0.52·D (pillar Ø) or 0.52 × slim Ø (slim landing branch) | 0.416 / 0.624 / 0.780 (pillar) |
+
+Pillar Ø is 0.8 / 1.2 / 1.5 mm (Light / Middle / Heavy). The 0.52·D ball is 4 % larger in radius than both the pillar and the cone base — matching "slightly larger than the adjoining part".
+
+Note the **double scale in the landing path** (V): the stored half-size is already 0.52·D and `genSupportStructure` multiplies by 1.04 again → 0.5408·D, while manual uses plain 0.52·D. This looks like a bug; copy it only for exact parity.
+
+**Q3 — axial offset.** Pillar, link and merge joints have **no** offset; the centre is exactly the shared vertex (V). The only axial offset is on **slim end balls** (V): each slim end is pushed into the model along the slim axis by the relevant contact depth (`smallpillaruppercontactdepth` / `smallpillarlowercontactdepth`, 0.25 / 0.3 / 0.3 mm), then pulled back toward the middle by **one slim radius**; the slim body runs between the pulled-back ends and each ball is centred on one, radius = slim radius. Net effect: each ball's outer surface touches the sunk tip point exactly. The offset is one slim radius (setting-driven, not a constant); the ball axis is still vertical.
+
+**Q4 — same radius for both balls?** Yes in every case (V). Slim: both slim radius. Model landing: both 0.5408 × Ø. Merges: a member's joint uses that member's radius; the merge-point joint uses the merged pillar's radius (differs only if pillar Øs differed). No case sizes the tip-side ball from the cone and the stick-side ball from the pillar.
+
+**Q5 — contact shape "None" vs "Sphere".** The joint is unaffected by tip contact shape (V). The tip contact sphere is a separate part, added only when the top-touch shape is not "None" (on this printer it's None, so no contact sphere). Joint emitters never read that field: with shape None you still get the pillar-top joint, landing joints and slim end balls. The only shape gates on joints are `supportmiddleshape` "Cube" (→ cube) and `supportmiddlesmallpillarshape` "None" (→ no slim balls).
+
+**Q6 — settings that reach joints.** Read (V): `supportmiddlediameter` (0xa0: ground/landing/manual), `supportmiddlesmallpillardiameter` (0xd8: slim landing + slim balls), small-pillar contact depths (0xe0/0xe8: slim-ball offset), `supportmiddleshape` (0x80: Cube/Sphere), `supportmiddlesmallpillarshape` (0xb8: slim balls on/off). Never read (V): `supportmiddlediameter2`, the tip-cone diameters (`supporttipupdiameter`/`supporttipdowndiameter`), tip contact diameter/depth, and any joint/"join" setting (this profile has none). Constants: 1.04 (inflation, auto/merge paths), 0.52 (same inflation folded in, manual/landing paths), 0.5 (diameter→radius).
+
+**Open / not verified.** (1) What the flag guarding the sizing step means. (2) Whether `postMergeMidSups` runs in default auto. (3) That the field `postMergeMidSups` reads (offset 0x50c) is the part radius (I, from its setters).
 
 ### 3.2 Pillar assembly cases (`HandleGenMainSup`, verified dispatch)
 
