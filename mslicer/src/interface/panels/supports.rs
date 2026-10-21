@@ -4,6 +4,7 @@ use common::units::Milimeter;
 use const_format::concatcp;
 use egui::{Button, ComboBox, Context, DragValue, Ui, Widget};
 use egui_phosphor::regular::{LINE_SEGMENT, SELECTION_INVERSE, SPARKLE, TRASH};
+use nalgebra::Vector3;
 use slicer::geometry::mesh::MeshBuilder;
 use tools::supports::{auto::route_support, mesh::SupportPreset};
 
@@ -178,11 +179,15 @@ fn generate_support(app: &mut App, model: usize) {
     let default_lift = app.project.support_config.default_lift.get::<Milimeter>();
 
     let model = &mut app.project.models[model];
-    let pos = model.mesh.position();
-    model.set_position(
-        &app.project.slice_config.platform_size,
-        pos.xy().push(pos.z.max(default_lift)),
-    );
+
+    // Lift so the model's *lowest point* sits at `default_lift`, mirroring
+    // align-to-bed (which puts the lowest point at z = 0) then adding the lift.
+    // Using the object origin (`mesh.position().z`) instead is wrong: the origin
+    // is the encoded translation, not the surface, so a model whose origin is
+    // already above the lift would be left sitting below the plate.
+    let min_z = model.bounds.min.z;
+    let pos = model.mesh.position() + Vector3::z() * (default_lift - min_z);
+    model.set_position(&app.project.slice_config.platform_size, pos);
 
     let placement = app.project.support_config.auto_placement.clone();
     let support = app.project.support_config.preset.clone();

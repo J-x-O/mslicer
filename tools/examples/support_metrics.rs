@@ -106,12 +106,14 @@ struct ModelReport {
 fn process_model(model_path: &Path) -> Result<ModelReport> {
     let mut model = load_stl(model_path)?;
 
-    // Lift the model by the default lift, exactly as the app's generate button
-    // does (`generate_support` in panels/supports.rs). The models sit at z=0,
-    // so without this the routing has no vertical room and drops every support.
+    // Lift so the model's *lowest point* sits at `default_lift`, mirroring the
+    // app's corrected generate path (align-to-bed then lift). The STLs sit at
+    // their raw coordinates with identity transform, so `bounds.min.z` is the
+    // lowest world point; without this there's no vertical room to route.
     let default_lift = 5.0;
+    let min_z = slicer::geometry::bounds::Bounds3D::from_mesh(&model).min.z;
     let pos = model.position();
-    model.set_position(pos.xy().push(pos.z.max(default_lift)));
+    model.set_position(Vector3::new(pos.x, pos.y, pos.z + (default_lift - min_z)));
 
     let progress = Progress::new();
     let bvh = Bvh::build(model.inner(), Progress::new());
