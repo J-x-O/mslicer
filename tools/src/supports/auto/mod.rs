@@ -16,6 +16,7 @@ pub mod detect;
 pub mod grid;
 pub mod points;
 pub mod quazirandom;
+pub mod tip;
 
 pub struct AutoPlacement {
     pub placement: PlacementConfig,
@@ -87,7 +88,10 @@ impl AutoPlacement {
         overhangs
             .into_iter()
             .filter_map(|x| {
-                let tip_start = x.point + x.normal * self.support.tip_length.get::<Milimeter>();
+                // Clamp the tip direction to at most 70° from straight down
+                // (§2.2), then build the tip end along it.
+                let dir = tip::clamp_tip_direction(x.normal);
+                let tip_start = x.point + dir * self.support.tip_length.get::<Milimeter>();
                 let mid = route_support(mesh, bvh, radius, x.point, tip_start);
                 progress.add_complete(1);
                 mid.map(|mid| [x.point, tip_start, mid])
