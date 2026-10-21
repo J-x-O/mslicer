@@ -22,7 +22,7 @@ impl AutoPlacement {
         let mut overhangs = Vec::new();
 
         for face in 0..mesh.face_count() {
-            let normal = mesh.transform_normal(&mesh.normal(face));
+            let normal = mesh.transform_normal(&mesh.normal(face)).normalize();
 
             let angle = (-normal.z).acos();
             (angle <= max_angle).then(|| overhangs.push((face, normal)));
@@ -51,7 +51,7 @@ impl AutoPlacement {
                 let Some(twin) = edge.twin else { continue }; // ✌️
                 let neighbor = half_edge.get_edge(twin).face as usize;
 
-                let neighbor_normal = mesh.transform_normal(&mesh.normal(neighbor));
+                let neighbor_normal = mesh.transform_normal(&mesh.normal(neighbor)).normalize();
                 let angle_diff = normal.angle(&neighbor_normal);
 
                 // 0.1 rad ≈ 5°
@@ -88,7 +88,7 @@ impl AutoPlacement {
                     intersection.1 = mesh.transform(&intersection.1);
                     intersections.push(SupportPlacement {
                         point: intersection.1,
-                        normal: mesh.transform_normal(&face.1),
+                        normal: mesh.transform_normal(&face.1).normalize(),
                     });
                 }
             }
@@ -134,9 +134,12 @@ impl AutoPlacement {
 
                             let normal =
                                 (mesh.transform_normal(&mesh.normal(edge.face as usize))
-                                    + mesh.transform_normal(&mesh.normal(
-                                        half_edge.get_edge(edge.twin.unwrap()).face as usize,
-                                    )))
+                                    .normalize()
+                                    + mesh
+                                        .transform_normal(&mesh.normal(
+                                            half_edge.get_edge(edge.twin.unwrap()).face as usize,
+                                        ))
+                                        .normalize())
                                 .normalize();
 
                             let mut t = t;
@@ -189,7 +192,7 @@ impl AutoPlacement {
             }) {
                 let point = mesh.transform(&mesh.vertices()[origin.origin_vertex as usize]);
                 let normal = (neighbors.iter())
-                    .map(|x| mesh.transform_normal(&mesh.normal(x.face as usize)))
+                    .map(|x| mesh.transform_normal(&mesh.normal(x.face as usize)).normalize())
                     .sum::<Vector3<_>>()
                     .normalize();
 

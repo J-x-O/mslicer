@@ -216,7 +216,9 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         let config = &app.project.support_config.preset;
         let tip_r = config.tip_radius.get::<Milimeter>();
 
-        let normal = (model.mesh).transform_normal(&model.mesh.normal(intersection.face));
+        let normal = (model.mesh)
+            .transform_normal(&model.mesh.normal(intersection.face))
+            .normalize();
         if normal.z > 0.0 {
             continue;
         }
@@ -225,7 +227,7 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         let start = intersection + normal * config.tip_length.get::<Milimeter>();
 
         let radius = (config.radius + config.margin).get::<Milimeter>();
-        if let Some(middle) = route_support(&model.mesh, bvh, radius, start) {
+        if let Some(middle) = route_support(&model.mesh, bvh, radius, intersection, start) {
             let (r, p) = (config.radius.get::<Milimeter>(), 100);
             builder.add_cylinder((intersection, start), (tip_r, r), p);
             builder.add_cylinder((start, middle), (r, r), p);
