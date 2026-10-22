@@ -11,7 +11,7 @@ use nalgebra::{Vector2, Vector3};
 
 use common::serde::{Deserializer, SerdeExt, Serializer};
 
-use crate::supports::SupportId;
+use crate::supports::{SupportId, auto::Landing};
 
 /// How a support point was chosen. Coarse for now: routing (Stage 2 of the
 /// plan) still produces bare contact points, and point classification only
@@ -207,6 +207,73 @@ impl SupportSet {
             },
             parts,
             foot,
+            group: 0,
+        });
+    }
+
+    /// Adds a support that lands on the model (§2.4): contact sphere, tip
+    /// cone, a joint at the tip end, a vertical pillar down to the foot, a
+    /// joint at the foot, and one tail per landing tail. A tail is the tip cone
+    /// mirrored: pillar-wide at the foot, tip-narrow where it sinks in.
+    ///
+    /// `tip_radius` and `radius` are millimetres.
+    pub fn add_landing(&mut self, id: SupportId, tip_radius: f32, radius: f32, landing: &Landing) {
+        let round = |kind, a, b, radius_a, radius_b| Part {
+            kind,
+            a,
+            b,
+            radius_a,
+            radius_b,
+            shape: Shape::Round,
+        };
+        let Landing {
+            contact,
+            tip,
+            foot,
+            depth,
+            ..
+        } = *landing;
+
+        // Both landing joints share one radius (§3.1.1 Q4). The plan records
+        // CHITUBOX's doubled 1.04 scale on this path as a likely bug, so use
+        // the plate pillars' 1.04 × radius.
+        let joint = radius * 1.04;
+        let mut parts = vec![
+            round(
+                PartKind::ContactSphere,
+                contact,
+                contact,
+                tip_radius,
+                tip_radius,
+            ),
+            round(PartKind::TipCone, contact, tip, tip_radius, radius),
+            round(PartKind::Joint, tip, tip, joint, joint),
+            round(PartKind::Pillar, tip, foot, radius, radius),
+            round(PartKind::Joint, foot, foot, joint, joint),
+        ];
+        for &(end, _) in &landing.tails {
+            parts.push(round(PartKind::Tail, foot, end, radius, tip_radius));
+        }
+
+        let normal = (tip - contact).try_normalize(f32::EPSILON);
+        let (pos, foot_normal) = landing
+            .tails
+            .first()
+            .copied()
+            .unwrap_or((foot, Vector3::z()));
+        self.supports.push(Support {
+            id,
+            point: SupportPoint {
+                pos: contact,
+                normal: normal.unwrap_or(-Vector3::z()),
+                kind: PointKind::Contact,
+                depth,
+            },
+            parts,
+            foot: Foot::Model {
+                pos,
+                normal: foot_normal,
+            },
             group: 0,
         });
     }
@@ -529,6 +596,40 @@ mod tests {
                 assert_eq!(pa.radius_b, pb.radius_b);
             }
         }
+    }
+
+    #[test]
+    fn landing_support_ends_in_a_tail() {
+        let mut set = SupportSet::default();
+        let landing = Landing {
+            contact: Vector3::new(1.0, 1.0, 20.0),
+            tip: Vector3::new(1.0, 1.0, 18.0),
+            foot: Vector3::new(1.0, 1.0, 12.0),
+            tails: vec![(Vector3::new(1.0, 1.0, 9.8), Vector3::z())],
+            depth: 0.4,
+        };
+        set.add_landing(SupportId::from_raw(3), 0.2, 0.6, &landing);
+
+        let support = &set.supports[0];
+        let kinds: Vec<_> = support.parts.iter().map(|p| p.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                PartKind::ContactSphere,
+                PartKind::TipCone,
+                PartKind::Joint,
+                PartKind::Pillar,
+                PartKind::Joint,
+                PartKind::Tail,
+            ]
+        );
+
+        let tail = support.parts.last().unwrap();
+        assert_eq!(tail.a, landing.foot);
+        assert_eq!(tail.b, landing.tails[0].0);
+        assert_eq!((tail.radius_a, tail.radius_b), (0.6, 0.2));
+        assert!(matches!(support.foot, Foot::Model { .. }));
+        assert_eq!(support.point.depth, 0.4);
     }
 
     #[test]

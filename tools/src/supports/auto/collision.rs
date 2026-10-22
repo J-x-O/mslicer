@@ -57,34 +57,47 @@ pub fn main_test(
     bottom: Vector3<f32>,
     radius: f32,
 ) -> bool {
+    main_lines(top, bottom, radius).any(|(a, b)| bvh.intersect_segment(mesh, a, b).is_some())
+}
+
+/// The highest point (world z) at which a vertical pillar of radius `radius`
+/// dropped from `top` to `bottom` first touches the model, sampled with the
+/// same lines as [`main_test`]. `None` when the drop is clear. Model-landing
+/// supports use this to find the surface their pillar lands on (§2.4 step 3).
+pub fn main_first_hit(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    top: Vector3<f32>,
+    bottom: Vector3<f32>,
+    radius: f32,
+) -> Option<f32> {
+    main_lines(top, bottom, radius)
+        .filter_map(|(a, b)| bvh.intersect_segment(mesh, a, b))
+        .map(|hit| mesh.transform(&hit.position).z)
+        .reduce(f32::max)
+}
+
+/// The sample lines of the main test: the centre line, then lines at 0.5 and
+/// 1.0 of the radius around the circumference.
+fn main_lines(
+    top: Vector3<f32>,
+    bottom: Vector3<f32>,
+    radius: f32,
+) -> impl Iterator<Item = (Vector3<f32>, Vector3<f32>)> {
     let axis = bottom - top;
     let len = axis.magnitude();
-    if len <= f32::EPSILON {
-        return false;
-    }
+    let basis = (len > f32::EPSILON).then(|| slicer::geometry::mesh::orthogonal_basis(axis / len));
 
-    let [u, v] = slicer::geometry::mesh::orthogonal_basis(axis / len);
-
-    // Centre line.
-    if bvh.intersect_segment(mesh, top, bottom).is_some() {
-        return true;
-    }
-
-    // 0.5 and 1.0 of the radius, around the circumference.
-    for &frac in &[0.5f32, 1.0f32] {
-        for i in 0..SHELL_LINES {
-            let t = i as f32 / SHELL_LINES as f32 * TAU;
-            let offset = (u * t.cos() + v * t.sin()) * radius * frac;
-            if bvh
-                .intersect_segment(mesh, top + offset, bottom + offset)
-                .is_some()
-            {
-                return true;
-            }
-        }
-    }
-
-    false
+    basis.into_iter().flat_map(move |[u, v]| {
+        let shell = [0.5f32, 1.0f32].into_iter().flat_map(move |frac| {
+            (0..SHELL_LINES).map(move |i| {
+                let t = i as f32 / SHELL_LINES as f32 * TAU;
+                let offset = (u * t.cos() + v * t.sin()) * radius * frac;
+                (top + offset, bottom + offset)
+            })
+        });
+        std::iter::once((top, bottom)).chain(shell)
+    })
 }
 
 /// Link test. A 45° link or brace from `start` to `end` of radius `radius` is
@@ -113,6 +126,12 @@ fn shell_test(
     let axis = end - start;
     let len = axis.magnitude();
     if len <= f32::EPSILON {
+        return false;
+    }
+
+    // A sink that reaches past the end leaves nothing to test (and would
+    // otherwise flip the sampled segment beyond the end).
+    if sink >= len {
         return false;
     }
 

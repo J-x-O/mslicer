@@ -146,7 +146,7 @@ pub fn sample_surface(
 /// happens when the ray grazes the diagonal an `add_quad` face and hits both of
 /// its triangles. Keeps the first of each near-duplicate cluster, preserving
 /// the sorted order, so crossings pair cleanly into enter/exit intervals.
-fn collapse_coplanar(hits: Vec<Hit>) -> Vec<Hit> {
+pub(super) fn collapse_coplanar(hits: Vec<Hit>) -> Vec<Hit> {
     const EPS: f32 = 1e-3;
     let mut out: Vec<Hit> = Vec::with_capacity(hits.len());
     for hit in hits {

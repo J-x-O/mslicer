@@ -3,6 +3,7 @@ use nalgebra::Vector3;
 use slicer::geometry::mesh::Mesh;
 use tools::supports::{
     SupportId, SupportSet,
+    auto::{BraceNetwork, Generated},
     mesh::{FaceMap, SupportPreset, Transform, build_supports},
 };
 use wgpu::Device;
@@ -60,15 +61,25 @@ impl Supports {
     /// Replaces the stored auto supports and their brace network.
     ///
     /// `network` is the output of `AutoPlacement::generate_braces` over the same
-    /// routed triplets, so the pillars are tied together before meshing and any
-    /// inverted-V fork truncations are applied to the middle pillars.
+    /// plate supports, so the pillars are tied together before meshing and any
+    /// inverted-V fork truncations are applied to the middle pillars. The
+    /// model-landing supports go after the plate supports, which keeps the
+    /// network's support indices valid.
     pub fn replace_auto_with_braces(
         &mut self,
         config: &SupportPreset,
-        supports: Vec<[Vector3<f32>; 3]>,
-        network: tools::supports::auto::BraceNetwork,
+        generated: Generated,
+        network: BraceNetwork,
     ) {
-        self.replace_auto(config, supports);
+        self.replace_auto(config, generated.plate);
+        for landing in &generated.landings {
+            self.auto.add_landing(
+                SupportId::new(),
+                config.tip_radius.get::<Milimeter>(),
+                config.radius.get::<Milimeter>(),
+                landing,
+            );
+        }
         self.auto.braces = network.braces;
         for (index, bottom_z) in network.fork_bottoms {
             self.auto.truncate_pillar(index, bottom_z);

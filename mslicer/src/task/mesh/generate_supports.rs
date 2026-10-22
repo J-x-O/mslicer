@@ -2,7 +2,7 @@ use clone_macro::clone;
 use common::{progress::Progress, units::Milimeters};
 use nalgebra::Vector3;
 use tools::supports::{
-    auto::{AutoPlacement, BraceNetwork, PlacementConfig},
+    auto::{AutoPlacement, BraceNetwork, Generated, PlacementConfig},
     mesh::SupportPreset,
 };
 
@@ -11,11 +11,9 @@ use crate::{
     task::{PollResult, Task, TaskApp, TaskStatus, thread::TaskThread},
 };
 
-type RoutedSupports = Vec<[Vector3<f32>; 3]>;
-
-/// The routed triplets plus the brace network computed over them.
+/// The routed supports plus the brace network computed over them.
 struct RoutedWithBraces {
-    routed: RoutedSupports,
+    generated: Generated,
     network: BraceNetwork,
 }
 
@@ -46,9 +44,9 @@ impl GenerateSupports {
                 preset: support,
 
                 handle: TaskThread::spawn(clone!([progress], move || {
-                    let routed = generator.generate_supports(&mesh, &half_ege, &bvh, &progress);
-                    let network = generator.generate_braces(&mesh, &bvh, &routed);
-                    RoutedWithBraces { routed, network }
+                    let generated = generator.generate_supports(&mesh, &half_ege, &bvh, &progress);
+                    let network = generator.generate_braces(&mesh, &bvh, &generated.plate);
+                    RoutedWithBraces { generated, network }
                 })),
                 progress,
             });
@@ -64,9 +62,11 @@ impl Task for GenerateSupports {
             .poll(app, "Failed to Generate Supports")
             .into_poll_result(|out| {
                 if let Some(model) = app.project.model(self.model) {
-                    model
-                        .supports
-                        .replace_auto_with_braces(&self.preset, out.routed, out.network);
+                    model.supports.replace_auto_with_braces(
+                        &self.preset,
+                        out.generated,
+                        out.network,
+                    );
                 }
 
                 PollResult::complete()

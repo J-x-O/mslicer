@@ -5,7 +5,7 @@ use nalgebra::{Vector2, Vector3};
 use slicer::geometry::mesh::{Mesh, MeshBuilder};
 use tracing::info;
 
-use crate::supports::{Part, PartKind, SupportId, SupportSet};
+use crate::supports::{Foot, Part, PartKind, SupportId, SupportSet};
 
 pub type FaceMap = HashMap<SupportId, Range<u32>>;
 
@@ -19,6 +19,13 @@ pub struct SupportPreset {
     /// How far the tip sinks into the model at the contact, in millimetres
     /// (§2.2 step 2, §3.1: 0.3 / 0.4 / 0.6 for Light / Middle / Heavy).
     pub contact_depth: Milimeters,
+    /// How far a model-landing tail sinks into the lower surface along its
+    /// axis (§2.4 step 5, §3.1 `supporttailtouchdepth`: 0.2 / 0.2 / 0.3).
+    pub tail_depth: Milimeters,
+    /// Radius of the slim (small) pillar (§3.1 `supportmiddlesmallpillardiameter`
+    /// 0.4 / 0.5 / 0.5 Ø). A model-landing tail leans at most 2 × slim Ø
+    /// sideways (§2.4 step 4).
+    pub slim_radius: Milimeters,
 }
 
 #[derive(Clone, Copy)]
@@ -65,7 +72,9 @@ pub fn build_supports(
     // until the per-island raft (M5) replaces it. Reconstructed from the
     // vertical pillars so it matches the pre-SupportSet output exactly.
     let mut feet = Vec::new();
-    for support in &supports.supports {
+    // Model-landing supports end on the model, not the plate.
+    let on_plate = (supports.supports.iter()).filter(|s| matches!(s.foot, Foot::Plate { .. }));
+    for support in on_plate {
         for part in &support.parts {
             if part.kind == PartKind::Pillar {
                 // Mirror the old transform: scale the xy, drop the z (the foot
@@ -180,6 +189,8 @@ impl SupportPreset {
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
         contact_depth: Milimeters::new(0.3),
+        tail_depth: Milimeters::new(0.2),
+        slim_radius: Milimeters::new(0.2),
     };
 
     pub const MDEIUM: Self = Self {
@@ -188,6 +199,8 @@ impl SupportPreset {
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
         contact_depth: Milimeters::new(0.4),
+        tail_depth: Milimeters::new(0.2),
+        slim_radius: Milimeters::new(0.25),
     };
 
     pub const HEAVY: Self = Self {
@@ -196,6 +209,8 @@ impl SupportPreset {
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
         contact_depth: Milimeters::new(0.6),
+        tail_depth: Milimeters::new(0.3),
+        slim_radius: Milimeters::new(0.25),
     };
 }
 

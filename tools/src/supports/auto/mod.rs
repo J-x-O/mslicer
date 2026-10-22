@@ -15,12 +15,30 @@ use crate::supports::mesh::SupportPreset;
 pub mod collision;
 pub mod detect;
 pub mod grid;
+pub mod landing;
 pub mod points;
 pub mod quazirandom;
 pub mod tip;
 pub mod topology;
 
+pub use landing::{Landing, LandingConfig};
 pub use topology::BraceNetwork;
+
+/// The routed supports of one generation run.
+#[derive(Clone, Debug, Default)]
+pub struct Generated {
+    /// Supports with a pillar to the plate, as `[contact, tip, joint]`
+    /// triplets. The brace network indexes into this list.
+    pub plate: Vec<[Vector3<f32>; 3]>,
+    /// Supports that land on the model below them (§2.4).
+    pub landings: Vec<Landing>,
+}
+
+/// One point's route: to the plate, or onto the model.
+enum Routed {
+    Plate([Vector3<f32>; 3]),
+    Model(Landing),
+}
 
 pub struct AutoPlacement {
     pub placement: PlacementConfig,
@@ -58,7 +76,7 @@ impl AutoPlacement {
         _half_edge: &HalfEdgeMesh,
         bvh: &Bvh,
         progress: &Progress,
-    ) -> Vec<[Vector3<f32>; 3]> {
+    ) -> Generated {
         // Stage 1: ray-grid point placement replaces the three detectors. The
         // old detector path lives on in `detect` but is no longer driven here.
         let grid = grid::footprint(mesh);
@@ -91,9 +109,12 @@ impl AutoPlacement {
         let radius = (self.support.radius + self.support.margin).get::<Milimeter>();
         let tip_length = self.support.tip_length.get::<Milimeter>();
         let contact_depth = self.support.contact_depth.get::<Milimeter>();
-        overhangs
+        let landing = self.landing_config();
+        let routed: Vec<Routed> = overhangs
             .into_par_iter()
             .filter_map(|x| {
+                // Plate first (§2.3); points with no way down land on the
+                // model below (§2.4).
                 let routed = route_support(
                     mesh,
                     bvh,
@@ -102,11 +123,43 @@ impl AutoPlacement {
                     contact_depth,
                     x.point,
                     x.normal,
-                );
+                )
+                .map(|(tip_end, joint)| Routed::Plate([x.point, tip_end, joint]))
+                .or_else(|| {
+                    landing::land_support(mesh, bvh, &landing, x.point, x.normal).map(Routed::Model)
+                });
                 progress.add_complete(1);
-                routed.map(|(tip_end, joint)| [x.point, tip_end, joint])
+                routed
             })
-            .collect()
+            .collect();
+
+        let mut generated = Generated::default();
+        for route in routed {
+            match route {
+                Routed::Plate(triplet) => generated.plate.push(triplet),
+                Routed::Model(landing) => generated.landings.push(landing),
+            }
+        }
+
+        info!(
+            "Routed {} supports to the plate and {} onto the model",
+            generated.plate.len(),
+            generated.landings.len()
+        );
+        generated
+    }
+
+    /// The sizes the model-landing router (§2.4) works with, from the preset.
+    fn landing_config(&self) -> LandingConfig {
+        let support = &self.support;
+        LandingConfig {
+            radius: (support.radius + support.margin).get::<Milimeter>(),
+            pillar_diameter: 2.0 * support.radius.get::<Milimeter>(),
+            cone_length: support.tip_length.get::<Milimeter>(),
+            contact_depth: support.contact_depth.get::<Milimeter>(),
+            tail_depth: support.tail_depth.get::<Milimeter>(),
+            max_lean: 4.0 * support.slim_radius.get::<Milimeter>(),
+        }
     }
 
     /// Builds the brace network (plan §2.5) over the routed supports.
@@ -115,8 +168,8 @@ impl AutoPlacement {
     /// a Delaunay + MST over the pillar XY positions for the 45° spanning-tree
     /// braces, then chains nearly-collinear triples into inverted-V forks. The
     /// returned [`BraceNetwork`] carries both the brace/fork link parts and the
-    /// pillar truncations the forks impose. `routed` must be the output of
-    /// [`Self::generate_supports`] (or hand-routed triplets of the same form).
+    /// pillar truncations the forks impose. `routed` must be the plate supports
+    /// of [`Self::generate_supports`] (or hand-routed triplets of the same form).
     pub fn generate_braces(
         &self,
         mesh: &Mesh,
@@ -355,9 +408,9 @@ mod tests {
         let placement =
             AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
         let supports = placement.generate_supports(&mesh, &half_edge, &bvh, &Progress::new());
-        assert!(!supports.is_empty());
+        assert!(!supports.plate.is_empty());
 
-        for [contact, tip, joint] in supports {
+        for [contact, tip, joint] in supports.plate {
             assert!(
                 !intersect_tip(&mesh, &bvh, contact, tip),
                 "tip enters the model"
@@ -366,6 +419,49 @@ mod tests {
             let run = (joint.xy() - tip.xy()).magnitude();
             assert!(tip.z - joint.z >= run - 1e-3, "arm flatter than 45°");
             assert!(joint.z > 0.0);
+        }
+    }
+
+    #[test]
+    fn ledge_over_table_lands_on_model() {
+        // A floating 10 × 10 mm ledge above a 60 × 60 mm table: the table
+        // blocks every plate route within 15 mm, so the ledge's points land on
+        // the table top instead (§2.4).
+        let (mut verts, mut faces) = (Vec::new(), Vec::new());
+        let v = Vector3::new;
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(-30.0, -30.0, 5.0),
+            v(30.0, 30.0, 10.0),
+        );
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(-5.0, -5.0, 20.0),
+            v(5.0, 5.0, 22.0),
+        );
+        let mesh = Mesh::new(verts, faces);
+        let half_edge = HalfEdgeMesh::build_from_mesh(mesh.inner());
+        let bvh = Bvh::build(mesh.inner(), Progress::new());
+
+        let bed = Vector3::repeat(Milimeters::new(100.0));
+        let placement =
+            AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
+        let supports = placement.generate_supports(&mesh, &half_edge, &bvh, &Progress::new());
+        assert!(!supports.landings.is_empty(), "ledge points must land");
+
+        for landing in &supports.landings {
+            assert!((landing.contact.z - 20.0).abs() < 1e-3);
+            assert_eq!(landing.foot.xy(), landing.tip.xy(), "pillar is vertical");
+            assert!(!intersect_tip(&mesh, &bvh, landing.contact, landing.tip));
+            for (end, normal) in &landing.tails {
+                // Tails sink 0.2 mm (Middle) along their axis into the table.
+                let axis = (landing.foot - end).normalize();
+                let sunk = (10.0 - end.z) / axis.z;
+                assert!((sunk - 0.2).abs() < 1e-3, "tail sinks {sunk} mm");
+                assert!(normal.z > 0.99);
+            }
         }
     }
 

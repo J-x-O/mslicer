@@ -93,6 +93,7 @@ fn triangle_intersection_count(model: &Mesh, model_bvh: &Bvh, support_mesh: &Mes
 struct ModelReport {
     name: String,
     our_supports: usize,
+    our_landings: usize,
     our_triangles: usize,
     our_volume: f32,
     chitubox_triangles: usize,
@@ -123,7 +124,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     let placement = AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
 
     let generate_start = Instant::now();
-    let routed = {
+    let generated = {
         let half_edge = slicer::geometry::mesh::HalfEdgeMesh::build_from_mesh(model.inner());
         placement.generate_supports(&model, &half_edge, &bvh, &progress)
     };
@@ -131,17 +132,29 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
 
     // Expand routed triplets [contact, tip, joint] into a SupportSet so we can
     // mesh them with the same code path the app uses, and add the brace network
-    // computed over the pillar tops.
+    // computed over the pillar tops. Model-landing supports go after the plate
+    // supports so the network's support indices stay valid.
+    let tip_radius = placement.support.tip_radius.get::<Milimeter>();
+    let radius = placement.support.radius.get::<Milimeter>();
     let mut set = tools::supports::SupportSet::default();
-    for (i, [contact, tip, joint]) in routed.iter().enumerate() {
+    for (i, triplet) in generated.plate.iter().enumerate() {
         set.add_routed(
             tools::supports::SupportId::from_raw(i as u32),
-            placement.support.tip_radius.get::<Milimeter>(),
-            placement.support.radius.get::<Milimeter>(),
-            [*contact, *tip, *joint],
+            tip_radius,
+            radius,
+            *triplet,
         );
     }
-    let network = placement.generate_braces(&model, &bvh, &routed);
+    for (i, landing) in generated.landings.iter().enumerate() {
+        let id = (generated.plate.len() + i) as u32;
+        set.add_landing(
+            tools::supports::SupportId::from_raw(id),
+            tip_radius,
+            radius,
+            landing,
+        );
+    }
+    let network = placement.generate_braces(&model, &bvh, &generated.plate);
     set.braces = network.braces;
     for (index, bottom_z) in network.fork_bottoms {
         set.truncate_pillar(index, bottom_z);
@@ -205,7 +218,8 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
             .unwrap()
             .to_string_lossy()
             .into_owned(),
-        our_supports: routed.len(),
+        our_supports: generated.plate.len() + generated.landings.len(),
+        our_landings: generated.landings.len(),
         our_triangles,
         our_volume,
         chitubox_triangles,
@@ -245,8 +259,17 @@ fn main() -> Result<()> {
     reports.sort_by(|a, b| a.name.cmp(&b.name));
 
     println!(
-        "\n{:<28} {:>6} {:>10} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
-        "model", "sups", "our_vol", "cb_vol", "our_tris", "cb_tris", "inter", "gen_ms", "build_ms"
+        "\n{:<28} {:>6} {:>6} {:>10} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
+        "model",
+        "sups",
+        "land",
+        "our_vol",
+        "cb_vol",
+        "our_tris",
+        "cb_tris",
+        "inter",
+        "gen_ms",
+        "build_ms"
     );
     for r in &reports {
         let cb_vol = if r.chitubox_volume.is_nan() {
@@ -255,9 +278,10 @@ fn main() -> Result<()> {
             format!("{:.2}", r.chitubox_volume)
         };
         println!(
-            "{:<28} {:>6} {:>10.2} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
+            "{:<28} {:>6} {:>6} {:>10.2} {:>10} {:>10} {:>10} {:>6} {:>6} {:>6}",
             r.name,
             r.our_supports,
+            r.our_landings,
             r.our_volume,
             cb_vol,
             r.our_triangles,
