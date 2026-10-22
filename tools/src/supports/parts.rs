@@ -11,7 +11,10 @@ use nalgebra::{Vector2, Vector3};
 
 use common::serde::{Deserializer, SerdeExt, Serializer};
 
-use crate::supports::{SupportId, auto::Landing};
+use crate::supports::{
+    SupportId,
+    auto::{Landing, LandingKind},
+};
 
 /// How a support point was chosen. Coarse for now: routing (Stage 2 of the
 /// plan) still produces bare contact points, and point classification only
@@ -216,6 +219,10 @@ impl SupportSet {
     /// joint at the foot, and one tail per landing tail. A tail is the tip cone
     /// mirrored: pillar-wide at the foot, tip-narrow where it sinks in.
     ///
+    /// A slim landing (§2.4 step 7) swaps the pillar for a slim, sizes both
+    /// joints from the slim radius, and has no tail: the slim's end ball
+    /// already reaches the sunk point (§3.1.1 Q3).
+    ///
     /// `tip_radius` and `radius` are millimetres.
     pub fn add_landing(&mut self, id: SupportId, tip_radius: f32, radius: f32, landing: &Landing) {
         let round = |kind, a, b, radius_a, radius_b| Part {
@@ -237,7 +244,12 @@ impl SupportSet {
         // Both landing joints share one radius (§3.1.1 Q4). The plan records
         // CHITUBOX's doubled 1.04 scale on this path as a likely bug, so use
         // the plate pillars' 1.04 × radius.
-        let joint = radius * 1.04;
+        let (body, body_radius, foot_ball) = match landing.kind {
+            LandingKind::Pillar => (PartKind::Pillar, radius, radius * 1.04),
+            // The slim's end ball is exactly the slim radius (§3.1.1 Q2).
+            LandingKind::Slim { radius } => (PartKind::Slim, radius, radius),
+        };
+        let joint = body_radius * 1.04;
         let mut parts = vec![
             round(
                 PartKind::ContactSphere,
@@ -248,11 +260,13 @@ impl SupportSet {
             ),
             round(PartKind::TipCone, contact, tip, tip_radius, radius),
             round(PartKind::Joint, tip, tip, joint, joint),
-            round(PartKind::Pillar, tip, foot, radius, radius),
-            round(PartKind::Joint, foot, foot, joint, joint),
+            round(body, tip, foot, body_radius, body_radius),
+            round(PartKind::Joint, foot, foot, foot_ball, foot_ball),
         ];
-        for &(end, _) in &landing.tails {
-            parts.push(round(PartKind::Tail, foot, end, radius, tip_radius));
+        if landing.kind == LandingKind::Pillar {
+            for &(end, _) in &landing.tails {
+                parts.push(round(PartKind::Tail, foot, end, radius, tip_radius));
+            }
         }
 
         let normal = (tip - contact).try_normalize(f32::EPSILON);
@@ -602,6 +616,7 @@ mod tests {
     fn landing_support_ends_in_a_tail() {
         let mut set = SupportSet::default();
         let landing = Landing {
+            kind: LandingKind::Pillar,
             contact: Vector3::new(1.0, 1.0, 20.0),
             tip: Vector3::new(1.0, 1.0, 18.0),
             foot: Vector3::new(1.0, 1.0, 12.0),

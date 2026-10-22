@@ -154,7 +154,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
             landing,
         );
     }
-    let network = placement.generate_braces(&model, &bvh, &generated.plate);
+    let network = placement.generate_braces(&model, &bvh, &generated);
     set.braces = network.braces;
     for (index, bottom_z) in network.fork_bottoms {
         set.truncate_pillar(index, bottom_z);

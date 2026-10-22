@@ -11,7 +11,12 @@
 //!   (§2.5 steps 3–4);
 //! * nearly-collinear triples of pillars become inverted-V forks: the middle
 //!   pillar stops short and is carried by two 45° links to its neighbours
-//!   (§2.5 step 2).
+//!   (§2.5 step 2);
+//! * model-landing pillars get the same spanning-tree bracing, but only along
+//!   edges shorter than 1.3 × R (§2.4 step 8, §2.5 step 5).
+//!
+//! Every brace is link-tested, and an edge is skipped when a brace already
+//! leaves either pillar within 20° of it (§2.5 steps 4 and 6).
 //!
 //! 2.8's pre-merge is not here; it is off by default and its rules do not run in
 //! normal auto-support.
@@ -68,6 +73,14 @@ const FORK_FLOOR_EXTRA: f32 = 0.1;
 /// "base or raft thickness" (§2.5 step 2).
 const BASE_THICKNESS: f32 = 1.0;
 
+/// `sin(20°)`: a new brace is dropped when one already leaves either pillar
+/// within 20° of its direction (plan §2.5 step 6).
+const SIN_20: f32 = 0.342;
+
+/// The landing-pillar brace edge limit, as a multiple of R = 0.5 × point
+/// spacing (plan §2.5 step 5: 1.3 × R).
+pub const LANDING_EDGE_R_FACTOR: f32 = 1.3;
+
 /// `cos(45°)`: the fork chain turns at most 45° from one step to the next
 /// (plan §2.5 step 2).
 const COS_45: f32 = 0.707_106_78;
@@ -86,6 +99,33 @@ pub struct Pillar {
     /// they join (plan §2.5 step 4: `supportcrossdiameter` never reaches the
     /// algorithm, so `0.8`/`1.2`/`1.5` Ø becomes the brace radius too).
     pub radius: f32,
+    /// The lowest height a brace may reach on this pillar: `supportconnminheight`
+    /// above the plate for plate pillars, the foot for model-landing pillars.
+    pub floor_z: f32,
+}
+
+impl Pillar {
+    /// A pillar standing on the plate.
+    pub fn plate(xy: Vector2<f32>, top_z: f32, tip_z: f32, radius: f32) -> Self {
+        Self {
+            xy,
+            top_z,
+            tip_z,
+            radius,
+            floor_z: BRACE_STOP_HEIGHT,
+        }
+    }
+
+    /// A model-landing pillar from its tip end `top_z` down to `foot_z`.
+    pub fn landing(xy: Vector2<f32>, top_z: f32, foot_z: f32, radius: f32) -> Self {
+        Self {
+            xy,
+            top_z,
+            tip_z: top_z,
+            radius,
+            floor_z: foot_z,
+        }
+    }
 }
 
 /// The complete brace network: 45° spanning-tree braces plus inverted-V fork
@@ -98,25 +138,43 @@ pub struct BraceNetwork {
     pub fork_bottoms: Vec<(usize, f32)>,
 }
 
-/// Builds the set of brace parts for a routed support set.
+/// Builds the set of brace parts for a set of pillars.
 ///
-/// `pillars` is one entry per routed support's vertical pillar. The Delaunay /
-/// MST is computed over the XY positions; each kept edge is braced with 45°
-/// diagonals from the higher pillar down to the lower (plan §2.5 step 4).
-pub fn build_braces(pillars: &[Pillar]) -> Vec<Part> {
+/// The Delaunay / MST is computed over the XY positions, keeping only edges no
+/// longer than `max_spacing`; each kept edge is braced with link-tested 45°
+/// diagonals from the lower pillar top down toward the higher pillar (plan
+/// §2.5 step 4). An edge is skipped when a brace already leaves either of its
+/// pillars within 20° of the edge's direction (§2.5 step 6).
+pub fn build_braces(pillars: &[Pillar], max_spacing: f32, mesh: &Mesh, bvh: &Bvh) -> Vec<Part> {
     if pillars.len() < 2 {
         return Vec::new();
     }
 
-    let edges = spanning_tree_edges(pillars);
-
+    let mut leaving: Vec<Vec<Vector2<f32>>> = vec![Vec::new(); pillars.len()];
     let mut braces = Vec::new();
-    for (i, j) in edges {
-        if let Some(parts) = brace_pair(pillars[i], pillars[j]) {
+    for (i, j) in spanning_tree_edges(pillars, max_spacing) {
+        let Some(dir) = (pillars[j].xy - pillars[i].xy).try_normalize(f32::EPSILON) else {
+            continue;
+        };
+        if near_parallel(&leaving[i], dir) || near_parallel(&leaving[j], -dir) {
+            continue;
+        }
+
+        if let Some(parts) = brace_pair(pillars[i], pillars[j], mesh, bvh) {
+            leaving[i].push(dir);
+            leaving[j].push(-dir);
             braces.extend(parts);
         }
     }
     braces
+}
+
+/// Whether any of the brace directions `existing` leaves within 20° of `dir`
+/// (plan §2.5 step 6: dot > 0 and |cross| < sin 20°). All are unit vectors.
+fn near_parallel(existing: &[Vector2<f32>], dir: Vector2<f32>) -> bool {
+    existing
+        .iter()
+        .any(|u| u.dot(&dir) > 0.0 && u.perp(&dir).abs() < SIN_20)
 }
 
 /// Builds the full brace network over `pillars`: the spanning-tree braces of
@@ -125,7 +183,7 @@ pub fn build_braces(pillars: &[Pillar]) -> Vec<Part> {
 /// `cone_length` is the tip cone length (`supporttiplength`), used to place the
 /// fork point. `mesh`/`bvh` are the model, used to link-test each fork link.
 pub fn build_network(pillars: &[Pillar], mesh: &Mesh, bvh: &Bvh, cone_length: f32) -> BraceNetwork {
-    let mut braces = build_braces(pillars);
+    let mut braces = build_braces(pillars, MAX_CROSS_SPACING_XY, mesh, bvh);
     let (fork_links, fork_bottoms) = build_forks(pillars, cone_length, mesh, bvh);
     braces.extend(fork_links);
     BraceNetwork {
@@ -269,14 +327,15 @@ fn fork_at(
 }
 
 /// Delaunay triangulation over pillar XY positions, reduced to a minimum
-/// spanning tree, then filtered to edges no longer than
-/// [`MAX_CROSS_SPACING_XY`]. Returns `(a, b)` index pairs into `pillars`.
+/// spanning tree, then filtered to edges no longer than `max_spacing`. Kruskal
+/// visits edges shortest first, so this is also the minimum spanning forest of
+/// the edges within `max_spacing`. Returns `(a, b)` index pairs into `pillars`.
 ///
 /// The MST is Kruskal over the Delaunay edges: Delaunay already contains the
 /// Euclidean MST as a subgraph, so this converges quickly and the plan's
 /// "1.3 × R edge filter" (§2.5 step 3) is not needed for the plate-pillar path
 /// (it only runs in enhanced mode).
-fn spanning_tree_edges(pillars: &[Pillar]) -> Vec<(usize, usize)> {
+fn spanning_tree_edges(pillars: &[Pillar], max_spacing: f32) -> Vec<(usize, usize)> {
     let points: Vec<Point2<f32>> = pillars
         .iter()
         .map(|p| Point2::new(p.xy.x, p.xy.y))
@@ -348,7 +407,7 @@ fn spanning_tree_edges(pillars: &[Pillar]) -> Vec<(usize, usize)> {
         // Apply the max-spacing filter on the actual pillar distance.
         let pa = pillars[ia].xy;
         let pb = pillars[ib].xy;
-        if (pa - pb).magnitude() <= MAX_CROSS_SPACING_XY {
+        if (pa - pb).magnitude() <= max_spacing {
             kept.push((ia, ib));
         }
 
@@ -368,9 +427,10 @@ fn point_index(points: &[Point2<f32>], p: Point2<f32>) -> Option<usize> {
     points.iter().position(|q| q.x == p.x && q.y == p.y)
 }
 
-/// Braces a pillar pair with 45° diagonals (plan §2.5 step 4). Returns `None`
-/// when the pair is too close or too short to brace.
-fn brace_pair(a: Pillar, b: Pillar) -> Option<Vec<Part>> {
+/// Braces a pillar pair with 45° diagonals (plan §2.5 step 4). Each brace is
+/// link-tested and a failing one is skipped. Returns `None` when the pair is
+/// too close or too short to brace, or every brace fails.
+fn brace_pair(a: Pillar, b: Pillar, mesh: &Mesh, bvh: &Bvh) -> Option<Vec<Part>> {
     let higher = if a.top_z >= b.top_z { a } else { b };
     let lower = if a.top_z >= b.top_z { b } else { a };
 
@@ -389,21 +449,27 @@ fn brace_pair(a: Pillar, b: Pillar) -> Option<Vec<Part>> {
     // First brace starts 0.15 mm below the lower pillar's top, descending
     // toward the higher pillar's surface height.
     let start_z = lower.top_z - FIRST_BRACE_DROP;
+    // Braces stay above both pillars' floors.
+    let floor = lower.floor_z.max(higher.floor_z);
 
     let mut parts = Vec::new();
     let mut z = start_z;
-    while z > BRACE_STOP_HEIGHT {
+    while z > floor {
         // A brace drops exactly as far as it travels sideways (45°). If that
-        // would carry it below the minimum brace height above the plate, stop:
-        // braces end at `supportconnminheight`, they are never truncated to a
-        // shallower angle (§2.5 step 4).
+        // would carry it below the floor, stop: braces end at
+        // `supportconnminheight` (or a landing pillar's foot), they are never
+        // truncated to a shallower angle (§2.5 step 4).
         let to_z = z - run;
-        if to_z < BRACE_STOP_HEIGHT {
+        if to_z < floor {
             break;
         }
 
         let from = Vector3::new(lower.xy.x, lower.xy.y, z);
         let to = Vector3::new(higher.xy.x, higher.xy.y, to_z);
+        if collision::link_test(mesh, bvh, from, to, radius) {
+            z -= step_z;
+            continue;
+        }
 
         parts.push(Part {
             kind: PartKind::Brace,
@@ -423,18 +489,19 @@ fn brace_pair(a: Pillar, b: Pillar) -> Option<Vec<Part>> {
 #[cfg(test)]
 mod tests {
     use common::progress::Progress;
-    use nalgebra::Vector2;
+    use nalgebra::{Vector2, Vector3};
     use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 
     use super::*;
 
     fn pillar(x: f32, y: f32, z: f32) -> Pillar {
-        Pillar {
-            xy: Vector2::new(x, y),
-            top_z: z,
-            tip_z: z,
-            radius: 0.6,
-        }
+        Pillar::plate(Vector2::new(x, y), z, z, 0.6)
+    }
+
+    /// Plate bracing over an empty scene, with the default 30 mm span.
+    fn plate_braces(pillars: &[Pillar]) -> Vec<Part> {
+        let (mesh, bvh) = empty_scene();
+        build_braces(pillars, MAX_CROSS_SPACING_XY, &mesh, &bvh)
     }
 
     /// A model with no triangles, so every collision test passes (returns no
@@ -447,7 +514,7 @@ mod tests {
 
     #[test]
     fn no_braces_for_single_pillar() {
-        let braces = build_braces(&[pillar(0.0, 0.0, 10.0)]);
+        let braces = plate_braces(&[pillar(0.0, 0.0, 10.0)]);
         assert!(braces.is_empty());
     }
 
@@ -455,7 +522,7 @@ mod tests {
     fn close_pair_gets_braced() {
         // Two pillars 10 mm apart, tall enough to take at least one brace.
         let pillars = [pillar(0.0, 0.0, 30.0), pillar(10.0, 0.0, 30.0)];
-        let braces = build_braces(&pillars);
+        let braces = plate_braces(&pillars);
         assert!(!braces.is_empty(), "a close, tall pair must be braced");
 
         for brace in &braces {
@@ -474,18 +541,83 @@ mod tests {
     fn far_pair_is_not_braced() {
         // Two pillars 40 mm apart exceed the 30 mm max spacing.
         let pillars = [pillar(0.0, 0.0, 30.0), pillar(40.0, 0.0, 30.0)];
-        assert!(build_braces(&pillars).is_empty());
+        assert!(plate_braces(&pillars).is_empty());
     }
 
     #[test]
     fn braces_stop_above_the_plate() {
         let pillars = [pillar(0.0, 0.0, 30.0), pillar(10.0, 0.0, 30.0)];
-        for brace in build_braces(&pillars) {
+        for brace in plate_braces(&pillars) {
             assert!(
                 brace.b.z >= BRACE_STOP_HEIGHT - 1e-3,
                 "brace must stop above the plate"
             );
         }
+    }
+
+    /// An axis-aligned box mesh with outward facing triangles.
+    fn box_scene(min: Vector3<f32>, max: Vector3<f32>) -> (Mesh, Bvh) {
+        let mut verts = Vec::new();
+        for i in 0..8 {
+            let pick = |bit, lo: f32, hi: f32| if i & bit == 0 { lo } else { hi };
+            verts.push(Vector3::new(
+                pick(1, min.x, max.x),
+                pick(2, min.y, max.y),
+                pick(4, min.z, max.z),
+            ));
+        }
+        #[rustfmt::skip]
+        let quads = [
+            [0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4],
+            [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5],
+        ];
+        let faces = quads
+            .iter()
+            .flat_map(|&[a, b, c, d]| [[a, b, c], [a, c, d]])
+            .collect();
+        let mesh = Mesh::new(verts, faces);
+        let bvh = Bvh::build(mesh.inner(), Progress::new());
+        (mesh, bvh)
+    }
+
+    #[test]
+    fn braces_through_the_model_are_skipped() {
+        // A wall between two tall pillars blocks every brace.
+        let (mesh, bvh) = box_scene(Vector3::new(4.0, -5.0, 0.0), Vector3::new(6.0, 5.0, 40.0));
+        let pillars = [pillar(0.0, 0.0, 30.0), pillar(10.0, 0.0, 30.0)];
+        assert!(build_braces(&pillars, MAX_CROSS_SPACING_XY, &mesh, &bvh).is_empty());
+    }
+
+    #[test]
+    fn landing_braces_stay_above_the_feet() {
+        let (mesh, bvh) = empty_scene();
+        let landing = |x, foot| Pillar::landing(Vector2::new(x, 0.0), 12.0, foot, 0.6);
+
+        // 2 mm apart, feet at 8 mm: one brace from 11.85 down to 9.85.
+        let braces = build_braces(&[landing(0.0, 8.0), landing(2.0, 8.0)], 2.6, &mesh, &bvh);
+        assert_eq!(braces.len(), 1);
+        assert!((braces[0].a.z - 11.85).abs() < 1e-4);
+        assert!((braces[0].b.z - 9.85).abs() < 1e-4);
+
+        // A foot at 10.5 mm leaves no room for a full 45° brace.
+        let pillars = [landing(0.0, 8.0), landing(2.0, 10.5)];
+        assert!(build_braces(&pillars, 2.6, &mesh, &bvh).is_empty());
+
+        // 3 mm apart exceeds the 2.6 mm landing edge limit.
+        let pillars = [landing(0.0, 8.0), landing(3.0, 8.0)];
+        assert!(build_braces(&pillars, 2.6, &mesh, &bvh).is_empty());
+    }
+
+    #[test]
+    fn near_parallel_braces_are_detected() {
+        let existing = [Vector2::new(1.0, 0.0)];
+        // 15° off: within 20°.
+        let a = 15f32.to_radians();
+        assert!(near_parallel(&existing, Vector2::new(a.cos(), a.sin())));
+        // 25° off, or pointing the other way: allowed.
+        let b = 25f32.to_radians();
+        assert!(!near_parallel(&existing, Vector2::new(b.cos(), b.sin())));
+        assert!(!near_parallel(&existing, Vector2::new(-1.0, 0.0)));
     }
 
     #[test]

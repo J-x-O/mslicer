@@ -45,7 +45,7 @@ impl GenerateSupports {
 
                 handle: TaskThread::spawn(clone!([progress], move || {
                     let generated = generator.generate_supports(&mesh, &half_ege, &bvh, &progress);
-                    let network = generator.generate_braces(&mesh, &bvh, &generated.plate);
+                    let network = generator.generate_braces(&mesh, &bvh, &generated);
                     RoutedWithBraces { generated, network }
                 })),
                 progress,

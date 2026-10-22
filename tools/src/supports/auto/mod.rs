@@ -21,7 +21,7 @@ pub mod quazirandom;
 pub mod tip;
 pub mod topology;
 
-pub use landing::{Landing, LandingConfig};
+pub use landing::{Landing, LandingConfig, LandingKind};
 pub use topology::BraceNetwork;
 
 /// The routed supports of one generation run.
@@ -158,36 +158,43 @@ impl AutoPlacement {
             cone_length: support.tip_length.get::<Milimeter>(),
             contact_depth: support.contact_depth.get::<Milimeter>(),
             tail_depth: support.tail_depth.get::<Milimeter>(),
-            max_lean: 4.0 * support.slim_radius.get::<Milimeter>(),
+            slim_radius: support.slim_radius.get::<Milimeter>(),
+            slim_depth: support.slim_depth.get::<Milimeter>(),
         }
     }
 
     /// Builds the brace network (plan §2.5) over the routed supports.
     ///
-    /// Each routed triplet's `joint` is the pillar top; the brace network runs
+    /// Each plate triplet's `joint` is the pillar top; the brace network runs
     /// a Delaunay + MST over the pillar XY positions for the 45° spanning-tree
-    /// braces, then chains nearly-collinear triples into inverted-V forks. The
-    /// returned [`BraceNetwork`] carries both the brace/fork link parts and the
-    /// pillar truncations the forks impose. `routed` must be the plate supports
-    /// of [`Self::generate_supports`] (or hand-routed triplets of the same form).
-    pub fn generate_braces(
-        &self,
-        mesh: &Mesh,
-        bvh: &Bvh,
-        routed: &[[Vector3<f32>; 3]],
-    ) -> BraceNetwork {
+    /// braces, then chains nearly-collinear triples into inverted-V forks.
+    /// Model-landing pillars are braced among themselves along edges shorter
+    /// than 1.3 × R, R = 0.5 × point spacing (§2.4 step 8); slims are not
+    /// braced. The returned [`BraceNetwork`] carries the brace/fork link parts
+    /// and the plate-pillar truncations the forks impose, indexed into
+    /// `generated.plate`.
+    pub fn generate_braces(&self, mesh: &Mesh, bvh: &Bvh, generated: &Generated) -> BraceNetwork {
         let radius = self.support.radius.get::<Milimeter>();
         let cone_length = self.support.tip_length.get::<Milimeter>();
-        let pillars: Vec<topology::Pillar> = routed
-            .iter()
-            .map(|[_, tip, joint]| topology::Pillar {
-                xy: joint.xy(),
-                top_z: joint.z,
-                tip_z: tip.z,
-                radius,
+        let pillars: Vec<topology::Pillar> = (generated.plate.iter())
+            .map(|[_, tip, joint]| topology::Pillar::plate(joint.xy(), joint.z, tip.z, radius))
+            .collect();
+        let mut network = topology::build_network(&pillars, mesh, bvh, cone_length);
+
+        let landing_pillars: Vec<topology::Pillar> = (generated.landings.iter())
+            .filter(|landing| landing.kind == LandingKind::Pillar)
+            .map(|landing| {
+                topology::Pillar::landing(landing.tip.xy(), landing.tip.z, landing.foot.z, radius)
             })
             .collect();
-        topology::build_network(&pillars, mesh, bvh, cone_length)
+        let max_spacing = topology::LANDING_EDGE_R_FACTOR * 0.5 * self.placement.min_spacing;
+        network.braces.extend(topology::build_braces(
+            &landing_pillars,
+            max_spacing,
+            mesh,
+            bvh,
+        ));
+        network
     }
 }
 

@@ -26,6 +26,9 @@ pub struct SupportPreset {
     /// 0.4 / 0.5 / 0.5 Ø). A model-landing tail leans at most 2 × slim Ø
     /// sideways (§2.4 step 4).
     pub slim_radius: Milimeters,
+    /// How far a slim pillar's lower end sinks into the model (§3.1.1 Q3,
+    /// `supportmiddlesmallpillarlowercontactdepth`: 0.25 / 0.3 / 0.3).
+    pub slim_depth: Milimeters,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +194,7 @@ impl SupportPreset {
         contact_depth: Milimeters::new(0.3),
         tail_depth: Milimeters::new(0.2),
         slim_radius: Milimeters::new(0.2),
+        slim_depth: Milimeters::new(0.25),
     };
 
     pub const MDEIUM: Self = Self {
@@ -201,6 +205,7 @@ impl SupportPreset {
         contact_depth: Milimeters::new(0.4),
         tail_depth: Milimeters::new(0.2),
         slim_radius: Milimeters::new(0.25),
+        slim_depth: Milimeters::new(0.3),
     };
 
     pub const HEAVY: Self = Self {
@@ -211,6 +216,7 @@ impl SupportPreset {
         contact_depth: Milimeters::new(0.6),
         tail_depth: Milimeters::new(0.3),
         slim_radius: Milimeters::new(0.25),
+        slim_depth: Milimeters::new(0.3),
     };
 }
 
