@@ -10,7 +10,7 @@ use slicer::geometry::{
 };
 use tracing::info;
 
-use crate::supports::mesh::SupportPreset;
+use crate::supports::{Part, mesh::SupportPreset};
 
 pub mod collision;
 pub mod detect;
@@ -18,6 +18,7 @@ pub mod grid;
 pub mod points;
 pub mod quazirandom;
 pub mod tip;
+pub mod topology;
 
 pub struct AutoPlacement {
     pub placement: PlacementConfig,
@@ -104,6 +105,25 @@ impl AutoPlacement {
                 routed.map(|(tip_end, joint)| [x.point, tip_end, joint])
             })
             .collect()
+    }
+
+    /// Builds the brace network (plan §2.5 steps 3–4) over the routed supports.
+    ///
+    /// Each routed triplet's `joint` is the pillar top; the brace network runs
+    /// a Delaunay + MST over the pillar XY positions and returns the 45° braces
+    /// that tie tall, close pillars together. `routed` must be the output of
+    /// [`Self::generate_supports`] (or hand-routed triplets of the same form).
+    pub fn generate_braces(&self, routed: &[[Vector3<f32>; 3]]) -> Vec<Part> {
+        let radius = self.support.radius.get::<Milimeter>();
+        let pillars: Vec<topology::Pillar> = routed
+            .iter()
+            .map(|[_, _, joint]| topology::Pillar {
+                xy: joint.xy(),
+                top_z: joint.z,
+                radius,
+            })
+            .collect();
+        topology::build_braces(&pillars)
     }
 }
 

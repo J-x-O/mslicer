@@ -130,7 +130,8 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     let generate_ms = generate_start.elapsed().as_millis();
 
     // Expand routed triplets [contact, tip, joint] into a SupportSet so we can
-    // mesh them with the same code path the app uses.
+    // mesh them with the same code path the app uses, and add the brace network
+    // computed over the pillar tops.
     let mut set = tools::supports::SupportSet::default();
     for (i, [contact, tip, joint]) in routed.iter().enumerate() {
         set.add_routed(
@@ -140,6 +141,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
             [*contact, *tip, *joint],
         );
     }
+    set.braces = placement.generate_braces(&routed);
 
     let build_start = Instant::now();
     let (mesh, _map) = build_supports(&set, Transform::default(), 24)
@@ -150,7 +152,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     let our_volume = mesh_volume(&mesh);
     let our_triangles = mesh.face_count();
 
-    // Part-kind histogram.
+    // Part-kind histogram, including the top-level brace network.
     let mut part_kinds: Vec<(PartKind, usize)> = Vec::new();
     for support in &set.supports {
         for part in &support.parts {
@@ -159,6 +161,13 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
             } else {
                 part_kinds.push((part.kind, 1));
             }
+        }
+    }
+    for brace in &set.braces {
+        if let Some((_, count)) = part_kinds.iter_mut().find(|(k, _)| *k == brace.kind) {
+            *count += 1;
+        } else {
+            part_kinds.push((brace.kind, 1));
         }
     }
     part_kinds.sort_by_key(|(k, _)| format!("{k:?}"));

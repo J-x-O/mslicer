@@ -13,12 +13,18 @@ use crate::{
 
 type RoutedSupports = Vec<[Vector3<f32>; 3]>;
 
+/// The routed triplets plus the brace network computed over them.
+struct RoutedWithBraces {
+    routed: RoutedSupports,
+    braces: Vec<tools::supports::Part>,
+}
+
 pub struct GenerateSupports {
     model: ModelId,
     preset: SupportPreset,
 
     progress: Progress,
-    handle: TaskThread<RoutedSupports>,
+    handle: TaskThread<RoutedWithBraces>,
 }
 
 impl GenerateSupports {
@@ -40,7 +46,9 @@ impl GenerateSupports {
                 preset: support,
 
                 handle: TaskThread::spawn(clone!([progress], move || {
-                    generator.generate_supports(&mesh, &half_ege, &bvh, &progress)
+                    let routed = generator.generate_supports(&mesh, &half_ege, &bvh, &progress);
+                    let braces = generator.generate_braces(&routed);
+                    RoutedWithBraces { routed, braces }
                 })),
                 progress,
             });
@@ -54,9 +62,11 @@ impl Task for GenerateSupports {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
         self.handle
             .poll(app, "Failed to Generate Supports")
-            .into_poll_result(|supports| {
+            .into_poll_result(|out| {
                 if let Some(model) = app.project.model(self.model) {
-                    model.supports.replace_auto(&self.preset, supports);
+                    model
+                        .supports
+                        .replace_auto_with_braces(&self.preset, out.routed, out.braces);
                 }
 
                 PollResult::complete()

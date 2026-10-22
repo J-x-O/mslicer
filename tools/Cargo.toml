@@ -22,5 +22,6 @@ ordered-float.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 rayon.workspace = true
+spade.workspace = true
 svg.workspace = true
 tracing.workspace = true
