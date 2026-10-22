@@ -276,7 +276,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     let preset = match std::env::var("PRESET").as_deref() {
         Ok("light") => SupportPreset::LIGHT,
         Ok("heavy") => SupportPreset::HEAVY,
-        _ => SupportPreset::MDEIUM,
+        _ => SupportPreset::MIDDLE,
     };
     let placement = AutoPlacement::new(PlacementConfig::default(), preset, bed);
 

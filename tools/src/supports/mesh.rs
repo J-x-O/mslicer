@@ -14,10 +14,16 @@ pub type FaceMap = HashMap<SupportId, Range<u32>>;
 
 #[derive(Clone, PartialEq)]
 pub struct SupportPreset {
+    /// Pillar radius, half of `supportmiddlediameter` (0.8 / 1.2 / 1.5 Ø).
     pub radius: Milimeters,
+    /// Collision clearance added to the pillar radius,
+    /// `supportspacingfrommodel` (0.6, §2.7).
     pub margin: Milimeters,
 
+    /// Tip-cone radius at the contact, half of `supporttipupdiameter`
+    /// (0.3 / 0.4 / 0.6 Ø).
     pub tip_radius: Milimeters,
+    /// `supporttiplength` (2 / 2 / 3).
     pub tip_length: Milimeters,
     /// How far the tip sinks into the model at the contact, in millimetres
     /// (§2.2 step 2, §3.1: 0.3 / 0.4 / 0.6 for Light / Middle / Heavy).
@@ -148,8 +154,8 @@ impl Default for Transform {
 impl SupportPreset {
     pub const LIGHT: Self = Self {
         radius: Milimeters::new(0.4),
-        margin: Milimeters::new(0.5),
-        tip_radius: Milimeters::new(0.2),
+        margin: Milimeters::new(0.6),
+        tip_radius: Milimeters::new(0.15),
         tip_length: Milimeters::new(2.0),
         contact_depth: Milimeters::new(0.3),
         tail_depth: Milimeters::new(0.2),
@@ -169,9 +175,9 @@ impl SupportPreset {
         raft_grid_width: Milimeters::new(2.0),
     };
 
-    pub const MDEIUM: Self = Self {
+    pub const MIDDLE: Self = Self {
         radius: Milimeters::new(0.6),
-        margin: Milimeters::new(0.5),
+        margin: Milimeters::new(0.6),
         tip_radius: Milimeters::new(0.2),
         tip_length: Milimeters::new(2.0),
         contact_depth: Milimeters::new(0.4),
@@ -194,9 +200,9 @@ impl SupportPreset {
 
     pub const HEAVY: Self = Self {
         radius: Milimeters::new(0.8),
-        margin: Milimeters::new(0.5),
-        tip_radius: Milimeters::new(0.2),
-        tip_length: Milimeters::new(2.0),
+        margin: Milimeters::new(0.6),
+        tip_radius: Milimeters::new(0.3),
+        tip_length: Milimeters::new(3.0),
         contact_depth: Milimeters::new(0.6),
         tail_depth: Milimeters::new(0.3),
         slim_radius: Milimeters::new(0.25),
@@ -217,6 +223,18 @@ impl SupportPreset {
 }
 
 impl SupportPreset {
+    /// The built-in presets and their names (§8.1).
+    pub const PRESETS: [(&str, Self); 3] = [
+        ("Light", Self::LIGHT),
+        ("Middle", Self::MIDDLE),
+        ("Heavy", Self::HEAVY),
+    ];
+
+    /// The name of the built-in preset these settings match, if any.
+    pub fn name(&self) -> Option<&'static str> {
+        (Self::PRESETS.iter()).find_map(|(name, preset)| (preset == self).then_some(*name))
+    }
+
     /// The plate-pillar foot settings (§3.2).
     pub fn base_config(&self) -> BaseConfig {
         BaseConfig {
@@ -245,6 +263,6 @@ impl SupportPreset {
 
 impl Default for SupportPreset {
     fn default() -> Self {
-        Self::MDEIUM
+        Self::MIDDLE
     }
 }
