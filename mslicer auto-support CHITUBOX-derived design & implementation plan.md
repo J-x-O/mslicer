@@ -43,61 +43,52 @@ The extraction is reproducible with the flake in `~/Documents/chitubox-supports-
 
 ## Current mslicer support code
 
-mslicer v0.9.2 (commit `19abc4a`, 30 Aug 2026) places supports with three independent detectors and routes each one alone. Nothing checks the finished support against the model, and supports are drawn but never sliced.
+This section documents the state **after M0–M3** (the quick fixes through the routing collision tests and joint sphere). It replaces the v0.9.2 description that used to live here; every file listed below is the live implementation, and the pipeline below is what `AutoPlacement::generate_supports` runs today. Not yet implemented: M4 (topology/merging), M5 (bases/raft/presets), M6 (manual tools).
 
 ### Where the code lives
 
 | File | Lines | Role |
 | --- | --- | --- |
-| `tools/src/supports/mod.rs` | 175 | `SupportConfig`, `generate_supports`, `route_support`, `build_raft_mesh` |
-| `tools/src/supports/detect.rs` | 196 | Overhang faces, edges and lowest vertices |
-| `tools/src/supports/quazirandom.rs` | 24 | Low-discrepancy 2D point sequence for face sampling |
-| `mslicer/src/project/supports.rs` | 102 | Stores auto and manual supports as 3 points each; builds the render mesh |
-| `mslicer/src/windows/supports.rs` | \~140 | UI: "Generate" button and manual click placement |
+| `tools/src/supports/mod.rs` | ~9 | Public API: re-exports `Part`/`PartKind`/`SupportSet`, declares `SupportId` |
+| `tools/src/supports/parts.rs` | ~547 | `SupportSet` and the `Part` catalogue; `add_routed` expands a [contact, tip, joint] triplet into typed parts; serialization |
+| `tools/src/supports/mesh.rs` | ~206 | `SupportPreset` (Light/Middle/Heavy), `Transform`, `build_supports`, per-part meshing (`add_sphere`/`add_cylinder`) |
+| `tools/src/supports/auto/mod.rs` | ~372 | `AutoPlacement::generate_supports` (stage 1→2 driver) and `route_support` (stage 2) |
+| `tools/src/supports/auto/grid.rs` | ~215 | Stage 1 ray grid: `footprint` and `sample_surface` (plan §1.1, §1.3) |
+| `tools/src/supports/auto/points.rs` | ~270 | Stage 1 point placement: `place_points` coverage/dedupe (plan §1.2, §1.4–1.6) |
+| `tools/src/supports/auto/tip.rs` | ~74 | Tip direction clamping, `clamp_tip_direction` (plan §2.2) |
+| `tools/src/supports/auto/collision.rs` | ~216 | Multi-line collision tests: `horn_test`/`link_test`/`main_test`/`segment_hits` (plan §2.7) |
+| `tools/src/supports/auto/detect.rs` | ~205 | Legacy three detectors (`overhanging_faces`, `place_face_supports`, `place_edge_supports`, `place_point_supports`). **No longer driven by `generate_supports`; dead code** |
+| `tools/src/supports/auto/quazirandom.rs` | ~24 | Low-discrepancy 2D point sequence (used only by the dead detector path) |
+| `mslicer/src/core/project/supports.rs` | ~184 | `Supports` handle: stores `auto` + `manual` `SupportSet`s, builds the render mesh |
+| `mslicer/src/interface/panels/supports.rs` | ~285 | UI: "Generate" button, manual click placement, lift handling |
 
-A support is always exactly three points: contact point, tip end, and one middle point. The pillar then drops vertically from the middle point to z = 0.
+A routed support is still three points — contact, tip end, and joint — but `add_routed` now expands those into a typed `Support` whose `parts` carry the render geometry (contact sphere, tip cone, optional link, joint sphere, vertical pillar). The pillar drops vertically from the joint to the plate; the model is lifted by `SupportSet::lift` (default 5 mm) before supports are placed.
 
 ### Current pipeline
 
-1. **Overhang faces**: every face whose normal is within `max_angle` (30°) of straight down.
-2. **Face supports**: quasi-random points over the whole build plate (about one per 50 mm²), each cast as an upward ray. Every overhanging face that ray crosses gets a support, at every height.
-3. **Edge supports**: chains of edges where neighbouring face normals differ by more than 0.1 rad (5.7°), sampled every 20 mm.
-4. **Point supports**: vertices lower than all their neighbours, on a downward-facing face.
-5. **Dedupe**: face supports within 5 mm of an edge or point support are removed, and edge supports within 5 mm of a point support. Supports of the same kind are never deduplicated against each other.
-6. **Routing** (`route_support`): start at `point + normal × tip_length` (3 mm). Step away from the closest model surface with momentum, never upward, for up to 100 steps, until a straight-down ray misses the model. That spot becomes the middle point.
-7. **Mesh**: a tapered cylinder (radius 0.2 → 1.0) for the tip, a cylinder for the arm, a vertical cylinder to the plate, spheres at the joints. The raft is one convex hull around every pillar foot.
+1. **Footprint & ray grid** (`grid.rs`): the model is rasterised onto a vertical-ray grid sized from its footprint (plan §1.1). Every grid column casts one ray down through the mesh; crossings pair into inside-the-model intervals, and each interval's exit surface (downward-facing) becomes a `SurfaceSample` with a world-space position and normal.
+2. **Point placement** (`points.rs`: `place_points`): the samples are covered and deduplicated into a sparse set of contact points (plan §1.2, §1.4–1.6). This replaces the three legacy detectors — the wall/bound/key steps are still gated off, so only the basic low + fill path runs.
+3. **Routing** (`route_support`, plan §2.3): for each contact point, clamp its tip direction to at most 70° from down (`tip::clamp_tip_direction`, §2.2). First try a straight vertical drop; if that fails, search lateral pillar sites up to 15 mm away and try a 45° link from the tip end to the pillar top. Every candidate is validated by the multi-line collision tests.
+4. **Collision tests** (`collision.rs`, plan §2.7): `horn_test` (tip cone), `link_test` (45° link), and `main_test` (vertical pillar) each intersect several offset line segments — not just the centreline — against the model BVH, so thin walls can't slip through between samples.
+5. **Expansion** (`parts.rs::add_routed`): each surviving [contact, tip, joint] triplet becomes a `Support` with a `ContactSphere`, a `TipCone`, an optional `Link` (only when the pillar sits laterally from the tip end), a `Joint` sphere (radius `1.04 × pillar radius`, §3.1.1), and a vertical `Pillar`.
+6. **Mesh** (`mesh.rs::build_supports`): each part is meshed (`add_sphere` for contact/joint, `add_cylinder` for the rest) and transformed to world space; the raft is still a single convex hull around every pillar foot (to be replaced in M5).
 
-### Root causes of the three defects
+### What M0–M3 fixed
 
-**Clutter**
+- **Tips through geometry**: `horn_test` now rejects a tip passing through the model (thin walls and tips pointed into the model); this is the §2.7 tip check that was previously missing.
+- **Near-horizontal arms**: the joint is lowered to the 45° line before collision checks, so no arm is flatter than 45°; if that line ends below the plate the support is dropped.
+- **Normals normalised after transform**: `transform_normal` uses the inverse-transpose, so normals on a scaled model were no longer unit length; they are renormalised before the overhang-angle and tip-length checks.
+- **Contact depth**: the tip sinks `contact_depth` (0.3/0.4/0.6 mm) into the model instead of touching the surface.
+- **Model lift**: the app lifts by the lowest point, not the object origin.
+- **Joint sphere** (M3 slice 4): a single sphere, centred on the join vertex with no axial offset, radius `1.04 × pillar radius` (§3.1.1).
 
-- Face sampling adds a support for every overhanging face along each ray, including overhangs that sit directly above other parts of the model. Those are the supports that later have to wander sideways.
-- Edge detection fires on any 5.7° crease. Finely tessellated curved surfaces produce many such edges, each sampled every 20 mm.
-- On curved tessellated surfaces, many vertices count as local minima.
-- There is no coverage model: nothing asks whether an area is already held by a nearby support. Same-kind supports are never deduplicated.
-- Every support gets its own pillar to the plate. Nothing merges neighbours into shared trunks.
+### Remaining gaps (targeted by later milestones)
 
-**Near-horizontal arms**
-
-- `route_support` moves freely in x and y and only limits z to "not up". Near a wall the gradient is almost horizontal, so the walk runs sideways, up to 100 steps of up to 1 mm.
-- The arm from tip end to middle point is a straight line with no angle limit, so it can end up nearly flat.
-- Tips follow the surface normal. On steep faces the normal is nearly horizontal, so the tip is too.
-
-**Tips through geometry**
-
-- Neither the tip segment nor the arm is ever tested for intersection. Only the final vertical drop is ray-tested. `Bvh::intersect_segment` exists but isn't used.
-- The arm cuts the corner of the walk path, so it can pass through geometry the walk went around.
-- `place_face_supports` stores the **untransformed** face normal (`mesh.normal`), while overhang detection uses the transformed one. On a rotated model, tips point the wrong way.
-- `place_point_supports` checks vertex `origin_vertex` but places the support at `origin.vertex`, a neighbour. It also sums untransformed normals.
-- A 3 mm tip from a thin wall can exit the far side of the wall.
-
-### Other gaps that affect the design
-
-- **Supports are not sliced.** Nothing outside rendering reads the support mesh; `notes.md` lists "slice supports" as a TODO. Section 9 makes this milestone 1.
-- **No model lift.** Supports end at z = 0 whether or not the model is raised. CHITUBOX lifts the model by `zliftheightinsupportmode` (5 mm) first.
-- **No contact depth.** The tip sphere sits on the surface instead of sinking 0.3–0.6 mm into it, giving a weak, point-like joint.
-- **One giant raft.** A convex hull around all feet makes one large plate even for two distant supports.
-- **Settings mismatch.** `precision` and the raft values in `SupportConfig` are ignored by the mesh builder, which hard-codes 20 segments and a 1 mm raft.
+- **No topology/merging (M4)** — neighbours are not yet merged into shared trunks; each support has its own pillar to the plate. This is the main remaining cause of point-count/volume overage vs CHITUBOX.
+- **No 45° braces or inverted-V forks** (M4, plan §2.5).
+- **Supports are not saved into the project file** — the UI still shows the "not saved" warning (`panels/supports.rs`).
+- **One giant raft** (M5) — a convex hull around all feet, not per-island rafts.
+- **No per-part face attribution** — the comparison harness's `inter` metric counts the intentional contact sink, so the part–model intersection number is never zero until faces are attributed to parts.
 
 ## CHITUBOX pipeline overview
 
