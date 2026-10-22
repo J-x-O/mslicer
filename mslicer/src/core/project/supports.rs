@@ -92,8 +92,8 @@ impl Supports {
         for (index, bottom_z) in network.fork_bottoms {
             self.auto.truncate_pillar(index, bottom_z);
         }
-        // Bases go on last, once forks have cut their middle pillars short.
-        self.auto.add_bases(&config.base_config());
+        // Feet go on last, once forks have cut their middle pillars short.
+        (self.auto).add_feet(&config.base_config(), &config.raft_config());
     }
 
     pub fn add_manual(&mut self, config: &SupportPreset, support: [Vector3<f32>; 3]) {
@@ -104,7 +104,11 @@ impl Supports {
             config.radius.get::<Milimeter>(),
             support,
         );
-        self.manual.add_bases(&config.base_config());
+        // A manual support stands on the auto raft if there is one.
+        match &self.auto.raft {
+            Some(raft) => self.manual.stand_on_raft(raft),
+            None => self.manual.add_bases(&config.base_config()),
+        }
     }
 
     pub fn auto(&self) -> &SupportSet {

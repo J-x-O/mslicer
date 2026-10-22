@@ -18,7 +18,9 @@
 //! Run from the repo root:
 //!   cargo run -p tools --example support_metrics -- [<model-name> ...]
 //! With no arguments it processes every model that has a `<name>_supports.stl`
-//! next to it.
+//! next to it. `PRESET=light|middle|heavy` picks the support preset (default
+//! middle). `RENDER=<dir>` writes top and side depth renders of model plus
+//! supports to `<dir>/<model>_{top,side}.png`.
 
 use std::{
     fs,
@@ -58,6 +60,70 @@ fn mesh_volume(mesh: &Mesh) -> f32 {
     }
 
     volume
+}
+
+/// Orthographic depth render for eyeballing output. `axes` picks the image
+/// x, image y (up) and depth (towards the viewer) world axes; each mesh gets a
+/// base colour, shaded by depth.
+fn render(meshes: &[(&Mesh, [u8; 3])], [u, v, w]: [usize; 3], path: &Path) -> Result<()> {
+    const PX: f32 = 0.1; // mm per pixel
+    let points = |m: &Mesh| -> Vec<Vector3<f32>> {
+        (m.vertices().iter())
+            .map(|p| {
+                let p = m.transform(p);
+                Vector3::new(p[u], p[v], p[w])
+            })
+            .collect()
+    };
+    let all: Vec<_> = meshes.iter().map(|(m, c)| (m, points(m), *c)).collect();
+    let (mut min, mut max) = (Vector3::repeat(f32::MAX), Vector3::repeat(f32::MIN));
+    for p in all.iter().flat_map(|(_, p, _)| p) {
+        min = min.inf(p);
+        max = max.sup(p);
+    }
+    let (width, height) = (
+        ((max.x - min.x) / PX) as u32 + 1,
+        ((max.y - min.y) / PX) as u32 + 1,
+    );
+    let mut depth = vec![f32::MIN; (width * height) as usize];
+    let mut image = image::RgbImage::new(width, height);
+    for (mesh, pts, colour) in &all {
+        for face in mesh.faces() {
+            let [a, b, c] = face.map(|i| {
+                let p = pts[i as usize];
+                Vector3::new((p.x - min.x) / PX, (max.y - p.y) / PX, p.z)
+            });
+            let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if area.abs() < 1e-9 {
+                continue;
+            }
+            let x0 = a.x.min(b.x).min(c.x).max(0.0) as u32;
+            let x1 = (a.x.max(b.x).max(c.x) as u32).min(width - 1);
+            let y0 = a.y.min(b.y).min(c.y).max(0.0) as u32;
+            let y1 = (a.y.max(b.y).max(c.y) as u32).min(height - 1);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let wa = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) / area;
+                    let wb = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) / area;
+                    let wc = 1.0 - wa - wb;
+                    if wa < 0.0 || wb < 0.0 || wc < 0.0 {
+                        continue;
+                    }
+                    let z = wa * a.z + wb * b.z + wc * c.z;
+                    let i = (y * width + x) as usize;
+                    if z > depth[i] {
+                        depth[i] = z;
+                        let shade = 0.35 + 0.65 * (z - min.z) / (max.z - min.z).max(1e-6);
+                        let rgb = colour.map(|ch| (ch as f32 * shade) as u8);
+                        image.put_pixel(x, y, image::Rgb(rgb));
+                    }
+                }
+            }
+        }
+    }
+    image.save(path)?;
+    Ok(())
 }
 
 /// Loads an STL into a `slicer::geometry::mesh::Mesh` in raw (identity) space.
@@ -183,6 +249,7 @@ struct ModelReport {
     chitubox_triangles: usize,
     chitubox_volume: f32,
     part_kinds: Vec<(PartKind, usize)>,
+    raft_islands: usize,
     intersections: usize,
     generate_ms: u128,
     build_ms: u128,
@@ -206,7 +273,12 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
 
     // Build the auto placement exactly as the app's generate button does.
     let bed = Vector3::repeat(Milimeters::new(218.88)); // Saturn 4 Ultra 16K xy
-    let placement = AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
+    let preset = match std::env::var("PRESET").as_deref() {
+        Ok("light") => SupportPreset::LIGHT,
+        Ok("heavy") => SupportPreset::HEAVY,
+        _ => SupportPreset::MDEIUM,
+    };
+    let placement = AutoPlacement::new(PlacementConfig::default(), preset, bed);
 
     let generate_start = Instant::now();
     let generated = {
@@ -253,13 +325,28 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     for (index, bottom_z) in network.fork_bottoms {
         set.truncate_pillar(index, bottom_z);
     }
-    set.add_bases(&placement.support.base_config());
+    set.add_feet(
+        &placement.support.base_config(),
+        &placement.support.raft_config(),
+    );
 
     let build_start = Instant::now();
     let (mesh, _map) = build_supports(&set, Transform::default(), 24)
         .map(|(m, map)| (m, map))
         .unwrap_or_else(|| (Mesh::default(), Default::default()));
     let build_ms = build_start.elapsed().as_millis();
+
+    if let Ok(dir) = std::env::var("RENDER") {
+        let name = model_path.file_stem().unwrap().to_string_lossy();
+        for (view, axes) in [("top", [0, 1, 2]), ("side", [0, 2, 1])] {
+            let path = Path::new(&dir).join(format!("{name}_{view}.png"));
+            render(
+                &[(&model, [200, 120, 80]), (&mesh, [90, 160, 230])],
+                axes,
+                &path,
+            )?;
+        }
+    }
 
     let our_volume = mesh_volume(&mesh);
     let our_triangles = mesh.face_count();
@@ -321,6 +408,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
         chitubox_triangles,
         chitubox_volume,
         part_kinds,
+        raft_islands: set.raft.as_ref().map_or(0, |r| r.islands.len()),
         intersections,
         acceptance,
         generate_ms,
@@ -395,7 +483,7 @@ fn main() -> Result<()> {
                 .map(|(k, c)| format!("{k:?}:{c}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("    parts: {kinds}");
+            println!("    parts: {kinds} raft_islands:{}", r.raft_islands);
         }
 
         let a = &r.acceptance;

@@ -5,7 +5,10 @@ use nalgebra::Vector3;
 use slicer::geometry::mesh::{Mesh, MeshBuilder};
 use tracing::info;
 
-use crate::supports::{BaseConfig, BaseShape, Part, PartKind, SupportId, SupportSet};
+use crate::supports::{
+    BaseConfig, BaseShape, Part, PartKind, SupportId, SupportSet,
+    raft::{RaftConfig, RaftShape},
+};
 
 pub type FaceMap = HashMap<SupportId, Range<u32>>;
 
@@ -40,6 +43,18 @@ pub struct SupportPreset {
     pub boss_height: Milimeters,
     /// Half of `diameterofbossbottom` (2.2 Ø, all presets).
     pub boss_radius: Milimeters,
+
+    /// Raft under the plate pillars (§3.3, §8.1 `raftshape`: None / None /
+    /// Skate). The rest are the shared §8.2 raft values.
+    pub raft_shape: RaftShape,
+    /// `raftarearatio`, as a factor (110 % = 1.1).
+    pub raft_area_ratio: f32,
+    pub raft_thickness: Milimeters,
+    pub raft_height: Milimeters,
+    /// `raftangle`, degrees.
+    pub raft_angle: f32,
+    pub raft_grid_cell: Milimeters,
+    pub raft_grid_width: Milimeters,
 }
 
 #[derive(Clone, Copy)]
@@ -74,12 +89,8 @@ pub fn build_supports(
         add_part(&mut builder, brace, transform, resolution);
     }
 
-    // The raft is a catalogue of parts in model-local space, meshed exactly
-    // like any other part.
     if let Some(raft) = &supports.raft {
-        for part in raft {
-            add_part(&mut builder, part, transform, resolution);
-        }
+        raft.mesh(&mut builder, |v| to_world(v, transform));
     }
 
     (!builder.is_empty()).then(|| {
@@ -90,6 +101,13 @@ pub fn build_supports(
     })
 }
 
+/// Applies the world transform to a model-local point.
+fn to_world(point: Vector3<f32>, transform: Transform) -> Vector3<f32> {
+    let mut point = point.component_mul(&transform.scale);
+    point.z += transform.position.z;
+    point
+}
+
 /// Applies the world transform to a point and meshes a single part.
 ///
 /// Note: this mirrors the pre-SupportSet transform exactly (scale then a
@@ -97,10 +115,7 @@ pub fn build_supports(
 /// history — but fixing the support/mesh space relationship is out of scope
 /// for M1 and would change rendered output.
 fn add_part(builder: &mut MeshBuilder, part: &Part, transform: Transform, resolution: u32) {
-    let mut a = part.a.component_mul(&transform.scale);
-    let mut b = part.b.component_mul(&transform.scale);
-    a.z += transform.position.z;
-    b.z += transform.position.z;
+    let (a, b) = (to_world(part.a, transform), to_world(part.b, transform));
 
     match part.kind {
         PartKind::ContactSphere | PartKind::Joint => {
@@ -145,6 +160,13 @@ impl SupportPreset {
         base_thickness: Milimeters::new(0.8),
         boss_height: Milimeters::new(1.0),
         boss_radius: Milimeters::new(1.1),
+        raft_shape: RaftShape::None,
+        raft_area_ratio: 1.1,
+        raft_thickness: Milimeters::new(1.0),
+        raft_height: Milimeters::new(1.8),
+        raft_angle: 30.0,
+        raft_grid_cell: Milimeters::new(2.0),
+        raft_grid_width: Milimeters::new(2.0),
     };
 
     pub const MDEIUM: Self = Self {
@@ -161,6 +183,13 @@ impl SupportPreset {
         base_thickness: Milimeters::new(1.0),
         boss_height: Milimeters::new(1.0),
         boss_radius: Milimeters::new(1.1),
+        raft_shape: RaftShape::None,
+        raft_area_ratio: 1.1,
+        raft_thickness: Milimeters::new(1.0),
+        raft_height: Milimeters::new(1.8),
+        raft_angle: 30.0,
+        raft_grid_cell: Milimeters::new(2.0),
+        raft_grid_width: Milimeters::new(2.0),
     };
 
     pub const HEAVY: Self = Self {
@@ -177,6 +206,13 @@ impl SupportPreset {
         base_thickness: Milimeters::new(1.0),
         boss_height: Milimeters::new(1.0),
         boss_radius: Milimeters::new(1.1),
+        raft_shape: RaftShape::Skate,
+        raft_area_ratio: 1.1,
+        raft_thickness: Milimeters::new(1.0),
+        raft_height: Milimeters::new(1.8),
+        raft_angle: 30.0,
+        raft_grid_cell: Milimeters::new(2.0),
+        raft_grid_width: Milimeters::new(2.0),
     };
 }
 
@@ -189,6 +225,20 @@ impl SupportPreset {
             thickness: self.base_thickness.get::<Milimeter>(),
             boss_height: self.boss_height.get::<Milimeter>(),
             boss_radius: self.boss_radius.get::<Milimeter>(),
+        }
+    }
+
+    /// The raft settings (§3.3). A raft takes each base's footprint.
+    pub fn raft_config(&self) -> RaftConfig {
+        RaftConfig {
+            shape: self.raft_shape,
+            foot_radius: self.base_radius.get::<Milimeter>(),
+            area_ratio: self.raft_area_ratio,
+            thickness: self.raft_thickness.get::<Milimeter>(),
+            height: self.raft_height.get::<Milimeter>(),
+            angle: self.raft_angle,
+            grid_cell: self.raft_grid_cell.get::<Milimeter>(),
+            grid_width: self.raft_grid_width.get::<Milimeter>(),
         }
     }
 }

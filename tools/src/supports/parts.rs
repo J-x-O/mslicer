@@ -14,6 +14,7 @@ use common::serde::{Deserializer, SerdeExt, Serializer};
 use crate::supports::{
     SupportId,
     auto::{Landing, LandingKind},
+    raft::{Raft, RaftConfig},
 };
 
 /// How a support point was chosen. Coarse for now: routing (Stage 2 of the
@@ -154,8 +155,8 @@ pub struct Support {
 pub struct SupportSet {
     pub supports: Vec<Support>,
     pub braces: Vec<Part>,
-    /// The raft mesh, if any, in model-local space.
-    pub raft: Option<Vec<Part>>,
+    /// The raft under the plate pillars, if any, in model-local space.
+    pub raft: Option<Raft>,
     /// The lift (in millimetres) applied to the model while supports exist.
     pub lift: f32,
 }
@@ -348,6 +349,45 @@ impl SupportSet {
 }
 
 impl SupportSet {
+    /// Gives every plate pillar its foot (§3.2 cases 1–6): a raft under all of
+    /// them when the raft shape is set, else a base each.
+    pub fn add_feet(&mut self, base: &BaseConfig, raft: &RaftConfig) {
+        let feet: Vec<_> = (self.supports.iter())
+            .filter_map(|s| plate_pillar(s).map(|i| s.parts[i].a.xy()))
+            .collect();
+        match Raft::build(raft, &feet) {
+            Some(raft) => {
+                self.stand_on_raft(&raft);
+                self.raft = Some(raft);
+            }
+            None => {
+                self.raft = None;
+                self.add_bases(base);
+            }
+        }
+    }
+
+    /// Stands every plate pillar whose foot lies inside the raft on its top,
+    /// [`JOINT_SHRINK`] deep and with no base or boss (§3.2 cases 1 and 4).
+    /// Feet outside the raft stay on the plate.
+    pub fn stand_on_raft(&mut self, raft: &Raft) {
+        let floor = raft.top() - JOINT_SHRINK;
+        for support in &mut self.supports {
+            let Some(pillar) = plate_pillar(support) else {
+                continue;
+            };
+            let a = support.parts[pillar].a;
+            if !raft.contains(a.xy()) {
+                continue;
+            }
+            if a.z - floor > JOINT_SHRINK {
+                support.parts[pillar].b.z = floor;
+            } else {
+                support.parts.remove(pillar);
+            }
+        }
+    }
+
     /// Stands every plate pillar on the plate (§3.2 cases 2, 3, 5 and 6).
     ///
     /// Only pillars that reach z = 0 are touched, so this skips fork-truncated
@@ -360,9 +400,7 @@ impl SupportSet {
             return;
         }
         for support in &mut self.supports {
-            let Some(pillar) =
-                (support.parts.iter()).position(|p| p.kind == PartKind::Pillar && p.b.z == 0.0)
-            else {
+            let Some(pillar) = plate_pillar(support) else {
                 continue;
             };
             let tip = (support.parts.iter())
@@ -408,6 +446,11 @@ impl SupportSet {
             support.parts.extend(parts);
         }
     }
+}
+
+/// The pillar of a support that still reaches the plate, if any.
+fn plate_pillar(support: &Support) -> Option<usize> {
+    (support.parts.iter()).position(|p| p.kind == PartKind::Pillar && p.b.z == 0.0)
 }
 
 fn round(kind: PartKind, a: Vector3<f32>, b: Vector3<f32>, radius_a: f32, radius_b: f32) -> Part {
@@ -612,10 +655,7 @@ impl SupportSet {
         match &self.raft {
             Some(raft) => {
                 ser.write_bool(true);
-                ser.write_u32_be(raft.len() as u32);
-                for part in raft {
-                    part.serialize(ser);
-                }
+                raft.serialize(ser);
             }
             None => ser.write_bool(false),
         }
@@ -632,11 +672,7 @@ impl SupportSet {
             .map(|_| Part::deserialize(des))
             .collect();
 
-        let raft = des.read_bool().then(|| {
-            (0..des.read_u32_be())
-                .map(|_| Part::deserialize(des))
-                .collect()
-        });
+        let raft = des.read_bool().then(|| Raft::deserialize(des));
 
         Self {
             supports,
@@ -652,6 +688,7 @@ mod tests {
     use common::serde::{SizedSerializer, SliceDeserializer};
 
     use super::*;
+    use crate::supports::raft::RaftShape;
 
     #[test]
     fn support_set_roundtrips() {
@@ -684,16 +721,9 @@ mod tests {
             radius_b: 0.6,
             shape: Shape::Round,
         });
-        set.raft = Some(vec![Part {
-            kind: PartKind::Base,
-            a: Vector3::new(0.0, 0.0, 0.0),
-            b: Vector3::new(0.0, 0.0, 1.0),
-            radius_a: 5.0,
-            radius_b: 5.0,
-            shape: Shape::Round,
-        }]);
+        set.raft = Raft::build(&RAFT, &[Vector2::new(1.0, 2.0)]);
 
-        let mut buffer = vec![0; 1024];
+        let mut buffer = vec![0; 4096];
         {
             let mut ser = SizedSerializer::new(&mut buffer);
             set.serialize(&mut ser);
@@ -705,7 +735,9 @@ mod tests {
         assert_eq!(out.lift, set.lift);
         assert_eq!(out.supports.len(), 2);
         assert_eq!(out.braces.len(), 1);
-        assert!(out.raft.is_some());
+        let (raft, original) = (out.raft.unwrap(), set.raft.unwrap());
+        assert_eq!(raft.config, original.config);
+        assert_eq!(raft.islands, original.islands);
 
         assert_eq!(out.supports[0].id.raw(), 7);
         assert_eq!(out.supports[1].id.raw(), 9);
@@ -796,6 +828,36 @@ mod tests {
         boss_height: 1.0,
         boss_radius: 1.1,
     };
+
+    const RAFT: RaftConfig = RaftConfig {
+        shape: RaftShape::Skate,
+        foot_radius: 6.0,
+        area_ratio: 1.1,
+        thickness: 1.0,
+        height: 1.8,
+        angle: 30.0,
+        grid_cell: 2.0,
+        grid_width: 2.0,
+    };
+
+    #[test]
+    fn raft_replaces_bases() {
+        let mut set = plate_support(10.0);
+        set.add_feet(&BASE, &RAFT);
+        assert!(set.raft.is_some());
+        assert!(part(&set, PartKind::Base).is_none());
+        assert!(part(&set, PartKind::Boss).is_none());
+        assert!((part(&set, PartKind::Pillar).unwrap().b.z - 0.998).abs() < 1e-6);
+
+        let mut set = plate_support(10.0);
+        let none = RaftConfig {
+            shape: RaftShape::None,
+            ..RAFT
+        };
+        set.add_feet(&BASE, &none);
+        assert!(set.raft.is_none());
+        assert!(part(&set, PartKind::Base).is_some());
+    }
 
     fn plate_support(joint_z: f32) -> SupportSet {
         let mut set = SupportSet::default();

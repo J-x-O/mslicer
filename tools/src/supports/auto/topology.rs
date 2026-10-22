@@ -83,7 +83,7 @@ pub const LANDING_EDGE_R_FACTOR: f32 = 1.3;
 
 /// `cos(45°)`: the fork chain turns at most 45° from one step to the next
 /// (plan §2.5 step 2).
-const COS_45: f32 = 0.707_106_78;
+const COS_45: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// A pillar as seen by the brace network: its XY position (where it meets the
 /// plate) and the height of its top (where the tip/link ends and the vertical
