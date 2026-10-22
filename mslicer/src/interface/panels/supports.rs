@@ -5,8 +5,7 @@ use const_format::concatcp;
 use egui::{Button, ComboBox, Context, DragValue, Ui, Widget};
 use egui_phosphor::regular::{LINE_SEGMENT, SELECTION_INVERSE, SPARKLE, TRASH};
 use nalgebra::Vector3;
-use slicer::geometry::mesh::MeshBuilder;
-use tools::supports::{BaseShape, auto::route_support, mesh::SupportPreset, raft::RaftShape};
+use tools::supports::{BaseShape, auto::route_point, mesh::SupportPreset, raft::RaftShape};
 
 use crate::{
     core::App,
@@ -309,7 +308,7 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         return;
     };
 
-    let mut builder = MeshBuilder::new();
+    let mut preview = None;
     for model in app.project.models.iter_mut() {
         let Some(bvh) = model.bvh.as_ref() else {
             continue;
@@ -320,8 +319,6 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         };
 
         let config = &app.project.support_config.preset;
-        let tip_r = config.tip_radius.get::<Milimeter>();
-
         let normal = (model.mesh)
             .transform_normal(&model.mesh.normal(intersection.face))
             .normalize();
@@ -330,36 +327,15 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         }
 
         let intersection = model.mesh.transform(&intersection.position);
-
-        let radius = (config.radius + config.margin).get::<Milimeter>();
-        let tip_length = config.tip_length.get::<Milimeter>();
-        let contact_depth = config.contact_depth.get::<Milimeter>();
-        if let Some((start, middle)) = route_support(
-            &model.mesh,
-            bvh,
-            radius,
-            tip_length,
-            contact_depth,
-            intersection,
-            normal,
-        ) {
-            let (r, p) = (config.radius.get::<Milimeter>(), 100);
-            builder.add_cylinder((intersection, start), (tip_r, r), p);
-            builder.add_cylinder((start, middle), (r, r), p);
-            builder.add_cylinder((middle, middle.xy().push(0.0)), (r, r), p);
-
-            builder.add_sphere(intersection, 0.2, p);
-            builder.add_sphere(start, r, p);
-            builder.add_sphere(middle, r, p);
-
+        if let Some(routed) = route_point(&model.mesh, bvh, config, intersection, normal) {
+            preview = model.supports.preview_manual(config, &routed);
             if clicked {
-                let support = [intersection, start, middle];
-                model.supports.add_manual(config, support);
+                model.supports.add_manual(config, &routed);
             }
         }
     }
 
-    app.state.support_preview = (!builder.is_empty()).then(|| builder.build());
+    app.state.support_preview = preview;
 }
 
 fn prepare(app: &mut App, ui: &mut Ui) {

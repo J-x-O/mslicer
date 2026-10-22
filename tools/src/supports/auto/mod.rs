@@ -35,8 +35,10 @@ pub struct Generated {
     pub landings: Vec<Landing>,
 }
 
-/// One point's route: to the plate, or onto the model.
-enum Routed {
+/// One point's route: to the plate (contact, tip end, joint), or onto the
+/// model.
+#[derive(Clone, Debug)]
+pub enum Routed {
     Plate([Vector3<f32>; 3]),
     Model(Landing),
 }
@@ -107,28 +109,10 @@ impl AutoPlacement {
         );
 
         progress.set_total(overhangs.len() as u64);
-        let radius = (self.support.radius + self.support.margin).get::<Milimeter>();
-        let tip_length = self.support.tip_length.get::<Milimeter>();
-        let contact_depth = self.support.contact_depth.get::<Milimeter>();
-        let landing = self.landing_config();
         let routed: Vec<Routed> = overhangs
             .into_par_iter()
             .filter_map(|x| {
-                // Plate first (§2.3); points with no way down land on the
-                // model below (§2.4).
-                let routed = route_support(
-                    mesh,
-                    bvh,
-                    radius,
-                    tip_length,
-                    contact_depth,
-                    x.point,
-                    x.normal,
-                )
-                .map(|(tip_end, joint)| Routed::Plate([x.point, tip_end, joint]))
-                .or_else(|| {
-                    landing::land_support(mesh, bvh, &landing, x.point, x.normal).map(Routed::Model)
-                });
+                let routed = route_point(mesh, bvh, &self.support, x.point, x.normal);
                 progress.add_complete(1);
                 routed
             })
@@ -148,20 +132,6 @@ impl AutoPlacement {
             generated.landings.len()
         );
         generated
-    }
-
-    /// The sizes the model-landing router (§2.4) works with, from the preset.
-    fn landing_config(&self) -> LandingConfig {
-        let support = &self.support;
-        LandingConfig {
-            radius: (support.radius + support.margin).get::<Milimeter>(),
-            pillar_diameter: 2.0 * support.radius.get::<Milimeter>(),
-            cone_length: support.tip_length.get::<Milimeter>(),
-            contact_depth: support.contact_depth.get::<Milimeter>(),
-            tail_depth: support.tail_depth.get::<Milimeter>(),
-            slim_radius: support.slim_radius.get::<Milimeter>(),
-            slim_depth: support.slim_depth.get::<Milimeter>(),
-        }
     }
 
     /// Builds the brace network (plan §2.5) over the routed supports.
@@ -215,6 +185,48 @@ impl AutoPlacement {
         network.legs = leg_supports;
         network.braces.extend(leg_braces);
         network
+    }
+}
+
+/// Routes one contact point the way auto supports are routed: to the plate
+/// first (§2.3), and onto the model below when there is no way down (§2.4).
+/// Manual placement uses this too.
+pub fn route_point(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    support: &SupportPreset,
+    contact: Vector3<f32>,
+    normal: Vector3<f32>,
+) -> Option<Routed> {
+    let radius = (support.radius + support.margin).get::<Milimeter>();
+    let tip_length = support.tip_length.get::<Milimeter>();
+    let contact_depth = support.contact_depth.get::<Milimeter>();
+    route_support(
+        mesh,
+        bvh,
+        radius,
+        tip_length,
+        contact_depth,
+        contact,
+        normal,
+    )
+    .map(|(tip_end, joint)| Routed::Plate([contact, tip_end, joint]))
+    .or_else(|| {
+        landing::land_support(mesh, bvh, &landing_config(support), contact, normal)
+            .map(Routed::Model)
+    })
+}
+
+/// The sizes the model-landing router (§2.4) works with, from the preset.
+fn landing_config(support: &SupportPreset) -> LandingConfig {
+    LandingConfig {
+        radius: (support.radius + support.margin).get::<Milimeter>(),
+        pillar_diameter: 2.0 * support.radius.get::<Milimeter>(),
+        cone_length: support.tip_length.get::<Milimeter>(),
+        contact_depth: support.contact_depth.get::<Milimeter>(),
+        tail_depth: support.tail_depth.get::<Milimeter>(),
+        slim_radius: support.slim_radius.get::<Milimeter>(),
+        slim_depth: support.slim_depth.get::<Milimeter>(),
     }
 }
 
@@ -371,7 +383,9 @@ mod tests {
         partitioning::Bvh,
     };
 
-    use super::{AutoPlacement, PlacementConfig, intersect_tip, route_support};
+    use super::{
+        AutoPlacement, PlacementConfig, Routed, intersect_tip, route_point, route_support,
+    };
     use crate::supports::mesh::SupportPreset;
 
     /// Appends an axis-aligned box with outward facing triangles.
@@ -447,6 +461,41 @@ mod tests {
             assert!(tip.z - joint.z >= run - 1e-3, "arm flatter than 45°");
             assert!(joint.z > 0.0);
         }
+    }
+
+    #[test]
+    fn route_point_falls_back_to_landing() {
+        // A manual click routes like auto: the open ledge corner reaches the
+        // plate, the ledge centre over the table lands on it.
+        let (mut verts, mut faces) = (Vec::new(), Vec::new());
+        let v = Vector3::new;
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(-30.0, -30.0, 5.0),
+            v(30.0, 30.0, 10.0),
+        );
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(-5.0, -5.0, 20.0),
+            v(5.0, 5.0, 22.0),
+        );
+        add_box(
+            &mut verts,
+            &mut faces,
+            v(40.0, -5.0, 20.0),
+            v(50.0, 5.0, 22.0),
+        );
+        let mesh = Mesh::new(verts, faces);
+        let bvh = Bvh::build(mesh.inner(), Progress::new());
+        let preset = SupportPreset::default();
+        let down = -Vector3::z();
+
+        let over_table = route_point(&mesh, &bvh, &preset, v(0.0, 0.0, 20.0), down);
+        assert!(matches!(over_table, Some(Routed::Model(_))));
+        let in_the_open = route_point(&mesh, &bvh, &preset, v(45.0, 0.0, 20.0), down);
+        assert!(matches!(in_the_open, Some(Routed::Plate(_))));
     }
 
     #[test]

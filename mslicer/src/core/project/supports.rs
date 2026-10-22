@@ -3,7 +3,7 @@ use nalgebra::Vector3;
 use slicer::geometry::mesh::Mesh;
 use tools::supports::{
     SupportId, SupportSet,
-    auto::{BraceNetwork, Generated},
+    auto::{BraceNetwork, Generated, Routed},
     mesh::{FaceMap, SupportPreset, Transform, build_supports},
 };
 use wgpu::Device;
@@ -96,19 +96,38 @@ impl Supports {
         (self.auto).add_feet(&config.base_config(), &config.raft_config());
     }
 
-    pub fn add_manual(&mut self, config: &SupportPreset, support: [Vector3<f32>; 3]) {
+    /// Adds a hand-placed support, routed like an auto one (to the plate, or
+    /// onto the model below), with the same foot: on the auto raft if there
+    /// is one, else a base.
+    pub fn add_manual(&mut self, config: &SupportPreset, routed: &Routed) {
         self.invalidate_cache();
-        self.manual.add_routed(
-            SupportId::new(),
+        let set = self.single(config, routed);
+        self.manual.supports.extend(set.supports);
+    }
+
+    /// Meshes what [`Self::add_manual`] would add, for the placement preview.
+    pub fn preview_manual(&self, config: &SupportPreset, routed: &Routed) -> Option<Mesh> {
+        let set = self.single(config, routed);
+        build_supports(&set, Transform::default(), self.resolution).map(|(mesh, _)| mesh)
+    }
+
+    fn single(&self, config: &SupportPreset, routed: &Routed) -> SupportSet {
+        let (tip_radius, radius) = (
             config.tip_radius.get::<Milimeter>(),
             config.radius.get::<Milimeter>(),
-            support,
         );
-        // A manual support stands on the auto raft if there is one.
-        match &self.auto.raft {
-            Some(raft) => self.manual.stand_on_raft(raft),
-            None => self.manual.add_bases(&config.base_config()),
+        let mut set = SupportSet::default();
+        match routed {
+            Routed::Plate(points) => set.add_routed(SupportId::new(), tip_radius, radius, *points),
+            Routed::Model(landing) => {
+                set.add_landing(SupportId::new(), tip_radius, radius, landing)
+            }
         }
+        match &self.auto.raft {
+            Some(raft) => set.stand_on_raft(raft),
+            None => set.add_bases(&config.base_config()),
+        }
+        set
     }
 
     pub fn auto(&self) -> &SupportSet {
