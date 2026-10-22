@@ -99,6 +99,8 @@ struct Acceptance {
     tall: usize,
     /// Braces (spanning-tree, fork links, leg braces) that fail the link test.
     failed_braces: usize,
+    /// Brace ends that don't touch any pillar (floating in mid-air).
+    floating_ends: usize,
     /// Shallowest and deepest tail sink into the lower surface, in mm.
     tail_sink: Option<(f32, f32)>,
 }
@@ -112,6 +114,19 @@ fn acceptance(model: &Mesh, bvh: &Bvh, set: &SupportSet) -> Acceptance {
     let braces: Vec<_> = (set.braces.iter())
         .filter(|b| b.kind == PartKind::Brace)
         .collect();
+    // Every brace end must sit on some vertical pillar, within its height.
+    let pillars: Vec<_> = (set.supports.iter())
+        .flat_map(|s| s.parts.iter().filter(|p| p.kind == PartKind::Pillar))
+        .collect();
+    let on_pillar = |end: Vector3<f32>| {
+        pillars.iter().any(|p| {
+            (p.a.xy() - end.xy()).norm() < 1e-3 && end.z <= p.a.z + 1e-3 && end.z >= p.b.z - 1e-3
+        })
+    };
+    let floating_ends = (braces.iter())
+        .map(|b| !on_pillar(b.a) as usize + !on_pillar(b.b) as usize)
+        .sum();
+
     let failed_braces = (braces.iter())
         .filter(|b| collision::link_test(model, bvh, b.a, b.b, b.radius_a))
         .count();
@@ -154,6 +169,7 @@ fn acceptance(model: &Mesh, bvh: &Bvh, set: &SupportSet) -> Acceptance {
         unbraced_tall,
         tall,
         failed_braces,
+        floating_ends,
         tail_sink,
     }
 }
@@ -386,8 +402,8 @@ fn main() -> Result<()> {
             .tail_sink
             .map_or("–".to_string(), |(lo, hi)| format!("{lo:.3}–{hi:.3} mm"));
         println!(
-            "    accept: unbraced>10mm {}/{} failed_braces {} tail_sink {sink}",
-            a.unbraced_tall, a.tall, a.failed_braces
+            "    accept: unbraced>10mm {}/{} failed_braces {} floating_brace_ends {} tail_sink {sink}",
+            a.unbraced_tall, a.tall, a.failed_braces, a.floating_ends
         );
     }
     println!();

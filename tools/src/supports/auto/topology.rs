@@ -186,8 +186,15 @@ fn near_parallel(existing: &[Vector2<f32>], dir: Vector2<f32>) -> bool {
 /// `cone_length` is the tip cone length (`supporttiplength`), used to place the
 /// fork point. `mesh`/`bvh` are the model, used to link-test each fork link.
 pub fn build_network(pillars: &[Pillar], mesh: &Mesh, bvh: &Bvh, cone_length: f32) -> BraceNetwork {
-    let mut braces = build_braces(pillars, MAX_CROSS_SPACING_XY, mesh, bvh);
+    // Forks first: a forked pillar stops at its fork point, so spanning-tree
+    // braces must stay above it there.
     let (fork_links, fork_bottoms) = build_forks(pillars, cone_length, mesh, bvh);
+    let mut braced = pillars.to_vec();
+    for &(index, fork_z) in &fork_bottoms {
+        braced[index].floor_z = braced[index].floor_z.max(fork_z);
+    }
+
+    let mut braces = build_braces(&braced, MAX_CROSS_SPACING_XY, mesh, bvh);
     braces.extend(fork_links);
     BraceNetwork {
         braces,
@@ -204,20 +211,30 @@ pub fn build_network(pillars: &[Pillar], mesh: &Mesh, bvh: &Bvh, cone_length: f3
 /// placed on B, two 45° links run from F down to A and C (each link-tested),
 /// and B's pillar is truncated at F so A and C carry it instead of the plate.
 ///
-/// Each pillar is forked at most once. A forked (truncated) pillar may still
-/// serve as a neighbour for an adjacent fork; in that rare chain-of-four case
-/// its links land where the original pillar ran, which §2.5 does not spell out.
-/// Accepted as a simplification.
+/// Each pillar plays at most one role: a forked (middle) pillar never anchors
+/// another fork, and an anchor is never forked itself. Either would leave a
+/// fork link landing below where its pillar now stops.
 fn build_forks(
     pillars: &[Pillar],
     cone_length: f32,
     mesh: &Mesh,
     bvh: &Bvh,
 ) -> (Vec<Part>, Vec<(usize, f32)>) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Role {
+        Free,
+        Middle,
+        Anchor,
+    }
+
     let mut links = Vec::new();
     let mut bottoms = Vec::new();
+    let mut roles = vec![Role::Free; pillars.len()];
 
     for b in 0..pillars.len() {
+        if roles[b] != Role::Free {
+            continue;
+        }
         let middle = pillars[b];
         let diameter = 2.0 * middle.radius;
         // The 9 × Ø chain radius of §2.5 step 2 only bounds how far ahead the
@@ -227,13 +244,16 @@ fn build_forks(
 
         let mut neighbours = Vec::new();
         for a in 0..pillars.len() {
-            if a != b && (pillars[a].xy - middle.xy).magnitude() <= max_gap {
+            if a != b
+                && roles[a] != Role::Middle
+                && (pillars[a].xy - middle.xy).magnitude() <= max_gap
+            {
                 neighbours.push(a);
             }
         }
 
-        // Pick the most collinear pair of neighbours on opposite sides of B.
-        let mut best: Option<(usize, usize, f32)> = None;
+        // Pairs of neighbours on opposite sides of B, most collinear first.
+        let mut pairs: Vec<(usize, usize, f32)> = Vec::new();
         for &a in &neighbours {
             for &c in &neighbours {
                 if a >= c {
@@ -249,16 +269,19 @@ fn build_forks(
                 if col < COS_45 {
                     continue;
                 }
-                if best.map_or(true, |(_, _, bc)| col > bc) {
-                    best = Some((a, c, col));
-                }
+                pairs.push((a, c, col));
             }
         }
+        pairs.sort_by(|x, y| y.2.total_cmp(&x.2));
 
-        if let Some((a, c, _)) = best {
+        for (a, c, _) in pairs {
             if let Some((parts, bottom)) = fork_at(pillars, a, b, c, cone_length, mesh, bvh) {
                 links.extend(parts);
                 bottoms.push(bottom);
+                roles[b] = Role::Middle;
+                roles[a] = Role::Anchor;
+                roles[c] = Role::Anchor;
+                break;
             }
         }
     }
@@ -312,9 +335,14 @@ fn fork_at(
             return None;
         }
         let to = Vector3::new(pillars[end].xy.x, pillars[end].xy.y, fork_z - run);
-        // A fork link may not dip below the plate (defensive; the fork-floor
-        // check above normally keeps the landing point above the base).
-        if to.z < 0.0 || collision::link_test(mesh, bvh, from, to, radius) {
+        // The link must land on the neighbour's pillar: below its top and
+        // above its floor. A neighbour lower down a slope would otherwise
+        // leave the link ending in mid-air beside it.
+        let anchor = pillars[end];
+        if to.z > anchor.top_z
+            || to.z < anchor.floor_z
+            || collision::link_test(mesh, bvh, from, to, radius)
+        {
             return None;
         }
         parts.push(Part {
@@ -678,6 +706,67 @@ mod tests {
                 "fork link must drop exactly as far as it runs (45°), got run {run} drop {drop}"
             );
         }
+    }
+
+    /// Asserts every brace end touches a pillar of `pillars` between its top
+    /// and its (possibly forked) bottom.
+    fn assert_no_floating_ends(pillars: &[Pillar], network: &BraceNetwork) {
+        let bottom = |i: usize| {
+            (network.fork_bottoms.iter())
+                .find(|&&(j, _)| j == i)
+                .map_or(0.0, |&(_, z)| z)
+        };
+        for brace in &network.braces {
+            for end in [brace.a, brace.b] {
+                let ok = pillars.iter().enumerate().any(|(i, p)| {
+                    (p.xy - end.xy()).magnitude() < 1e-4
+                        && end.z <= p.top_z + 1e-4
+                        && end.z >= bottom(i) - 1e-4
+                });
+                assert!(ok, "brace end {end:?} floats in mid-air");
+            }
+        }
+    }
+
+    #[test]
+    fn forks_never_float() {
+        // A long collinear row (as grid placement produces) on a slope: forks
+        // must not chain onto forked pillars, land beside lower neighbours, or
+        // leave spanning-tree braces below a fork point.
+        let (mesh, bvh) = empty_scene();
+        let pillars: Vec<Pillar> = (0..9)
+            .map(|i| pillar(i as f32 * 4.0, 0.0, 30.0 - i as f32 * 1.5))
+            .collect();
+        let network = build_network(&pillars, &mesh, &bvh, 2.0);
+        assert!(!network.fork_bottoms.is_empty());
+        assert_no_floating_ends(&pillars, &network);
+
+        // Forked pillars never anchor another fork.
+        for &(i, z) in &network.fork_bottoms {
+            for brace in &network.braces {
+                let at_i = |e: Vector3<f32>| (e.xy() - pillars[i].xy).magnitude() < 1e-4;
+                if at_i(brace.a) {
+                    assert!(brace.a.z >= z - 1e-4);
+                }
+                if at_i(brace.b) {
+                    assert!(brace.b.z >= z - 1e-4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fork_skips_a_neighbour_too_low() {
+        // C's top is far below where B's fork link would land.
+        let pillars = [
+            pillar(0.0, 0.0, 20.0),
+            pillar(4.0, 0.0, 20.0),
+            pillar(8.0, 0.0, 10.0),
+        ];
+        let (mesh, bvh) = empty_scene();
+        let (links, bottoms) = build_forks(&pillars, 2.0, &mesh, &bvh);
+        assert!(links.is_empty());
+        assert!(bottoms.is_empty());
     }
 
     #[test]
