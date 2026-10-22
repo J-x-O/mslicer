@@ -155,6 +155,15 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
         );
     }
     let network = placement.generate_braces(&model, &bvh, &generated);
+    for (i, leg) in network.legs.iter().enumerate() {
+        let id = (generated.plate.len() + generated.landings.len() + i) as u32;
+        set.add_routed(
+            tools::supports::SupportId::from_raw(id),
+            tip_radius,
+            radius,
+            *leg,
+        );
+    }
     set.braces = network.braces;
     for (index, bottom_z) in network.fork_bottoms {
         set.truncate_pillar(index, bottom_z);

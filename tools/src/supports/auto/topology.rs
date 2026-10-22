@@ -136,6 +136,9 @@ pub struct BraceNetwork {
     /// `support_index` must end at `bottom_z` (a fork point) instead of
     /// reaching the plate.
     pub fork_bottoms: Vec<(usize, f32)>,
+    /// Stabilising legs (§2.6) as routed `[contact, tip, joint]` plate
+    /// triplets. Their braces back to the pillars are in `braces`.
+    pub legs: Vec<[Vector3<f32>; 3]>,
 }
 
 /// Builds the set of brace parts for a set of pillars.
@@ -189,6 +192,7 @@ pub fn build_network(pillars: &[Pillar], mesh: &Mesh, bvh: &Bvh, cone_length: f3
     BraceNetwork {
         braces,
         fork_bottoms,
+        legs: Vec::new(),
     }
 }
 
@@ -430,7 +434,7 @@ fn point_index(points: &[Point2<f32>], p: Point2<f32>) -> Option<usize> {
 /// Braces a pillar pair with 45° diagonals (plan §2.5 step 4). Each brace is
 /// link-tested and a failing one is skipped. Returns `None` when the pair is
 /// too close or too short to brace, or every brace fails.
-fn brace_pair(a: Pillar, b: Pillar, mesh: &Mesh, bvh: &Bvh) -> Option<Vec<Part>> {
+pub(super) fn brace_pair(a: Pillar, b: Pillar, mesh: &Mesh, bvh: &Bvh) -> Option<Vec<Part>> {
     let higher = if a.top_z >= b.top_z { a } else { b };
     let lower = if a.top_z >= b.top_z { b } else { a };
 

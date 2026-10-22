@@ -63,8 +63,8 @@ impl Supports {
     /// `network` is the output of `AutoPlacement::generate_braces` over the same
     /// plate supports, so the pillars are tied together before meshing and any
     /// inverted-V fork truncations are applied to the middle pillars. The
-    /// model-landing supports go after the plate supports, which keeps the
-    /// network's support indices valid.
+    /// model-landing supports and stabilising legs go after the plate
+    /// supports, which keeps the network's support indices valid.
     pub fn replace_auto_with_braces(
         &mut self,
         config: &SupportPreset,
@@ -78,6 +78,14 @@ impl Supports {
                 config.tip_radius.get::<Milimeter>(),
                 config.radius.get::<Milimeter>(),
                 landing,
+            );
+        }
+        for leg in network.legs {
+            self.auto.add_routed(
+                SupportId::new(),
+                config.tip_radius.get::<Milimeter>(),
+                config.radius.get::<Milimeter>(),
+                leg,
             );
         }
         self.auto.braces = network.braces;

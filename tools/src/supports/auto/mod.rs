@@ -16,6 +16,7 @@ pub mod collision;
 pub mod detect;
 pub mod grid;
 pub mod landing;
+pub mod legs;
 pub mod points;
 pub mod quazirandom;
 pub mod tip;
@@ -170,9 +171,10 @@ impl AutoPlacement {
     /// braces, then chains nearly-collinear triples into inverted-V forks.
     /// Model-landing pillars are braced among themselves along edges shorter
     /// than 1.3 × R, R = 0.5 × point spacing (§2.4 step 8); slims are not
-    /// braced. The returned [`BraceNetwork`] carries the brace/fork link parts
-    /// and the plate-pillar truncations the forks impose, indexed into
-    /// `generated.plate`.
+    /// braced. Last, tall and sparsely braced plate pillars get a stabilising
+    /// leg each (§2.6). The returned [`BraceNetwork`] carries the brace/fork
+    /// link parts, the legs, and the plate-pillar truncations the forks impose,
+    /// indexed into `generated.plate`.
     pub fn generate_braces(&self, mesh: &Mesh, bvh: &Bvh, generated: &Generated) -> BraceNetwork {
         let radius = self.support.radius.get::<Milimeter>();
         let cone_length = self.support.tip_length.get::<Milimeter>();
@@ -187,13 +189,31 @@ impl AutoPlacement {
                 topology::Pillar::landing(landing.tip.xy(), landing.tip.z, landing.foot.z, radius)
             })
             .collect();
-        let max_spacing = topology::LANDING_EDGE_R_FACTOR * 0.5 * self.placement.min_spacing;
+        let r = 0.5 * self.placement.min_spacing;
+        let max_spacing = topology::LANDING_EDGE_R_FACTOR * r;
         network.braces.extend(topology::build_braces(
             &landing_pillars,
             max_spacing,
             mesh,
             bvh,
         ));
+
+        let leg_config = legs::LegConfig {
+            radius,
+            route_radius: (self.support.radius + self.support.margin).get::<Milimeter>(),
+            cone_length: legs::LEG_CONE_R_FACTOR * r,
+            contact_depth: self.support.contact_depth.get::<Milimeter>(),
+        };
+        let (leg_supports, leg_braces) = legs::build_legs(
+            mesh,
+            bvh,
+            &leg_config,
+            &generated.plate,
+            &network.braces,
+            &network.fork_bottoms,
+        );
+        network.legs = leg_supports;
+        network.braces.extend(leg_braces);
         network
     }
 }
