@@ -253,6 +253,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     for (index, bottom_z) in network.fork_bottoms {
         set.truncate_pillar(index, bottom_z);
     }
+    set.add_bases(&placement.support.base_config());
 
     let build_start = Instant::now();
     let (mesh, _map) = build_supports(&set, Transform::default(), 24)

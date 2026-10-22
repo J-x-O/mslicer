@@ -4,6 +4,9 @@ pub mod auto;
 pub mod mesh;
 pub mod parts;
 
-pub use parts::{Foot, Part, PartKind, PointKind, Shape, Support, SupportPoint, SupportSet};
+pub use parts::{
+    BaseConfig, BaseShape, Foot, Part, PartKind, PointKind, Shape, Support, SupportPoint,
+    SupportSet,
+};
 
 id_type!(SupportId, u32);

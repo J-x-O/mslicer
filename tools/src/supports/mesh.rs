@@ -1,11 +1,11 @@
 use std::{collections::HashMap, range::Range, time::Instant};
 
-use common::{geometry::convex_hull, units::Milimeters};
-use nalgebra::{Vector2, Vector3};
+use common::units::{Milimeter, Milimeters};
+use nalgebra::Vector3;
 use slicer::geometry::mesh::{Mesh, MeshBuilder};
 use tracing::info;
 
-use crate::supports::{Foot, Part, PartKind, SupportId, SupportSet};
+use crate::supports::{BaseConfig, BaseShape, Part, PartKind, SupportId, SupportSet};
 
 pub type FaceMap = HashMap<SupportId, Range<u32>>;
 
@@ -29,6 +29,17 @@ pub struct SupportPreset {
     /// How far a slim pillar's lower end sinks into the model (§3.1.1 Q3,
     /// `supportmiddlesmallpillarlowercontactdepth`: 0.25 / 0.3 / 0.3).
     pub slim_depth: Milimeters,
+
+    /// Base under each plate pillar (§3.1, §3.2 `supportbottomshape`).
+    pub base_shape: BaseShape,
+    /// Base radius, half of `supportbottomdiameter` (10 / 12 / 12 Ø).
+    pub base_radius: Milimeters,
+    /// `supportbottomthickness` (0.8 / 1.0 / 1.0).
+    pub base_thickness: Milimeters,
+    /// `heightofboss` (1.0, all presets).
+    pub boss_height: Milimeters,
+    /// Half of `diameterofbossbottom` (2.2 Ø, all presets).
+    pub boss_radius: Milimeters,
 }
 
 #[derive(Clone, Copy)]
@@ -63,37 +74,12 @@ pub fn build_supports(
         add_part(&mut builder, brace, transform, resolution);
     }
 
-    // The raft is a catalogue of parts in model-local space (only the base
-    // disc for now); meshed exactly like any other part.
+    // The raft is a catalogue of parts in model-local space, meshed exactly
+    // like any other part.
     if let Some(raft) = &supports.raft {
         for part in raft {
             add_part(&mut builder, part, transform, resolution);
         }
-    }
-
-    // Legacy single-hull raft: one convex hull around every pillar foot. Kept
-    // until the per-island raft (M5) replaces it. Reconstructed from the
-    // vertical pillars so it matches the pre-SupportSet output exactly.
-    let mut feet = Vec::new();
-    // Model-landing supports end on the model, not the plate.
-    let on_plate = (supports.supports.iter()).filter(|s| matches!(s.foot, Foot::Plate { .. }));
-    for support in on_plate {
-        for part in &support.parts {
-            if part.kind == PartKind::Pillar {
-                // Mirror the old transform: scale the xy, drop the z (the foot
-                // sits at plate level), and use the part's outer radius.
-                let xy = part.b.xy().component_mul(&transform.scale.xy());
-                let r = part.radius_b;
-                for i in 0..(resolution * 2) {
-                    let angle = i as f32 / resolution as f32 * std::f32::consts::PI;
-                    let normal = Vector2::new(angle.cos(), angle.sin());
-                    feet.push(xy + normal * r);
-                }
-            }
-        }
-    }
-    if !feet.is_empty() {
-        build_raft(1.0, 1.0, &feet, &mut builder);
     }
 
     (!builder.is_empty()).then(|| {
@@ -134,47 +120,6 @@ fn add_part(builder: &mut MeshBuilder, part: &Part, transform: Transform, resolu
     }
 }
 
-// The legacy raft builder, kept for the single-plate convex-hull path until the
-// real per-island raft lands in M5. Meshes one hull around every pillar foot.
-pub fn build_raft(
-    raft_offset: f32,
-    raft_height: f32,
-    points: &[Vector2<f32>],
-    builder: &mut MeshBuilder,
-) {
-    let hull = convex_hull(points);
-    let idx = builder.next_idx();
-    for i in 0..hull.len() {
-        let point = hull[i];
-        let next = hull[(i + 1) % hull.len()];
-        let prev = hull[(i + hull.len() - 1) % hull.len()];
-
-        let edge_1 = next - point;
-        let edge_2 = point - prev;
-        let offset = (Vector2::new(edge_1.y, -edge_1.x).normalize()
-            + Vector2::new(edge_2.y, -edge_2.x).normalize())
-        .normalize();
-
-        builder.add_vertex(point.push(0.0));
-        builder.add_vertex((point + offset * raft_offset).push(raft_height));
-    }
-
-    let verts = builder.next_idx() - idx;
-    for i in (0..verts).step_by(2) {
-        if i != 0 && i + 3 < verts {
-            builder.add_face([idx, idx + i + 2, idx + i]);
-            builder.add_face([idx + 1, idx + i + 1, idx + i + 3]);
-        }
-
-        builder.add_quad([
-            idx + i % verts,
-            idx + (i + 1) % verts,
-            idx + (i + 2) % verts,
-            idx + (i + 3) % verts,
-        ]);
-    }
-}
-
 impl Default for Transform {
     fn default() -> Self {
         Self {
@@ -195,6 +140,11 @@ impl SupportPreset {
         tail_depth: Milimeters::new(0.2),
         slim_radius: Milimeters::new(0.2),
         slim_depth: Milimeters::new(0.25),
+        base_shape: BaseShape::Skate,
+        base_radius: Milimeters::new(5.0),
+        base_thickness: Milimeters::new(0.8),
+        boss_height: Milimeters::new(1.0),
+        boss_radius: Milimeters::new(1.1),
     };
 
     pub const MDEIUM: Self = Self {
@@ -206,6 +156,11 @@ impl SupportPreset {
         tail_depth: Milimeters::new(0.2),
         slim_radius: Milimeters::new(0.25),
         slim_depth: Milimeters::new(0.3),
+        base_shape: BaseShape::Skate,
+        base_radius: Milimeters::new(6.0),
+        base_thickness: Milimeters::new(1.0),
+        boss_height: Milimeters::new(1.0),
+        boss_radius: Milimeters::new(1.1),
     };
 
     pub const HEAVY: Self = Self {
@@ -217,7 +172,25 @@ impl SupportPreset {
         tail_depth: Milimeters::new(0.3),
         slim_radius: Milimeters::new(0.25),
         slim_depth: Milimeters::new(0.3),
+        base_shape: BaseShape::Skate,
+        base_radius: Milimeters::new(6.0),
+        base_thickness: Milimeters::new(1.0),
+        boss_height: Milimeters::new(1.0),
+        boss_radius: Milimeters::new(1.1),
     };
+}
+
+impl SupportPreset {
+    /// The plate-pillar foot settings (§3.2).
+    pub fn base_config(&self) -> BaseConfig {
+        BaseConfig {
+            shape: self.base_shape,
+            radius: self.base_radius.get::<Milimeter>(),
+            thickness: self.base_thickness.get::<Milimeter>(),
+            boss_height: self.boss_height.get::<Milimeter>(),
+            boss_radius: self.boss_radius.get::<Milimeter>(),
+        }
+    }
 }
 
 impl Default for SupportPreset {

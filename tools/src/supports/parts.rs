@@ -86,6 +86,44 @@ pub enum PartKind {
     Brace,
 }
 
+/// Pillars whose length plus 0.6 × the tip-cone length is below this get a
+/// short foot: a base but no boss (§3.2, a fixed constant).
+pub const SHORT_PILLAR: f32 = 5.0;
+/// Stacked parts overlap by this much at each joint so faces don't coincide
+/// (§3.2, §8.3).
+pub const JOINT_SHRINK: f32 = 0.002;
+/// Wall angle of a Skate base, from the plate. The plan gives no Skate base
+/// profile; this borrows the Skate raft's `raftangle` (§3.3).
+const SKATE_ANGLE: f32 = 30.0;
+
+/// The base under a plate pillar (§8.1 `supportbottomshape`). Cube and Prism
+/// are meshed round until parts carry other cross-sections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseShape {
+    /// No base or boss (§3.2 cases 3 and 6).
+    None,
+    /// A disc whose outer wall slopes in at [`SKATE_ANGLE`].
+    Skate,
+    /// A frustum from the base diameter down to the boss bottom diameter.
+    Cone,
+    /// A flat disc.
+    Cylinder,
+}
+
+/// How plate pillars stand on the plate (§3.2). Lengths are millimetres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaseConfig {
+    pub shape: BaseShape,
+    /// Base radius, 0.5 × `supportbottomdiameter` (10 / 12 / 12 Ø).
+    pub radius: f32,
+    /// `supportbottomthickness` (0.8 / 1.0 / 1.0).
+    pub thickness: f32,
+    /// `heightofboss` (1.0).
+    pub boss_height: f32,
+    /// 0.5 × `diameterofbossbottom` (2.2 Ø).
+    pub boss_radius: f32,
+}
+
 /// A part: a segment from `a` to `b` swept with radii `radius_a` (at `a`) and
 /// `radius_b` (at `b`).
 #[derive(Clone, Copy, Debug)]
@@ -306,6 +344,80 @@ impl SupportSet {
                 pillar.b.z = bottom_z;
             }
         }
+    }
+}
+
+impl SupportSet {
+    /// Stands every plate pillar on the plate (§3.2 cases 2, 3, 5 and 6).
+    ///
+    /// Only pillars that reach z = 0 are touched, so this skips fork-truncated
+    /// pillars and model landings (case 7), and running it twice changes
+    /// nothing. Short pillars (length + 0.6 × tip length < 5 mm) get a base
+    /// only; long ones get a base, a boss, then the pillar. Each part starts
+    /// [`JOINT_SHRINK`] below the top of the one beneath it.
+    pub fn add_bases(&mut self, cfg: &BaseConfig) {
+        if cfg.shape == BaseShape::None {
+            return;
+        }
+        for support in &mut self.supports {
+            let Some(pillar) =
+                (support.parts.iter()).position(|p| p.kind == PartKind::Pillar && p.b.z == 0.0)
+            else {
+                continue;
+            };
+            let tip = (support.parts.iter())
+                .find(|p| p.kind == PartKind::TipCone)
+                .map_or(0.0, |p| (p.b - p.a).magnitude());
+            let Part { a, radius_b, .. } = support.parts[pillar];
+            let short = a.z + 0.6 * tip < SHORT_PILLAR;
+            let xy = a.xy();
+
+            let top = match cfg.shape {
+                BaseShape::Skate => {
+                    let inset = cfg.thickness / SKATE_ANGLE.to_radians().tan();
+                    (cfg.radius - inset).max(cfg.boss_radius)
+                }
+                BaseShape::Cone => cfg.boss_radius,
+                BaseShape::Cylinder | BaseShape::None => cfg.radius,
+            };
+            let mut parts = vec![round(
+                PartKind::Base,
+                xy.push(0.0),
+                xy.push(cfg.thickness),
+                cfg.radius,
+                top,
+            )];
+            let mut floor = cfg.thickness - JOINT_SHRINK;
+            if !short {
+                let boss_top = floor + cfg.boss_height;
+                parts.push(round(
+                    PartKind::Boss,
+                    xy.push(floor),
+                    xy.push(boss_top),
+                    cfg.boss_radius,
+                    radius_b,
+                ));
+                floor = boss_top - JOINT_SHRINK;
+            }
+            // A joint already inside the base needs no pillar at all.
+            if a.z - floor > JOINT_SHRINK {
+                support.parts[pillar].b.z = floor;
+            } else {
+                support.parts.remove(pillar);
+            }
+            support.parts.extend(parts);
+        }
+    }
+}
+
+fn round(kind: PartKind, a: Vector3<f32>, b: Vector3<f32>, radius_a: f32, radius_b: f32) -> Part {
+    Part {
+        kind,
+        a,
+        b,
+        radius_a,
+        radius_b,
+        shape: Shape::Round,
     }
 }
 
@@ -675,5 +787,89 @@ mod tests {
         assert!((joint.radius_a - 1.04 * radius).abs() < 1e-6);
         assert_eq!(joint.radius_b, joint.radius_a);
         assert_eq!(joint.shape, Shape::Round);
+    }
+
+    const BASE: BaseConfig = BaseConfig {
+        shape: BaseShape::Skate,
+        radius: 6.0,
+        thickness: 1.0,
+        boss_height: 1.0,
+        boss_radius: 1.1,
+    };
+
+    fn plate_support(joint_z: f32) -> SupportSet {
+        let mut set = SupportSet::default();
+        let joint = Vector3::new(1.0, 2.0, joint_z);
+        let contact = joint + Vector3::new(0.0, 0.0, 2.0);
+        set.add_routed(SupportId::from_raw(1), 0.2, 0.6, [contact, joint, joint]);
+        set
+    }
+
+    fn part(set: &SupportSet, kind: PartKind) -> Option<Part> {
+        set.supports[0]
+            .parts
+            .iter()
+            .find(|p| p.kind == kind)
+            .copied()
+    }
+
+    #[test]
+    fn long_pillar_stands_on_boss_and_base() {
+        let mut set = plate_support(10.0);
+        set.add_bases(&BASE);
+
+        let base = part(&set, PartKind::Base).unwrap();
+        let boss = part(&set, PartKind::Boss).unwrap();
+        let pillar = part(&set, PartKind::Pillar).unwrap();
+        assert_eq!((base.a.z, base.b.z), (0.0, 1.0));
+        assert_eq!(base.radius_a, 6.0);
+        assert!(base.radius_b < base.radius_a && base.radius_b >= BASE.boss_radius);
+        assert!((boss.a.z - 0.998).abs() < 1e-6 && (boss.b.z - 1.998).abs() < 1e-6);
+        assert_eq!((boss.radius_a, boss.radius_b), (1.1, 0.6));
+        assert!((pillar.b.z - 1.996).abs() < 1e-6);
+        assert_eq!(pillar.b.xy(), base.a.xy());
+    }
+
+    #[test]
+    fn short_pillar_gets_no_boss() {
+        // 3 + 0.6 × 2 = 4.2 < 5 mm.
+        let mut set = plate_support(3.0);
+        set.add_bases(&BASE);
+        assert!(part(&set, PartKind::Boss).is_none());
+        let pillar = part(&set, PartKind::Pillar).unwrap();
+        assert!((pillar.b.z - 0.998).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_base_leaves_the_pillar_on_the_plate() {
+        let mut set = plate_support(10.0);
+        set.add_bases(&BaseConfig {
+            shape: BaseShape::None,
+            ..BASE
+        });
+        assert!(part(&set, PartKind::Base).is_none());
+        assert_eq!(part(&set, PartKind::Pillar).unwrap().b.z, 0.0);
+    }
+
+    #[test]
+    fn bases_are_added_once_and_skip_truncated_pillars() {
+        let mut set = plate_support(10.0);
+        set.add_routed(
+            SupportId::from_raw(2),
+            0.2,
+            0.6,
+            [
+                Vector3::new(5.0, 0.0, 14.0),
+                Vector3::new(5.0, 0.0, 12.0),
+                Vector3::new(5.0, 0.0, 12.0),
+            ],
+        );
+        set.truncate_pillar(1, 6.0);
+        set.add_bases(&BASE);
+        set.add_bases(&BASE);
+
+        let count = |s: &Support| s.parts.iter().filter(|p| p.kind == PartKind::Base).count();
+        assert_eq!(count(&set.supports[0]), 1);
+        assert_eq!(count(&set.supports[1]), 0);
     }
 }
