@@ -59,16 +59,20 @@ impl Supports {
 
     /// Replaces the stored auto supports and their brace network.
     ///
-    /// `braces` is the output of `AutoPlacement::generate_braces` over the same
-    /// routed triplets, so the pillars are tied together before meshing.
+    /// `network` is the output of `AutoPlacement::generate_braces` over the same
+    /// routed triplets, so the pillars are tied together before meshing and any
+    /// inverted-V fork truncations are applied to the middle pillars.
     pub fn replace_auto_with_braces(
         &mut self,
         config: &SupportPreset,
         supports: Vec<[Vector3<f32>; 3]>,
-        braces: Vec<tools::supports::Part>,
+        network: tools::supports::auto::BraceNetwork,
     ) {
         self.replace_auto(config, supports);
-        self.auto.braces = braces;
+        self.auto.braces = network.braces;
+        for (index, bottom_z) in network.fork_bottoms {
+            self.auto.truncate_pillar(index, bottom_z);
+        }
     }
 
     pub fn add_manual(&mut self, config: &SupportPreset, support: [Vector3<f32>; 3]) {

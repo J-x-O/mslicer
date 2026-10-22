@@ -210,6 +210,22 @@ impl SupportSet {
             group: 0,
         });
     }
+
+    /// Truncates the vertical pillar of support `index` so it ends at `bottom_z`
+    /// (a fork point) instead of reaching the plate. Used by the brace network's
+    /// inverted-V forks (plan §2.5 step 2), where the middle pillar of a
+    /// collinear triple stops short and is carried by its neighbours.
+    pub fn truncate_pillar(&mut self, index: usize, bottom_z: f32) {
+        if let Some(support) = self.supports.get_mut(index) {
+            if let Some(pillar) = support
+                .parts
+                .iter_mut()
+                .find(|p| p.kind == PartKind::Pillar)
+            {
+                pillar.b.z = bottom_z;
+            }
+        }
+    }
 }
 
 impl Default for SupportSet {

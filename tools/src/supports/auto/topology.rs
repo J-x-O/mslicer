@@ -1,19 +1,26 @@
-//! Brace network (plan §2.5 steps 3–6).
+//! Brace network (plan §2.5).
 //!
 //! Once every support has been routed to a vertical pillar, neighbouring
 //! pillars are tied together with 45° braces so tall, sparsely supported
 //! pillars don't stand alone. The topology mirrors CHITUBOX's
-//! `processIsolatedNearGrounds`: a Delaunay triangulation over the pillar
-//! positions is reduced to a minimum spanning tree, every tree edge no longer
-//! than `maximalsupportcrossspacingxy` (30 mm) is kept, and each kept edge is
-//! braced with one or more 45° diagonals.
+//! `processIsolatedNearGrounds`:
 //!
-//! 2.8's pre-merge and 2.5's inverted-V forks are not here yet; this is the
-//! spanning-tree + brace slice only.
+//! * a Delaunay triangulation over the pillar positions is reduced to a minimum
+//!   spanning tree, every tree edge no longer than `maximalsupportcrossspacingxy`
+//!   (30 mm) is kept, and each kept edge is braced with one or more 45° diagonals
+//!   (§2.5 steps 3–4);
+//! * nearly-collinear triples of pillars become inverted-V forks: the middle
+//!   pillar stops short and is carried by two 45° links to its neighbours
+//!   (§2.5 step 2).
+//!
+//! 2.8's pre-merge is not here; it is off by default and its rules do not run in
+//! normal auto-support.
 
 use nalgebra::{Vector2, Vector3};
+use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 use spade::{DelaunayTriangulation, Point2, Triangulation};
 
+use crate::supports::auto::collision;
 use crate::supports::{Part, PartKind, Shape};
 
 /// Maximum XY spacing between two pillars that are still braced together
@@ -38,6 +45,33 @@ const BRACE_STEP_DIAMETER_FACTOR: f32 = 13.5;
 /// isn't modelled yet.
 const BRACE_STOP_HEIGHT: f32 = 3.0;
 
+/// Inverted-V fork gap limit, as a multiple of the pillar Ø (plan §2.5 step 2:
+/// each gap ≤ 4 × pillar Ø).
+const FORK_GAP_DIAMETERS: f32 = 4.0;
+
+/// How far below the pillar top the fork point sits, in pillar Øs (plan §2.5
+/// step 2: `2 × pillar Ø`).
+const FORK_DROP_DIAMETERS: f32 = 2.0;
+
+/// The cone-length term of the fork drop (plan §2.5 step 2: `0.3 × cone length`).
+const FORK_DROP_CONE_FACTOR: f32 = 0.3;
+
+/// The most the tip end may sit above the fork point, as a multiple of
+/// `cone length + pillar Ø` (plan §2.5 step 2: `2.5 × (cone length + pillar Ø)`).
+const FORK_TIP_MAX_DIAMETERS: f32 = 2.5;
+
+/// Extra clearance in the fork floor formula (plan §2.5 step 2: `+ 0.1 mm`).
+const FORK_FLOOR_EXTRA: f32 = 0.1;
+
+/// Base/raft thickness added to the fork floor. The Middle preset's base is
+/// 1.0 mm thick and the raft isn't modelled until M5, so this stands in for
+/// "base or raft thickness" (§2.5 step 2).
+const BASE_THICKNESS: f32 = 1.0;
+
+/// `cos(45°)`: the fork chain turns at most 45° from one step to the next
+/// (plan §2.5 step 2).
+const COS_45: f32 = 0.707_106_78;
+
 /// A pillar as seen by the brace network: its XY position (where it meets the
 /// plate) and the height of its top (where the tip/link ends and the vertical
 /// pillar begins).
@@ -45,10 +79,23 @@ const BRACE_STOP_HEIGHT: f32 = 3.0;
 pub struct Pillar {
     pub xy: Vector2<f32>,
     pub top_z: f32,
+    /// The tip end (horn end) height. Equal to `top_z` for a straight drop, and
+    /// higher when a 45° link runs from the tip end down to the pillar top.
+    pub tip_z: f32,
     /// The pillar radius, in millimetres. Braces are as thick as the pillars
     /// they join (plan §2.5 step 4: `supportcrossdiameter` never reaches the
     /// algorithm, so `0.8`/`1.2`/`1.5` Ø becomes the brace radius too).
     pub radius: f32,
+}
+
+/// The complete brace network: 45° spanning-tree braces plus inverted-V fork
+/// links, and the pillar truncations the forks impose.
+pub struct BraceNetwork {
+    pub braces: Vec<Part>,
+    /// `(support_index, bottom_z)`: the vertical pillar of support
+    /// `support_index` must end at `bottom_z` (a fork point) instead of
+    /// reaching the plate.
+    pub fork_bottoms: Vec<(usize, f32)>,
 }
 
 /// Builds the set of brace parts for a routed support set.
@@ -70,6 +117,155 @@ pub fn build_braces(pillars: &[Pillar]) -> Vec<Part> {
         }
     }
     braces
+}
+
+/// Builds the full brace network over `pillars`: the spanning-tree braces of
+/// [`build_braces`] plus the inverted-V forks of §2.5 step 2.
+///
+/// `cone_length` is the tip cone length (`supporttiplength`), used to place the
+/// fork point. `mesh`/`bvh` are the model, used to link-test each fork link.
+pub fn build_network(pillars: &[Pillar], mesh: &Mesh, bvh: &Bvh, cone_length: f32) -> BraceNetwork {
+    let mut braces = build_braces(pillars);
+    let (fork_links, fork_bottoms) = build_forks(pillars, cone_length, mesh, bvh);
+    braces.extend(fork_links);
+    BraceNetwork {
+        braces,
+        fork_bottoms,
+    }
+}
+
+/// Emits inverted-V forks (plan §2.5 step 2). Returns the fork links and the
+/// `(pillar index, fork z)` truncation for each forked (middle) pillar.
+///
+/// For each pillar B we look for the most collinear pair of neighbours A, C
+/// within 4 × Ø, both turning no more than 45° from straight. A fork point F is
+/// placed on B, two 45° links run from F down to A and C (each link-tested),
+/// and B's pillar is truncated at F so A and C carry it instead of the plate.
+///
+/// Each pillar is forked at most once. A forked (truncated) pillar may still
+/// serve as a neighbour for an adjacent fork; in that rare chain-of-four case
+/// its links land where the original pillar ran, which §2.5 does not spell out.
+/// Accepted as a simplification.
+fn build_forks(
+    pillars: &[Pillar],
+    cone_length: f32,
+    mesh: &Mesh,
+    bvh: &Bvh,
+) -> (Vec<Part>, Vec<(usize, f32)>) {
+    let mut links = Vec::new();
+    let mut bottoms = Vec::new();
+
+    for b in 0..pillars.len() {
+        let middle = pillars[b];
+        let diameter = 2.0 * middle.radius;
+        // The 9 × Ø chain radius of §2.5 step 2 only bounds how far ahead the
+        // chain walks; a fork still requires gaps ≤ 4 × Ø, so we enumerate
+        // neighbours at the tighter 4 × Ø bound directly.
+        let max_gap = FORK_GAP_DIAMETERS * diameter;
+
+        let mut neighbours = Vec::new();
+        for a in 0..pillars.len() {
+            if a != b && (pillars[a].xy - middle.xy).magnitude() <= max_gap {
+                neighbours.push(a);
+            }
+        }
+
+        // Pick the most collinear pair of neighbours on opposite sides of B.
+        let mut best: Option<(usize, usize, f32)> = None;
+        for &a in &neighbours {
+            for &c in &neighbours {
+                if a >= c {
+                    continue;
+                }
+                let d1 = middle.xy - pillars[a].xy;
+                let d2 = pillars[c].xy - middle.xy;
+                let (l1, l2) = (d1.magnitude(), d2.magnitude());
+                if l1 <= f32::EPSILON || l2 <= f32::EPSILON {
+                    continue;
+                }
+                let col = d1.dot(&d2) / (l1 * l2);
+                if col < COS_45 {
+                    continue;
+                }
+                if best.map_or(true, |(_, _, bc)| col > bc) {
+                    best = Some((a, c, col));
+                }
+            }
+        }
+
+        if let Some((a, c, _)) = best {
+            if let Some((parts, bottom)) = fork_at(pillars, a, b, c, cone_length, mesh, bvh) {
+                links.extend(parts);
+                bottoms.push(bottom);
+            }
+        }
+    }
+
+    (links, bottoms)
+}
+
+/// The minimum fork-point height above the plate (plan §2.5 step 2: `ground +
+/// pillar Ø + 0.1 mm + base or raft thickness + supportconnminheight`; ground
+/// is 0, so this is 5.3 mm for the Middle preset).
+fn fork_floor(diameter: f32) -> f32 {
+    diameter + FORK_FLOOR_EXTRA + BASE_THICKNESS + BRACE_STOP_HEIGHT
+}
+
+/// Tries to fork the middle pillar `b` onto its neighbours `a` and `c`.
+///
+/// Returns the two 45° fork links and the truncation `(b, fork_z)` when the
+/// fork is valid and both links pass the link test, otherwise `None`.
+fn fork_at(
+    pillars: &[Pillar],
+    a: usize,
+    b: usize,
+    c: usize,
+    cone_length: f32,
+    mesh: &Mesh,
+    bvh: &Bvh,
+) -> Option<(Vec<Part>, (usize, f32))> {
+    let (pa, pb, pc) = (pillars[a], pillars[b], pillars[c]);
+    let diameter = 2.0 * pb.radius;
+
+    // The fork point sits on B's pillar, `2 × Ø + 0.3 × cone length` below its
+    // top (§2.5 step 2).
+    let fork_z = pb.top_z - (FORK_DROP_DIAMETERS * diameter + FORK_DROP_CONE_FACTOR * cone_length);
+
+    // F must stay above the floor, and B's tip end may sit at most
+    // `2.5 × (cone length + Ø)` above F (§2.5 step 2).
+    if fork_z < fork_floor(diameter) {
+        return None;
+    }
+    if pb.tip_z - fork_z > FORK_TIP_MAX_DIAMETERS * (cone_length + diameter) {
+        return None;
+    }
+
+    let radius = pa.radius.min(pb.radius).min(pc.radius);
+    let from = Vector3::new(pb.xy.x, pb.xy.y, fork_z);
+
+    let mut parts = Vec::with_capacity(2);
+    for &end in &[a, c] {
+        let run = (pillars[end].xy - pb.xy).magnitude();
+        if run <= f32::EPSILON {
+            return None;
+        }
+        let to = Vector3::new(pillars[end].xy.x, pillars[end].xy.y, fork_z - run);
+        // A fork link may not dip below the plate (defensive; the fork-floor
+        // check above normally keeps the landing point above the base).
+        if to.z < 0.0 || collision::link_test(mesh, bvh, from, to, radius) {
+            return None;
+        }
+        parts.push(Part {
+            kind: PartKind::Brace,
+            a: from,
+            b: to,
+            radius_a: radius,
+            radius_b: radius,
+            shape: Shape::Round,
+        });
+    }
+
+    Some((parts, (b, fork_z)))
 }
 
 /// Delaunay triangulation over pillar XY positions, reduced to a minimum
@@ -226,7 +422,9 @@ fn brace_pair(a: Pillar, b: Pillar) -> Option<Vec<Part>> {
 
 #[cfg(test)]
 mod tests {
+    use common::progress::Progress;
     use nalgebra::Vector2;
+    use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 
     use super::*;
 
@@ -234,8 +432,17 @@ mod tests {
         Pillar {
             xy: Vector2::new(x, y),
             top_z: z,
+            tip_z: z,
             radius: 0.6,
         }
+    }
+
+    /// A model with no triangles, so every collision test passes (returns no
+    /// hit). Fork links only need the link test to come back clean.
+    fn empty_scene() -> (Mesh, Bvh) {
+        let mesh = Mesh::new(Vec::new(), Vec::new());
+        let bvh = Bvh::build(mesh.inner(), Progress::new());
+        (mesh, bvh)
     }
 
     #[test]
@@ -279,5 +486,89 @@ mod tests {
                 "brace must stop above the plate"
             );
         }
+    }
+
+    #[test]
+    fn collinear_triple_gets_forked() {
+        // Three pillars 4 mm apart (≤ 4 × Ø = 4.8 mm), tall enough to fork.
+        let pillars = [
+            pillar(0.0, 0.0, 20.0),
+            pillar(4.0, 0.0, 20.0),
+            pillar(8.0, 0.0, 20.0),
+        ];
+        let (mesh, bvh) = empty_scene();
+        let (links, bottoms) = build_forks(&pillars, 2.0, &mesh, &bvh);
+
+        assert_eq!(links.len(), 2, "a fork emits two links");
+        assert_eq!(bottoms.len(), 1, "one pillar is truncated");
+        assert_eq!(bottoms[0].0, 1, "the middle pillar is truncated");
+        // F = 20 − (2 × 1.2 + 0.3 × 2.0) = 20 − 3.0 = 17.0.
+        assert!((bottoms[0].1 - 17.0).abs() < 1e-3);
+
+        for link in &links {
+            assert_eq!(link.kind, PartKind::Brace);
+            let run = (link.a.xy() - link.b.xy()).magnitude();
+            let drop = link.a.z - link.b.z;
+            assert!(
+                (drop - run).abs() < 1e-3,
+                "fork link must drop exactly as far as it runs (45°), got run {run} drop {drop}"
+            );
+        }
+    }
+
+    #[test]
+    fn far_triple_is_not_forked() {
+        // Gaps of 5 mm exceed 4 × Ø = 4.8 mm, so no fork forms.
+        let pillars = [
+            pillar(0.0, 0.0, 20.0),
+            pillar(5.0, 0.0, 20.0),
+            pillar(10.0, 0.0, 20.0),
+        ];
+        let (mesh, bvh) = empty_scene();
+        let (links, bottoms) = build_forks(&pillars, 2.0, &mesh, &bvh);
+        assert!(links.is_empty());
+        assert!(bottoms.is_empty());
+    }
+
+    #[test]
+    fn bent_triple_is_not_forked() {
+        // B sits at a right-angle corner: A to the north, C to the east. The
+        // turn exceeds 45°, so no fork forms.
+        let pillars = [
+            pillar(0.0, 4.0, 20.0), // A
+            pillar(0.0, 0.0, 20.0), // B
+            pillar(4.0, 0.0, 20.0), // C
+        ];
+        let (mesh, bvh) = empty_scene();
+        let (links, bottoms) = build_forks(&pillars, 2.0, &mesh, &bvh);
+        assert!(links.is_empty());
+        assert!(bottoms.is_empty());
+    }
+
+    #[test]
+    fn low_triple_is_not_forked() {
+        // The fork point would sit below the 5.3 mm floor, so no fork forms.
+        let pillars = [
+            pillar(0.0, 0.0, 6.0),
+            pillar(4.0, 0.0, 6.0),
+            pillar(8.0, 0.0, 6.0),
+        ];
+        let (mesh, bvh) = empty_scene();
+        let (links, bottoms) = build_forks(&pillars, 2.0, &mesh, &bvh);
+        assert!(links.is_empty());
+        assert!(bottoms.is_empty());
+    }
+
+    #[test]
+    fn network_propagates_fork_bottoms() {
+        let pillars = [
+            pillar(0.0, 0.0, 20.0),
+            pillar(4.0, 0.0, 20.0),
+            pillar(8.0, 0.0, 20.0),
+        ];
+        let (mesh, bvh) = empty_scene();
+        let network = build_network(&pillars, &mesh, &bvh, 2.0);
+        assert_eq!(network.fork_bottoms.len(), 1);
+        assert_eq!(network.fork_bottoms[0].0, 1);
     }
 }

@@ -2,7 +2,7 @@ use clone_macro::clone;
 use common::{progress::Progress, units::Milimeters};
 use nalgebra::Vector3;
 use tools::supports::{
-    auto::{AutoPlacement, PlacementConfig},
+    auto::{AutoPlacement, BraceNetwork, PlacementConfig},
     mesh::SupportPreset,
 };
 
@@ -16,7 +16,7 @@ type RoutedSupports = Vec<[Vector3<f32>; 3]>;
 /// The routed triplets plus the brace network computed over them.
 struct RoutedWithBraces {
     routed: RoutedSupports,
-    braces: Vec<tools::supports::Part>,
+    network: BraceNetwork,
 }
 
 pub struct GenerateSupports {
@@ -47,8 +47,8 @@ impl GenerateSupports {
 
                 handle: TaskThread::spawn(clone!([progress], move || {
                     let routed = generator.generate_supports(&mesh, &half_ege, &bvh, &progress);
-                    let braces = generator.generate_braces(&routed);
-                    RoutedWithBraces { routed, braces }
+                    let network = generator.generate_braces(&mesh, &bvh, &routed);
+                    RoutedWithBraces { routed, network }
                 })),
                 progress,
             });
@@ -66,7 +66,7 @@ impl Task for GenerateSupports {
                 if let Some(model) = app.project.model(self.model) {
                     model
                         .supports
-                        .replace_auto_with_braces(&self.preset, out.routed, out.braces);
+                        .replace_auto_with_braces(&self.preset, out.routed, out.network);
                 }
 
                 PollResult::complete()

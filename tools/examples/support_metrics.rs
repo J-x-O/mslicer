@@ -141,7 +141,11 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
             [*contact, *tip, *joint],
         );
     }
-    set.braces = placement.generate_braces(&routed);
+    let network = placement.generate_braces(&model, &bvh, &routed);
+    set.braces = network.braces;
+    for (index, bottom_z) in network.fork_bottoms {
+        set.truncate_pillar(index, bottom_z);
+    }
 
     let build_start = Instant::now();
     let (mesh, _map) = build_supports(&set, Transform::default(), 24)
