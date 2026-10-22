@@ -176,6 +176,18 @@ impl SupportSet {
             });
         }
 
+        // The joint sphere sits on the vertex where the tip/link meets the
+        // pillar. A single sphere, centred exactly on the join with no axial
+        // offset, radius 0.52 · (2 · radius) = 1.04 · radius (§3.1.1).
+        parts.push(Part {
+            kind: PartKind::Joint,
+            a: joint,
+            b: joint,
+            radius_a: radius * 1.04,
+            radius_b: radius * 1.04,
+            shape: Shape::Round,
+        });
+
         parts.push(Part {
             kind: PartKind::Pillar,
             a: joint,
@@ -501,5 +513,35 @@ mod tests {
                 assert_eq!(pa.radius_b, pb.radius_b);
             }
         }
+    }
+
+    #[test]
+    fn routed_support_has_joint() {
+        let mut set = SupportSet::default();
+        let radius = 0.6;
+        set.add_routed(
+            SupportId::from_raw(1),
+            0.2,
+            radius,
+            [
+                Vector3::new(1.0, 2.0, 3.0),
+                Vector3::new(1.3, 2.4, 5.0),
+                Vector3::new(3.0, 4.0, 1.0),
+            ],
+        );
+
+        let support = &set.supports[0];
+        let joint = support
+            .parts
+            .iter()
+            .find(|p| p.kind == PartKind::Joint)
+            .expect("routed support should carry a joint sphere");
+
+        assert_eq!(joint.a, Vector3::new(3.0, 4.0, 1.0));
+        assert_eq!(joint.b, joint.a);
+        // 1.04 × radius, the 0.52·diameter joint rule (§3.1.1).
+        assert!((joint.radius_a - 1.04 * radius).abs() < 1e-6);
+        assert_eq!(joint.radius_b, joint.radius_a);
+        assert_eq!(joint.shape, Shape::Round);
     }
 }
