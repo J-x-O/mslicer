@@ -331,9 +331,15 @@ fn fork_at(
 }
 
 /// Delaunay triangulation over pillar XY positions, reduced to a minimum
-/// spanning tree, then filtered to edges no longer than `max_spacing`. Kruskal
-/// visits edges shortest first, so this is also the minimum spanning forest of
-/// the edges within `max_spacing`. Returns `(a, b)` index pairs into `pillars`.
+/// minimum spanning forest over the edges that are no longer than
+/// `max_spacing` and can hold at least one 45° brace. Returns `(a, b)` index
+/// pairs into `pillars`.
+///
+/// The braceability filter is ours, not the plan's (§2.5 just skips failed
+/// braces): the tree is built on XY distance alone, so without it a tall
+/// pillar can be connected only through a neighbour whose height range never
+/// overlaps its own (say a short landing pillar high above it), and end up
+/// unbraced while braceable neighbours sit right next to it.
 ///
 /// The MST is Kruskal over the Delaunay edges: Delaunay already contains the
 /// Euclidean MST as a subgraph, so this converges quickly and the plan's
@@ -393,6 +399,10 @@ fn spanning_tree_edges(pillars: &[Pillar], max_spacing: f32) -> Vec<(usize, usiz
         let (Some(ia), Some(ib)) = (idx_a, idx_b) else {
             continue;
         };
+        let (pa, pb) = (pillars[ia], pillars[ib]);
+        if (pa.xy - pb.xy).magnitude() > max_spacing || !can_brace(pa, pb) {
+            continue;
+        }
 
         let ra = find(&mut parent, ia);
         let rb = find(&mut parent, ib);
@@ -408,12 +418,7 @@ fn spanning_tree_edges(pillars: &[Pillar], max_spacing: f32) -> Vec<(usize, usiz
             rank[ra] += 1;
         }
 
-        // Apply the max-spacing filter on the actual pillar distance.
-        let pa = pillars[ia].xy;
-        let pb = pillars[ib].xy;
-        if (pa - pb).magnitude() <= max_spacing {
-            kept.push((ia, ib));
-        }
+        kept.push((ia, ib));
 
         if kept.len() == n - 1 {
             break;
@@ -421,6 +426,14 @@ fn spanning_tree_edges(pillars: &[Pillar], max_spacing: f32) -> Vec<(usize, usiz
     }
 
     kept
+}
+
+/// Whether a full 45° brace fits between two pillars: starting just below the
+/// lower top, it must end above both floors (§2.5 step 4). Collisions aren't
+/// considered here; `brace_pair` link-tests each brace.
+fn can_brace(a: Pillar, b: Pillar) -> bool {
+    let run = (a.xy - b.xy).magnitude();
+    run > f32::EPSILON && a.top_z.min(b.top_z) - FIRST_BRACE_DROP - run >= a.floor_z.max(b.floor_z)
 }
 
 /// Maps a `Point2` back to its index in `points` by exact bit-for-bit match.
@@ -610,6 +623,21 @@ mod tests {
         // 3 mm apart exceeds the 2.6 mm landing edge limit.
         let pillars = [landing(0.0, 8.0), landing(3.0, 8.0)];
         assert!(build_braces(&pillars, 2.6, &mesh, &bvh).is_empty());
+    }
+
+    #[test]
+    fn tree_skips_unbraceable_edges() {
+        // B is a short landing pillar high above A and C: XY-nearest to both,
+        // but no brace fits. A and C must still be braced to each other.
+        let (mesh, bvh) = empty_scene();
+        let pillars = [
+            Pillar::landing(Vector2::new(0.0, 0.0), 30.0, 10.0, 0.6),
+            Pillar::landing(Vector2::new(1.2, 0.3), 48.0, 46.0, 0.6),
+            Pillar::landing(Vector2::new(2.5, 0.0), 30.0, 10.0, 0.6),
+        ];
+        let braces = build_braces(&pillars, 2.6, &mesh, &bvh);
+        assert!(!braces.is_empty());
+        assert!(braces.iter().all(|b| b.a.z < 30.0 && b.b.z > 10.0));
     }
 
     #[test]

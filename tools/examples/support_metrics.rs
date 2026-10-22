@@ -38,7 +38,8 @@ use common::{
 };
 use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 use tools::supports::{
-    auto::{AutoPlacement, PlacementConfig},
+    SupportSet,
+    auto::{AutoPlacement, PlacementConfig, collision},
     mesh::{SupportPreset, Transform, build_supports},
     parts::PartKind,
 };
@@ -90,6 +91,73 @@ fn triangle_intersection_count(model: &Mesh, model_bvh: &Bvh, support_mesh: &Mes
     count
 }
 
+/// The M4 acceptance checks (plan §9.3), measured on the generated set.
+struct Acceptance {
+    /// Pillars taller than 10 mm with no brace and no stabilising leg.
+    unbraced_tall: usize,
+    /// Pillars taller than 10 mm, for scale.
+    tall: usize,
+    /// Braces (spanning-tree, fork links, leg braces) that fail the link test.
+    failed_braces: usize,
+    /// Shallowest and deepest tail sink into the lower surface, in mm.
+    tail_sink: Option<(f32, f32)>,
+}
+
+/// Runs the M4 acceptance checks: every pillar over 10 mm is braced or has a
+/// leg, every brace passes the link test, and tails sink 0.2–0.3 mm.
+fn acceptance(model: &Mesh, bvh: &Bvh, set: &SupportSet) -> Acceptance {
+    const TALL: f32 = 10.0;
+    const SAME_XY: f32 = 1e-4;
+
+    let braces: Vec<_> = (set.braces.iter())
+        .filter(|b| b.kind == PartKind::Brace)
+        .collect();
+    let failed_braces = (braces.iter())
+        .filter(|b| collision::link_test(model, bvh, b.a, b.b, b.radius_a))
+        .count();
+
+    // A leg's contact sits on its pillar's surface, exactly one pillar radius
+    // from the axis; model contacts practically never land there.
+    let contacts: Vec<_> = set.supports.iter().map(|s| s.point.pos).collect();
+
+    let (mut tall, mut unbraced_tall) = (0, 0);
+    for support in &set.supports {
+        for pillar in support.parts.iter().filter(|p| p.kind == PartKind::Pillar) {
+            if pillar.a.z - pillar.b.z <= TALL {
+                continue;
+            }
+            tall += 1;
+            let xy = pillar.a.xy();
+            let braced = (braces.iter())
+                .any(|b| (b.a.xy() - xy).norm() < SAME_XY || (b.b.xy() - xy).norm() < SAME_XY);
+            let legged = (contacts.iter())
+                .any(|c| ((c.xy() - xy).norm() - pillar.radius_a).abs() < 1e-3 && c.z < pillar.a.z);
+            if !braced && !legged {
+                unbraced_tall += 1;
+            }
+        }
+    }
+
+    // A tail's sink is how far its end lies past where its axis meets the
+    // model.
+    let tail_sink = (set.supports.iter())
+        .flat_map(|s| s.parts.iter().filter(|p| p.kind == PartKind::Tail))
+        .filter_map(|tail| {
+            let hit = bvh.intersect_segment(model, tail.a, tail.b)?;
+            Some((tail.b - model.transform(&hit.position)).norm())
+        })
+        .fold(None, |acc: Option<(f32, f32)>, d| {
+            Some(acc.map_or((d, d), |(lo, hi)| (lo.min(d), hi.max(d))))
+        });
+
+    Acceptance {
+        unbraced_tall,
+        tall,
+        failed_braces,
+        tail_sink,
+    }
+}
+
 struct ModelReport {
     name: String,
     our_supports: usize,
@@ -102,6 +170,7 @@ struct ModelReport {
     intersections: usize,
     generate_ms: u128,
     build_ms: u128,
+    acceptance: Acceptance,
 }
 
 fn process_model(model_path: &Path) -> Result<ModelReport> {
@@ -220,6 +289,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     // geometry; a proper "unintended intersection" metric needs per-part face
     // attribution, which is a later refinement.
     let intersections = triangle_intersection_count(&model, &bvh, &mesh);
+    let acceptance = acceptance(&model, &bvh, &set);
 
     Ok(ModelReport {
         name: model_path
@@ -235,6 +305,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
         chitubox_volume,
         part_kinds,
         intersections,
+        acceptance,
         generate_ms,
         build_ms,
     })
@@ -309,6 +380,15 @@ fn main() -> Result<()> {
                 .join(" ");
             println!("    parts: {kinds}");
         }
+
+        let a = &r.acceptance;
+        let sink = a
+            .tail_sink
+            .map_or("–".to_string(), |(lo, hi)| format!("{lo:.3}–{hi:.3} mm"));
+        println!(
+            "    accept: unbraced>10mm {}/{} failed_braces {} tail_sink {sink}",
+            a.unbraced_tall, a.tall, a.failed_braces
+        );
     }
     println!();
 
