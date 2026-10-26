@@ -37,8 +37,6 @@ pub struct SupportConfig {
     pub mesh_resolution: u32,
 
     pub default_lift: Milimeters,
-    pub raft_height: Milimeters,
-    pub raft_offset: Milimeters,
 }
 
 #[derive(Default, Clone)]
@@ -168,12 +166,10 @@ impl Default for SupportConfig {
     fn default() -> Self {
         Self {
             auto_placement: PlacementConfig::default(),
-            preset: SupportPreset::MDEIUM,
+            preset: SupportPreset::MIDDLE,
             mesh_resolution: 20,
 
             default_lift: Milimeters::new(5.0),
-            raft_height: Milimeters::new(1.0),
-            raft_offset: Milimeters::new(1.0),
         }
     }
 }

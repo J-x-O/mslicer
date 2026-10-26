@@ -1,15 +1,13 @@
 use common::id_type;
-use nalgebra::Vector3;
 
 pub mod auto;
 pub mod mesh;
+pub mod parts;
+pub mod raft;
 
-pub struct Support {
-    pub id: SupportId,
-    pub points: [Vector3<f32>; 3],
-
-    pub tip_radius: f32,
-    pub radius: f32,
-}
+pub use parts::{
+    BaseConfig, BaseShape, Foot, Part, PartKind, PointKind, Shape, Support, SupportPoint,
+    SupportSet,
+};
 
 id_type!(SupportId, u32);

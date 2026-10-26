@@ -19,6 +19,7 @@ use slicer::{
         elephant_foot_fixer::ElephantFootFixer, variable_layer_height::VariableLayerHeight,
     },
 };
+use tools::supports::SupportSet;
 
 /// Project format version. Value should be incremented whenever the save format
 /// changes, even in development so anyone using the dev/prerelease versions
@@ -46,7 +47,8 @@ use slicer::{
 /// - v3 (v0.6.0) — Added the PWM value to SliceConfig -> ExposureConfig.
 /// - v2 (v0.5.0) — A complete rewrite using a custom serilizer/deserilizer
 ///   because of the bincode drama...
-const VERSION: u16 = 16;
+/// - v17 (v0.11.0) — Store support sets (auto and manual) per model.
+const VERSION: u16 = 17;
 const DESCRIPTION: &str = concatcp!(
     "Saved by mslicer v",
     crate::VERSION,
@@ -66,6 +68,8 @@ struct ModelInfo {
     position: Vector3<f32>,
     scale: Vector3<f32>,
     rotation: Vector3<f32>,
+
+    supports: (SupportSet, SupportSet),
 }
 
 impl ModelInfo {
@@ -81,6 +85,10 @@ impl ModelInfo {
             position: model.mesh.position(),
             scale: model.mesh.scale(),
             rotation: model.mesh.rotation(),
+            supports: (
+                model.supports.auto().clone(),
+                model.supports.manual().clone(),
+            ),
         }
     }
 
@@ -91,13 +99,16 @@ impl ModelInfo {
         mesh.set_rotation_unchecked(self.rotation);
         mesh.update_transformation_matrix();
 
-        Model::from_mesh(mesh)
+        let mut model = Model::from_mesh(mesh)
             .with_name(self.name)
             .with_color(self.color.into())
             .with_exposure(self.exposure)
             .with_hidden(self.hidden)
             .with_collection(self.collection)
-            .with_unit(self.unit)
+            .with_unit(self.unit);
+
+        model.supports.restore(self.supports.0, self.supports.1);
+        model
     }
 
     pub fn serialize<T: Serializer>(&self, ser: &mut T) {
@@ -123,6 +134,10 @@ impl ModelInfo {
         self.position.serialize(ser);
         self.scale.serialize(ser);
         self.rotation.serialize(ser);
+
+        // Support sets (auto, manual)
+        self.supports.0.serialize(ser);
+        self.supports.1.serialize(ser);
     }
 
     pub fn deserialize<T: Deserializer>(des: &mut T, version: u16) -> Self {
@@ -150,6 +165,11 @@ impl ModelInfo {
             position: Vector3::<f32>::deserialize(des),
             scale: Vector3::<f32>::deserialize(des),
             rotation: Vector3::<f32>::deserialize(des),
+            supports: if version < 17 {
+                (SupportSet::default(), SupportSet::default())
+            } else {
+                (SupportSet::deserialize(des), SupportSet::deserialize(des))
+            },
         }
     }
 }
@@ -222,6 +242,15 @@ impl Project {
         let models = (0..models)
             .map(|_| ModelInfo::deserialize(des, version))
             .collect::<Vec<_>>();
+
+        // Keep generated support ids ahead of anything already in the file.
+        for info in &models {
+            for set in [&info.supports.0, &info.supports.1] {
+                if let Some(max_id) = set.supports.iter().map(|s| s.id.raw()).max() {
+                    tools::supports::SupportId::bump_past(max_id);
+                }
+            }
+        }
 
         let meshes = des.read_u32_be();
         progress.set_total((des.size() - des.pos()) as u64);

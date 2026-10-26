@@ -1,21 +1,19 @@
-use std::{collections::HashMap, f32::consts::PI, range::Range, time::Instant};
-
 use common::{color::SRgb, units::Milimeter};
-use nalgebra::{Vector2, Vector3};
-use slicer::geometry::mesh::{Mesh, MeshBuilder};
+use nalgebra::Vector3;
+use slicer::geometry::mesh::Mesh;
 use tools::supports::{
-    Support, SupportId,
-    mesh::{FaceMap, SupportPreset, Transform, build_raft},
+    SupportId, SupportSet,
+    auto::{BraceNetwork, Generated, Routed},
+    mesh::{FaceMap, SupportPreset, Transform, build_supports},
 };
-use tracing::info;
 use wgpu::Device;
 
 use crate::{core::state::PreviewModel, render::util::MeshBuffers};
 
 #[derive(Default)]
 pub struct Supports {
-    auto: Vec<Support>,
-    manual: Vec<Support>,
+    auto: SupportSet,
+    manual: SupportSet,
     transform: Transform,
 
     resolution: u32,
@@ -34,90 +32,149 @@ impl Supports {
     }
 
     pub fn clear(&mut self) {
-        self.auto.clear();
-        self.manual.clear();
+        self.auto = SupportSet::default();
+        self.manual = SupportSet::default();
         self.transform = Default::default();
         self.invalidate_cache();
     }
 
-    pub fn get(&self, id: SupportId) -> Option<&Support> {
-        (self.auto.iter())
-            .chain(self.manual.iter())
+    pub fn get(&self, id: SupportId) -> Option<&tools::supports::Support> {
+        (self.auto.supports.iter())
+            .chain(self.manual.supports.iter())
             .find(|s| s.id == id)
     }
 
     pub fn replace_auto(&mut self, config: &SupportPreset, supports: Vec<[Vector3<f32>; 3]>) {
         self.invalidate_cache();
-        self.auto = supports
-            .into_iter()
-            .map(|points| Support {
-                id: SupportId::new(),
+        let mut set = SupportSet::default();
+        for points in supports {
+            set.add_routed(
+                SupportId::new(),
+                config.tip_radius.get::<Milimeter>(),
+                config.radius.get::<Milimeter>(),
+                config.contact_depth.get::<Milimeter>(),
                 points,
-                tip_radius: config.tip_radius.get::<Milimeter>(),
-                radius: config.radius.get::<Milimeter>(),
-            })
-            .collect();
+            );
+        }
+        self.auto = set;
     }
 
-    pub fn add_manual(&mut self, config: &SupportPreset, support: [Vector3<f32>; 3]) {
+    /// Replaces the stored auto supports and their brace network.
+    ///
+    /// `network` is the output of `AutoPlacement::generate_braces` over the same
+    /// plate supports, so the pillars are tied together before meshing and any
+    /// inverted-V fork truncations are applied to the middle pillars. The
+    /// model-landing supports and stabilising legs go after the plate
+    /// supports, which keeps the network's support indices valid.
+    pub fn replace_auto_with_braces(
+        &mut self,
+        config: &SupportPreset,
+        generated: Generated,
+        network: BraceNetwork,
+    ) {
+        self.replace_auto(config, generated.plate);
+        for landing in &generated.landings {
+            self.auto.add_landing(
+                SupportId::new(),
+                config.tip_radius.get::<Milimeter>(),
+                config.radius.get::<Milimeter>(),
+                landing,
+            );
+        }
+        for leg in network.legs {
+            self.auto.add_routed(
+                SupportId::new(),
+                config.tip_radius.get::<Milimeter>(),
+                config.radius.get::<Milimeter>(),
+                config.contact_depth.get::<Milimeter>(),
+                leg,
+            );
+        }
+        self.auto.braces = network.braces;
+        for (index, bottom_z) in network.fork_bottoms {
+            self.auto.truncate_pillar(index, bottom_z);
+        }
+        // Feet go on last, once forks have cut their middle pillars short.
+        (self.auto).add_feet(&config.base_config(), &config.raft_config());
+    }
+
+    /// Adds a hand-placed support, routed like an auto one (to the plate, or
+    /// onto the model below), with the same foot: on the auto raft if there
+    /// is one, else a base.
+    pub fn add_manual(&mut self, config: &SupportPreset, routed: &Routed) {
         self.invalidate_cache();
-        self.manual.push(Support {
-            id: SupportId::new(),
-            points: support,
-            tip_radius: config.tip_radius.get::<Milimeter>(),
-            radius: config.radius.get::<Milimeter>(),
-        });
+        let set = self.single(config, routed);
+        self.manual.supports.extend(set.supports);
+    }
+
+    /// Meshes what [`Self::add_manual`] would add, for the placement preview.
+    pub fn preview_manual(&self, config: &SupportPreset, routed: &Routed) -> Option<Mesh> {
+        let set = self.single(config, routed);
+        build_supports(&set, Transform::default(), self.resolution).map(|(mesh, _)| mesh)
+    }
+
+    fn single(&self, config: &SupportPreset, routed: &Routed) -> SupportSet {
+        let (tip_radius, radius) = (
+            config.tip_radius.get::<Milimeter>(),
+            config.radius.get::<Milimeter>(),
+        );
+        let mut set = SupportSet::default();
+        match routed {
+            Routed::Plate(points) => set.add_routed(
+                SupportId::new(),
+                tip_radius,
+                radius,
+                config.contact_depth.get::<Milimeter>(),
+                *points,
+            ),
+            Routed::Model(landing) => {
+                set.add_landing(SupportId::new(), tip_radius, radius, landing)
+            }
+        }
+        match &self.auto.raft {
+            Some(raft) => set.stand_on_raft(raft),
+            None => set.add_bases(&config.base_config()),
+        }
+        set
+    }
+
+    pub fn auto(&self) -> &SupportSet {
+        &self.auto
+    }
+
+    pub fn manual(&self) -> &SupportSet {
+        &self.manual
+    }
+
+    /// Replaces the stored support sets, for deserialization.
+    pub fn restore(&mut self, auto: SupportSet, manual: SupportSet) {
+        self.auto = auto;
+        self.manual = manual;
+        self.invalidate_cache();
     }
 
     pub fn mesh(&mut self) -> &Option<(Mesh, FaceMap)> {
-        if self.mesh.is_some() || (self.auto.is_empty() && self.manual.is_empty()) {
+        if self.mesh.is_some() || (self.auto.supports.is_empty() && self.manual.supports.is_empty())
+        {
             return &self.mesh;
         }
 
-        let start = Instant::now();
-        let mut builder = MeshBuilder::new();
-        let mut raft_points = Vec::new();
-        let mut map = HashMap::new();
-
-        for support in self.auto.iter().chain(self.manual.iter()) {
-            let (r, p) = (support.radius, self.resolution);
-            let mut points = support.points;
-
-            //rotate!?
-
-            // ↓ incorrect!
-            points[0] = points[0].component_mul(&self.transform.scale);
-            points[1] = points[1].component_mul(&self.transform.scale);
-            points[2] = points[2].component_mul(&self.transform.scale);
-
-            points[0].z += self.transform.position.z;
-            points[1].z += self.transform.position.z;
-            points[2].z += self.transform.position.z;
-
-            let start = builder.next_face_idx();
-            builder.add_cylinder((points[0], points[1]), (support.tip_radius, r), p);
-            builder.add_cylinder((points[1], points[2]), (r, r), p);
-            builder.add_cylinder((points[2], points[2].xy().push(0.0)), (r, r), p);
-
-            for i in 0..(p * 2) {
-                let angle = i as f32 / p as f32 * PI;
-                let normal = Vector2::new(angle.cos(), angle.sin());
-                raft_points.push(points[2].xy() + normal * r);
-            }
-
-            builder.add_sphere(points[0], 0.2, p);
-            builder.add_sphere(points[1], r, p);
-            builder.add_sphere(points[2], r, p);
-
-            let end = builder.next_face_idx();
-            map.insert(support.id, Range::from(start..end));
+        // Build both sets into a single mesh: put every support from both sets
+        // into one SupportSet so build_supports assigns contiguous, non
+        // -overlapping face ranges keyed by id.
+        let mut set = SupportSet {
+            lift: self.auto.lift,
+            ..SupportSet::default()
+        };
+        set.supports.extend(self.auto.supports.iter().cloned());
+        set.supports.extend(self.manual.supports.iter().cloned());
+        set.braces = self.auto.braces.clone();
+        set.braces.extend(self.manual.braces.clone());
+        if let Some(raft) = &self.auto.raft {
+            set.raft = Some(raft.clone());
         }
 
-        build_raft(1.0, 1.0, &raft_points, &mut builder);
-        if !builder.is_empty() {
-            let mesh = builder.build();
-            let (faces, duration) = (mesh.face_count(), start.elapsed());
-            info!("Generated support mesh with {faces} faces in {duration:?}");
+        if let Some((mesh, map)) = build_supports(&set, self.transform, self.resolution) {
             self.mesh = Some((mesh, map));
         }
 
@@ -153,31 +210,36 @@ impl Supports {
         scale: Vector3<f32>,
         rotation: Vector3<f32>,
     ) {
+        let old = self.transform;
+        self.transform = Transform {
+            position,
+            scale,
+            _rotation: rotation.z,
+        };
+
         if let Some((mesh, _)) = &mut self.mesh {
             if mesh.rotation().xy() != rotation.xy() {
                 self.clear();
                 return;
             }
 
-            mesh.set_position(position.xy().push(mesh.position().z));
-            mesh.set_rotation(mesh.rotation().xy().push(rotation.z));
+            // Support parts are world-space, so the cached mesh's own transform
+            // is otherwise identity. Track the parent model by accumulating its
+            // movement onto the mesh instead of re-applying the model's absolute
+            // position — that would double-count the buildplate offset already
+            // baked into every part coordinate and bounce the supports up.
+            let delta = position - old.position;
+            mesh.set_position(mesh.position() + delta);
 
-            let old = self.transform;
-            self.transform = Transform {
-                position,
-                scale,
-                _rotation: rotation.z,
-            };
-
-            if scale != old.scale || position.z != old.position.z {
+            if scale != old.scale {
                 self.invalidate_cache();
             }
         }
     }
 
     pub fn remove(&mut self, id: SupportId) {
-        self.auto.retain(|x| x.id != id);
-        self.manual.retain(|x| x.id != id);
+        self.auto.supports.retain(|x| x.id != id);
+        self.manual.supports.retain(|x| x.id != id);
     }
 
     pub fn preview(&mut self, device: &Device, color: SRgb<f32>) -> Option<PreviewModel> {

@@ -13,6 +13,7 @@ mesh_format.workspace = true
 slicer.workspace = true
 
 anyhow.workspace = true
+bitflags.workspace = true
 gerber_parser.workspace = true
 hound.workspace = true
 image.workspace = true
@@ -22,5 +23,8 @@ ordered-float.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 rayon.workspace = true
+i_overlay.workspace = true
+i_triangle.workspace = true
+spade.workspace = true
 svg.workspace = true
 tracing.workspace = true

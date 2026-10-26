@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use common::units::Milimeter;
+use common::units::{Milimeter, Milimeters};
 use const_format::concatcp;
 use egui::{Button, ComboBox, Context, DragValue, Ui, Widget};
 use egui_phosphor::regular::{LINE_SEGMENT, SELECTION_INVERSE, SPARKLE, TRASH};
-use slicer::geometry::mesh::MeshBuilder;
-use tools::supports::{auto::route_support, mesh::SupportPreset};
+use nalgebra::Vector3;
+use tools::supports::{BaseShape, auto::route_point, mesh::SupportPreset, raft::RaftShape};
 
 use crate::{
     core::App,
@@ -76,35 +76,23 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
         ui.add_space(8.0);
     }
 
-    ui.collapsing("Support", |ui| {
+    ui.horizontal(|ui| {
         ui.label("Preset");
-        ui.horizontal(|ui| {
-            ComboBox::from_id_salt("preset")
-                .selected_text("todo")
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut app.project.support_config.preset,
-                        SupportPreset::LIGHT,
-                        "Light",
-                    );
-                    ui.selectable_value(
-                        &mut app.project.support_config.preset,
-                        SupportPreset::MDEIUM,
-                        "Medium",
-                    );
-                    ui.selectable_value(
-                        &mut app.project.support_config.preset,
-                        SupportPreset::HEAVY,
-                        "Heavy",
-                    );
-                });
-            ui.take_available_width();
-        });
-        ui.end_row();
+        let preset = &mut app.project.support_config.preset;
+        ComboBox::from_id_salt("preset")
+            .selected_text(preset.name().unwrap_or("Custom"))
+            .show_ui(ui, |ui| {
+                for (name, value) in SupportPreset::PRESETS {
+                    ui.selectable_value(preset, value, name);
+                }
+            });
     });
+    ui.add_space(4.0);
+
+    preset_groups(ui, &mut app.project.support_config.preset);
 
     let config = &mut app.project.support_config.auto_placement;
-    ui.collapsing("Auto Placement", |ui| {
+    ui.collapsing("General", |ui| {
         grid("auto_placement").show(ui, |ui| {
             ui.label("Default Lift");
             (app.project.support_config.default_lift)
@@ -113,21 +101,6 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
 
             ui.label("Max Angle");
             DragValue::new(&mut config.max_angle).speed(0.01).ui(ui);
-            ui.end_row();
-
-            ui.label("Face Support Spacing");
-            DragValue::new(&mut config.face_support_spacing)
-                .suffix(" mm")
-                .speed(0.01)
-                .ui(ui);
-            ui.end_row();
-
-            ui.label("Edge Angle Delta");
-            DragValue::new(&mut config.edge_angle_delta).ui(ui);
-            ui.end_row();
-
-            ui.label("Edge Support Spacing");
-            DragValue::new(&mut config.edge_support_spacing).ui(ui);
             ui.end_row();
 
             ui.label("Minimum Support Spacing");
@@ -147,42 +120,158 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
         });
     });
 
-    ui.collapsing("Raft", |ui| {
-        grid("raft").show(ui, |ui| {
-            let config = &mut app.project.support_config;
-
-            ui.label("Height");
-            config.raft_height.with::<Milimeter, _>(|x| {
-                DragValue::new(x).suffix(" mm").speed(0.1).ui(ui);
-            });
-            ui.end_row();
-
-            ui.label("Offset");
-            ui.horizontal(|ui| {
-                config.raft_offset.with::<Milimeter, _>(|x| {
-                    DragValue::new(x).suffix(" mm").speed(0.1).ui(ui);
-                });
-                ui.take_available_width();
-            });
-            ui.end_row();
-        });
-    });
-
     ui.add_space(4.0);
     ui.separator();
     ui.add_space(4.0);
     ui.label(IN_DEV_WARNING);
 }
 
+/// The preset's settings, grouped as top / middle / bottom / raft. Diameters
+/// are shown as diameters but stored as radii.
+fn preset_groups(ui: &mut Ui, preset: &mut SupportPreset) {
+    ui.collapsing("Top", |ui| {
+        grid("support_top").show(ui, |ui| {
+            row(ui, "Cone Top Diameter", |ui| {
+                diameter(ui, &mut preset.tip_radius)
+            });
+            row(ui, "Contact Depth", |ui| mm(ui, &mut preset.contact_depth));
+            row(ui, "Cone Length", |ui| mm(ui, &mut preset.tip_length));
+        });
+    });
+
+    ui.collapsing("Middle", |ui| {
+        grid("support_middle").show(ui, |ui| {
+            row(ui, "Pillar Diameter", |ui| diameter(ui, &mut preset.radius));
+            row(ui, "Model Clearance", |ui| mm(ui, &mut preset.margin));
+            row(ui, "Slim Diameter", |ui| {
+                diameter(ui, &mut preset.slim_radius)
+            });
+            row(ui, "Slim Contact Depth", |ui| {
+                mm(ui, &mut preset.slim_depth)
+            });
+        });
+    });
+
+    ui.collapsing("Bottom", |ui| {
+        grid("support_bottom").show(ui, |ui| {
+            row(ui, "Base Shape", |ui| {
+                ComboBox::from_id_salt("base_shape")
+                    .selected_text(format!("{:?}", preset.base_shape))
+                    .show_ui(ui, |ui| {
+                        for shape in [
+                            BaseShape::Skate,
+                            BaseShape::Cone,
+                            BaseShape::Cylinder,
+                            BaseShape::None,
+                        ] {
+                            ui.selectable_value(
+                                &mut preset.base_shape,
+                                shape,
+                                format!("{shape:?}"),
+                            );
+                        }
+                    });
+            });
+            row(ui, "Base Diameter", |ui| {
+                diameter(ui, &mut preset.base_radius)
+            });
+            row(ui, "Base Thickness", |ui| {
+                mm(ui, &mut preset.base_thickness)
+            });
+            row(ui, "Boss Height", |ui| mm(ui, &mut preset.boss_height));
+            row(ui, "Boss Bottom Diameter", |ui| {
+                diameter(ui, &mut preset.boss_radius)
+            });
+            row(ui, "Tail Depth", |ui| mm(ui, &mut preset.tail_depth));
+        });
+    });
+
+    ui.collapsing("Raft", |ui| {
+        grid("support_raft").show(ui, |ui| {
+            row(ui, "Shape", |ui| {
+                let name = |shape| match shape {
+                    RaftShape::None => "None",
+                    RaftShape::Skate => "Skate",
+                    RaftShape::CrossGrid => "Cross Grid",
+                };
+                ComboBox::from_id_salt("raft_shape")
+                    .selected_text(name(preset.raft_shape))
+                    .show_ui(ui, |ui| {
+                        for shape in [RaftShape::None, RaftShape::Skate, RaftShape::CrossGrid] {
+                            ui.selectable_value(&mut preset.raft_shape, shape, name(shape));
+                        }
+                    });
+            });
+            row(ui, "Area Ratio", |ui| {
+                let mut percent = preset.raft_area_ratio * 100.0;
+                if DragValue::new(&mut percent)
+                    .suffix(" %")
+                    .range(100.0..=200.0)
+                    .ui(ui)
+                    .changed()
+                {
+                    preset.raft_area_ratio = percent / 100.0;
+                }
+            });
+            row(ui, "Thickness", |ui| mm(ui, &mut preset.raft_thickness));
+            row(ui, "Lip Height", |ui| mm(ui, &mut preset.raft_height));
+            row(ui, "Lip Angle", |ui| {
+                DragValue::new(&mut preset.raft_angle)
+                    .suffix("°")
+                    .range(5.0..=90.0)
+                    .ui(ui);
+            });
+            row(ui, "Grid Cell", |ui| mm(ui, &mut preset.raft_grid_cell));
+            row(ui, "Grid Bar Width", |ui| {
+                mm(ui, &mut preset.raft_grid_width)
+            });
+        });
+    });
+}
+
+fn row(ui: &mut Ui, label: &str, content: impl FnOnce(&mut Ui)) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        content(ui);
+        ui.take_available_width();
+    });
+    ui.end_row();
+}
+
+fn mm(ui: &mut Ui, value: &mut Milimeters) {
+    value.with::<Milimeter, _>(|x| {
+        DragValue::new(x)
+            .suffix(" mm")
+            .speed(0.01)
+            .range(0.0..=f32::MAX)
+            .ui(ui);
+    });
+}
+
+fn diameter(ui: &mut Ui, radius: &mut Milimeters) {
+    let mut d = radius.get::<Milimeter>() * 2.0;
+    let edit = DragValue::new(&mut d)
+        .prefix("Ø ")
+        .suffix(" mm")
+        .speed(0.01);
+    if edit.range(0.0..=f32::MAX).ui(ui).changed() {
+        *radius = Milimeters::new(d / 2.0);
+    }
+}
+
 fn generate_support(app: &mut App, model: usize) {
     let default_lift = app.project.support_config.default_lift.get::<Milimeter>();
 
     let model = &mut app.project.models[model];
-    let pos = model.mesh.position();
-    model.set_position(
-        &app.project.slice_config.platform_size,
-        pos.xy().push(pos.z.max(default_lift)),
-    );
+
+    // Lift so the model's *lowest point* sits at `default_lift`, mirroring
+    // align-to-bed (which puts the lowest point at z = 0) then adding the lift.
+    // Using the object origin (`mesh.position().z`) instead is wrong: the origin
+    // is the encoded translation, not the surface, so a model whose origin is
+    // already above the lift would be left sitting below the plate.
+    let min_z = model.bounds.min.z;
+    let pos = model.mesh.position() + Vector3::z() * (default_lift - min_z);
+    model.set_position(&app.project.slice_config.platform_size, pos);
 
     let placement = app.project.support_config.auto_placement.clone();
     let support = app.project.support_config.preset.clone();
@@ -203,7 +292,7 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         return;
     };
 
-    let mut builder = MeshBuilder::new();
+    let mut preview = None;
     for model in app.project.models.iter_mut() {
         let Some(bvh) = model.bvh.as_ref() else {
             continue;
@@ -214,35 +303,23 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
         };
 
         let config = &app.project.support_config.preset;
-        let tip_r = config.tip_radius.get::<Milimeter>();
-
-        let normal = (model.mesh).transform_normal(&model.mesh.normal(intersection.face));
+        let normal = (model.mesh)
+            .transform_normal(&model.mesh.normal(intersection.face))
+            .normalize();
         if normal.z > 0.0 {
             continue;
         }
 
         let intersection = model.mesh.transform(&intersection.position);
-        let start = intersection + normal * config.tip_length.get::<Milimeter>();
-
-        let radius = (config.radius + config.margin).get::<Milimeter>();
-        if let Some(middle) = route_support(&model.mesh, bvh, radius, start) {
-            let (r, p) = (config.radius.get::<Milimeter>(), 100);
-            builder.add_cylinder((intersection, start), (tip_r, r), p);
-            builder.add_cylinder((start, middle), (r, r), p);
-            builder.add_cylinder((middle, middle.xy().push(0.0)), (r, r), p);
-
-            builder.add_sphere(intersection, 0.2, p);
-            builder.add_sphere(start, r, p);
-            builder.add_sphere(middle, r, p);
-
+        if let Some(routed) = route_point(&model.mesh, bvh, config, intersection, normal) {
+            preview = model.supports.preview_manual(config, &routed);
             if clicked {
-                let support = [intersection, start, middle];
-                model.supports.add_manual(config, support);
+                model.supports.add_manual(config, &routed);
             }
         }
     }
 
-    app.state.support_preview = (!builder.is_empty()).then(|| builder.build());
+    app.state.support_preview = preview;
 }
 
 fn prepare(app: &mut App, ui: &mut Ui) {
