@@ -19,6 +19,14 @@ pub struct UiConfig {
     pub quick_layout_spacing: Milimeters,
     pub hover_overlay: bool,
     pub hover_overlay_detail: bool,
+    /// Build every model's acceleration structures as soon as it is loaded.
+    pub auto_prepare: bool,
+    /// The colour of the selection box and the Orient tool's face highlight,
+    /// in sRGB.
+    pub accent_color: [f32; 3],
+    /// The colour of warnings, like a model outside the build volume, in
+    /// sRGB. Model and support colours keep clear of its hue.
+    pub warning_color: [f32; 3],
 
     pub update_check: UpdateCheckFrequency,
     pub last_update_check: Option<DateTime<Utc>>,
@@ -80,6 +88,9 @@ impl Default for UiConfig {
             quick_layout_spacing: Milimeters::new(2.0),
             hover_overlay: true,
             hover_overlay_detail: false,
+            auto_prepare: true,
+            accent_color: [0.2, 0.5, 1.0],
+            warning_color: [1.0, 0.1, 0.1],
 
             update_check: UpdateCheckFrequency::EveryLaunch,
             last_update_check: None,

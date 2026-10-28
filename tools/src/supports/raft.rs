@@ -358,7 +358,7 @@ fn bounds(island: &Island) -> (Vector2<f32>, Vector2<f32>) {
 // --------------------------------------------------------------------------
 
 impl RaftShape {
-    const fn discriminant(self) -> u8 {
+    pub(crate) const fn discriminant(self) -> u8 {
         match self {
             RaftShape::None => 0,
             RaftShape::Skate => 1,
@@ -366,7 +366,7 @@ impl RaftShape {
         }
     }
 
-    fn from_discriminant(x: u8) -> Self {
+    pub(crate) fn from_discriminant(x: u8) -> Self {
         match x {
             1 => RaftShape::Skate,
             2 => RaftShape::CrossGrid,
@@ -375,21 +375,48 @@ impl RaftShape {
     }
 }
 
-impl Raft {
+/// No raft, with the Middle preset's values ready for when one is turned on.
+impl Default for RaftConfig {
+    fn default() -> Self {
+        crate::supports::mesh::SupportPreset::default().raft_config()
+    }
+}
+
+impl RaftConfig {
     pub fn serialize<T: Serializer>(&self, ser: &mut T) {
-        let c = &self.config;
-        ser.write_u8(c.shape.discriminant());
+        ser.write_u8(self.shape.discriminant());
         for x in [
-            c.foot_radius,
-            c.area_ratio,
-            c.thickness,
-            c.height,
-            c.angle,
-            c.grid_cell,
-            c.grid_width,
+            self.foot_radius,
+            self.area_ratio,
+            self.thickness,
+            self.height,
+            self.angle,
+            self.grid_cell,
+            self.grid_width,
         ] {
             ser.write_f32_be(x);
         }
+    }
+
+    pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
+        let shape = RaftShape::from_discriminant(des.read_u8());
+        let mut f = || des.read_f32_be();
+        Self {
+            shape,
+            foot_radius: f(),
+            area_ratio: f(),
+            thickness: f(),
+            height: f(),
+            angle: f(),
+            grid_cell: f(),
+            grid_width: f(),
+        }
+    }
+}
+
+impl Raft {
+    pub fn serialize<T: Serializer>(&self, ser: &mut T) {
+        self.config.serialize(ser);
         ser.write_u32_be(self.islands.len() as u32);
         for island in &self.islands {
             ser.write_u32_be(island.len() as u32);
@@ -404,18 +431,7 @@ impl Raft {
     }
 
     pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
-        let shape = RaftShape::from_discriminant(des.read_u8());
-        let mut f = || des.read_f32_be();
-        let config = RaftConfig {
-            shape,
-            foot_radius: f(),
-            area_ratio: f(),
-            thickness: f(),
-            height: f(),
-            angle: f(),
-            grid_cell: f(),
-            grid_width: f(),
-        };
+        let config = RaftConfig::deserialize(des);
         let islands = (0..des.read_u32_be())
             .map(|_| {
                 (0..des.read_u32_be())

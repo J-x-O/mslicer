@@ -25,6 +25,7 @@ use crate::{
         project::{
             Collection, CollectionId,
             model::{Model, ModelId},
+            supports::SupportsSnapshot,
         },
     },
 };
@@ -91,9 +92,16 @@ pub enum ModelAction {
     Name(String),
     Color(LinearRgb<f32>),
     Hidden(bool),
-    Position(Vector3<f32>),
-    Scale(Vector3<f32>),
-    Rotation(Vector3<f32>),
+    // Transforms carry the supports from before, as a transform that lifts,
+    // tilts or scales the model clears them.
+    Position(Vector3<f32>, SupportsSnapshot),
+    Scale(Vector3<f32>, SupportsSnapshot),
+    Rotation(Vector3<f32>, SupportsSnapshot),
+    /// The Orient tool: rotation, then position.
+    Orientation(Vector3<f32>, Vector3<f32>, SupportsSnapshot),
+    /// Auto generation, which also lifts the model.
+    GeneratedSupports(Vector3<f32>, SupportsSnapshot),
+    Supports(SupportsSnapshot),
     RelativeExposure(u8),
     Collection(Option<CollectionId>),
     Move(usize, Option<CollectionId>),
@@ -148,10 +156,19 @@ impl History {
     pub fn memory_size(&self, loaded_models: &HashMap<MeshId, usize>) -> usize {
         let mut models = 0;
         for action in self.history.iter().chain(self.future.iter()) {
-            if let Action::ModelRemoved { model, .. } = action
-                && !loaded_models.contains_key(&model.mesh.mesh_id())
-            {
-                models += model.mesh_memory_size();
+            match action {
+                Action::ModelRemoved { model, .. } => {
+                    if !loaded_models.contains_key(&model.mesh.mesh_id()) {
+                        models += model.mesh_memory_size();
+                    }
+                    models += model.supports.memory_size();
+                }
+                // Overcounts snapshots that share their sets with the model
+                // or each other.
+                Action::Model { action, .. } => {
+                    models += action.supports().map_or(0, SupportsSnapshot::memory_size)
+                }
+                _ => {}
             }
         }
 
@@ -165,6 +182,7 @@ impl<'a> HistoryRef<'a> {
             self.constrain_size();
             self.future.push_back(redo);
         }
+        self.prune_selection();
     }
 
     pub fn redo(&mut self) {
@@ -172,6 +190,15 @@ impl<'a> HistoryRef<'a> {
             self.constrain_size();
             self.history.push_back(redo);
         }
+        self.prune_selection();
+    }
+
+    /// Drops selected supports that an undo or redo took away.
+    fn prune_selection(&mut self) {
+        let App { state, project, .. } = &mut *self.app;
+        (state.selected_supports).retain(|model, support| {
+            (project.models.iter()).any(|m| m.id == model && m.supports.contains(support))
+        });
     }
 
     pub fn undo_to(&mut self, index: usize) {
@@ -324,9 +351,12 @@ impl ModelAction {
             Self::Hidden(hide) => {
                 ActionDescription::new(if *hide { "Showed Model" } else { "Hid Model" })
             }
-            Self::Position(_) => ActionDescription::new("Moved Model"),
-            Self::Scale(_) => ActionDescription::new("Scaled Model"),
-            Self::Rotation(_) => ActionDescription::new("Rotated Model"),
+            Self::Position(..) => ActionDescription::new("Moved Model"),
+            Self::Scale(..) => ActionDescription::new("Scaled Model"),
+            Self::Rotation(..) => ActionDescription::new("Rotated Model"),
+            Self::Orientation(..) => ActionDescription::new("Oriented Model"),
+            Self::GeneratedSupports(..) => ActionDescription::new("Generated Supports"),
+            Self::Supports(_) => ActionDescription::new("Edited Supports"),
             Self::RelativeExposure(_) => ActionDescription::new("Changed Model Exposure"),
             Self::Collection(_) => ActionDescription::new("Changed Model Collection"),
             Self::Move(..) => ActionDescription::new("Moved Model"),
@@ -343,20 +373,45 @@ impl ModelAction {
             Self::Name(name) => Self::Name(mem::replace(&mut model.name, name)),
             Self::Color(color) => Self::Color(mem::replace(&mut model.color, color)),
             Self::Hidden(hide) => Self::Hidden(mem::replace(&mut model.hidden, hide)),
-            Self::Position(matrix) => {
-                let old = model.mesh.position();
-                model.set_position(platform_size, matrix);
-                Self::Position(old)
+            Self::Position(position, supports) => {
+                let old = (model.mesh.position(), model.supports.snapshot());
+                model.set_position(platform_size, position);
+                model.supports.restore_snapshot(supports);
+                Self::Position(old.0, old.1)
             }
-            Self::Scale(matrix) => {
-                let old = model.mesh.scale();
-                model.set_scale(platform_size, matrix);
-                Self::Scale(old)
+            Self::Scale(scale, supports) => {
+                let old = (model.mesh.scale(), model.supports.snapshot());
+                model.set_scale(platform_size, scale);
+                model.supports.restore_snapshot(supports);
+                Self::Scale(old.0, old.1)
             }
-            Self::Rotation(matrix) => {
-                let old = model.mesh.rotation();
-                model.set_rotation(platform_size, matrix);
-                Self::Rotation(old)
+            Self::Rotation(rotation, supports) => {
+                let old = (model.mesh.rotation(), model.supports.snapshot());
+                model.set_rotation(platform_size, rotation);
+                model.supports.restore_snapshot(supports);
+                Self::Rotation(old.0, old.1)
+            }
+            Self::Orientation(rotation, position, supports) => {
+                let old = (
+                    model.mesh.rotation(),
+                    model.mesh.position(),
+                    model.supports.snapshot(),
+                );
+                model.set_rotation(platform_size, rotation);
+                model.set_position(platform_size, position);
+                model.supports.restore_snapshot(supports);
+                Self::Orientation(old.0, old.1, old.2)
+            }
+            Self::GeneratedSupports(position, supports) => {
+                let old = (model.mesh.position(), model.supports.snapshot());
+                model.set_position(platform_size, position);
+                model.supports.restore_snapshot(supports);
+                Self::GeneratedSupports(old.0, old.1)
+            }
+            Self::Supports(supports) => {
+                let old = model.supports.snapshot();
+                model.supports.restore_snapshot(supports);
+                Self::Supports(old)
             }
             Self::RelativeExposure(exposure) => {
                 Self::RelativeExposure(mem::replace(&mut model.exposure, exposure))
@@ -373,6 +428,21 @@ impl ModelAction {
                 return Some(Self::Move(current_index, old_collection));
             }
         })
+    }
+}
+
+impl ModelAction {
+    /// The support snapshot this action carries, if any.
+    fn supports(&self) -> Option<&SupportsSnapshot> {
+        match self {
+            Self::Position(_, s)
+            | Self::Scale(_, s)
+            | Self::Rotation(_, s)
+            | Self::Orientation(_, _, s)
+            | Self::GeneratedSupports(_, s)
+            | Self::Supports(s) => Some(s),
+            _ => None,
+        }
     }
 }
 

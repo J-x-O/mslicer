@@ -51,6 +51,29 @@ pub fn vec3<Num: Numeric>(
     edit
 }
 
+/// Like [`vec3`], with only the components marked in `editable` editable;
+/// the others show `locked` on hover.
+pub fn vec3_partial<Num: Numeric>(
+    ui: &mut Ui,
+    val: &mut [Num; 3],
+    func: fn(DragValue) -> DragValue,
+    editable: [bool; 3],
+    locked: &str,
+) -> bool {
+    let mut edit = false;
+    ui.horizontal(|ui| {
+        for (i, value) in val.iter_mut().enumerate() {
+            if i > 0 {
+                ui.label("×");
+            }
+            (ui.add_enabled(editable[i], func(DragValue::new(value))))
+                .on_disabled_hover_text(locked)
+                .being_edited(&mut edit);
+        }
+    });
+    edit
+}
+
 // Note: could have issues if more than one value is edited in a frame
 pub fn vec3_proportional(
     ui: &mut Ui,

@@ -3,12 +3,12 @@ use std::sync::Arc;
 use clone_macro::clone;
 use common::progress::Progress;
 use slicer::geometry::{
-    mesh::{HalfEdgeMesh, MeshId, MeshInner},
+    mesh::{MeshId, MeshInner},
     partitioning::Bvh,
 };
 
 use crate::{
-    core::project::model::Model,
+    core::{project::model::Model, state::UiState},
     task::{PollResult, Task, TaskApp, TaskStatus, thread::TaskThread},
 };
 
@@ -17,53 +17,48 @@ pub struct BuildAccelerationStructures {
     name: Option<String>,
 
     progress: Progress,
-    handle: TaskThread<(Arc<Bvh>, Arc<HalfEdgeMesh>)>,
+    handle: TaskThread<Arc<Bvh>>,
 }
 
 impl BuildAccelerationStructures {
-    pub fn new(model: &Model) -> Self {
-        let progress = Progress::new();
-        let mesh = model.mesh.inner().clone();
-        Self {
-            mesh_id: model.mesh.mesh_id(),
-            name: Some(model.name.clone()),
-            handle: TaskThread::spawn(clone!([progress], move || {
-                let bvh = Bvh::build(&mesh, progress);
-                let half_edge = HalfEdgeMesh::build_from_mesh(&mesh);
-                (Arc::new(bvh), Arc::new(half_edge))
-            })),
-            progress,
-        }
+    /// Starts building the structures for `model`'s mesh, unless they exist
+    /// or are already being built.
+    pub fn request(state: &mut UiState, model: &Model) -> Option<Self> {
+        let id = model.mesh.mesh_id();
+        (!model.has_acceleration_structures() && state.preparing.insert(id)).then(|| {
+            let mut task = Self::new_mesh(id, model.mesh.inner().clone());
+            task.name = Some(model.name.clone());
+            task
+        })
     }
 
-    pub fn new_mesh(mesh_id: MeshId, inner: Arc<MeshInner>) -> Self {
+    fn new_mesh(mesh_id: MeshId, inner: Arc<MeshInner>) -> Self {
         let progress = Progress::new();
         Self {
             mesh_id,
             name: None,
             handle: TaskThread::spawn(clone!([progress], move || {
-                let bvh = Bvh::build(&inner, progress);
-                let half_edge = HalfEdgeMesh::build_from_mesh(&inner);
-                (Arc::new(bvh), Arc::new(half_edge))
+                Arc::new(Bvh::build(&inner, progress))
             })),
             progress,
         }
+    }
+}
+
+/// Hands a finished BVH to every model that shares its mesh.
+pub fn store_bvh(models: &mut [Model], mesh_id: MeshId, bvh: &Arc<Bvh>) {
+    for model in models.iter_mut().filter(|x| x.mesh.mesh_id() == mesh_id) {
+        model.bvh.get_or_insert_with(|| bvh.clone());
     }
 }
 
 impl Task for BuildAccelerationStructures {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
         const FAILURE: &str = "Failed to Build Acceleration Structure";
-        (self.handle.poll(app, FAILURE)).into_poll_result(|(bvh, half_edge)| {
-            for model in app
-                .project
-                .models
-                .iter_mut()
-                .filter(|x| x.mesh.mesh_id() == self.mesh_id)
-            {
-                model.bvh = Some(bvh.clone());
-                model.half_edge = Some(half_edge.clone());
-            }
+        // A failed build stays in `preparing`, so it isn't retried every frame.
+        (self.handle.poll(app, FAILURE)).into_poll_result(|bvh| {
+            store_bvh(&mut app.project.models, self.mesh_id, &bvh);
+            app.state.preparing.remove(&self.mesh_id);
             PollResult::complete()
         })
     }

@@ -9,7 +9,7 @@ mod notes;
 pub mod remote_print;
 mod slice_config;
 mod sliced;
-mod supports;
+pub mod supports;
 mod tabs;
 mod viewport;
 mod workspace;

@@ -89,7 +89,7 @@ impl Task for MeshLoad {
             let mut model = Model::from_mesh(mesh)
                 .with_name(mem::take(&mut self.name))
                 .width_file(self.file.take())
-                .with_random_color();
+                .with_random_color(app.config.ui.warning_color);
             model.update_oob(&app.project.slice_config.platform_size);
             let result = PollResult::complete().with_task(MeshAnalysis::new(&model));
             app.history.track(Action::ModelAdded { id: model.id });

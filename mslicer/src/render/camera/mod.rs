@@ -11,6 +11,8 @@ use crate::core::config::render::Projection;
 pub mod spacenav;
 
 const EPSILON: f32 = 1e-5;
+/// Radians of orbit per point of pointer movement.
+const ORBIT_SPEED: f32 = 0.0092;
 pub const NEAR: f32 = 0.1;
 pub const FAR: f32 = 10_000.0;
 
@@ -79,22 +81,44 @@ impl Camera {
         }
     }
 
-    pub fn handle_movement(&mut self, response: &Response, ui: &Ui) -> bool {
-        let ctrl_down = ui.input(|x| x.modifiers.command);
-        let drag_delta = response.drag_delta() * if ctrl_down { 0.1 } else { 1.0 };
+    /// Moves the camera from pointer input: right drag orbits, middle drag
+    /// pans, scrolling zooms. Without a middle button, shift + right drag pans
+    /// and alt + left drag orbits. The plain left button is left to the tools.
+    pub fn handle_movement(
+        &mut self,
+        response: &Response,
+        ui: &Ui,
+        projection: Projection,
+    ) -> bool {
+        let modifiers = ui.input(|x| x.modifiers);
+        let drag_delta = response.drag_delta() * if modifiers.command { 0.1 } else { 1.0 };
+
+        let right = response.dragged_by(PointerButton::Secondary);
+        let orbit = (right && !modifiers.shift)
+            || (response.dragged_by(PointerButton::Primary) && modifiers.alt);
+        let pan = response.dragged_by(PointerButton::Middle) || (right && modifiers.shift);
 
         let mut active = false;
-        if response.dragged_by(PointerButton::Primary) {
-            self.angle.x -= drag_delta.x * 0.01;
-            self.angle.y += drag_delta.y * 0.01;
+        if orbit {
+            self.angle.x -= drag_delta.x * ORBIT_SPEED;
+            self.angle.y += drag_delta.y * ORBIT_SPEED;
             active |= true;
         }
 
-        if response.dragged_by(PointerButton::Secondary) {
+        if pan {
+            // Move the target as far as the view moves under the pointer at
+            // the target's depth, so the grabbed point stays under it at any
+            // zoom.
+            let half_height = match projection {
+                Projection::Perspective => self.distance * (self.fov / 2.0).tan(),
+                Projection::Orthographic => self.distance * (self.fov / 2.0).sin(),
+            };
+            let per_point = 2.0 * half_height / response.rect.height().max(1.0);
+
             let facing = self.position(1.0).neg();
             let right = facing.cross(&self.up()).normalize();
             let up = right.cross(&facing).normalize();
-            self.target -= (right * drag_delta.x * 0.1) - (up * drag_delta.y * 0.1);
+            self.target -= (right * drag_delta.x - up * drag_delta.y) * per_point;
             active |= true;
         }
 
@@ -105,6 +129,13 @@ impl Camera {
         }
 
         active
+    }
+
+    /// Points the camera at `bounds` from far enough to see all of it.
+    pub fn frame(&mut self, min: Vector3<f32>, max: Vector3<f32>) {
+        self.target = (min + max) / 2.0;
+        let radius = (max - min).magnitude() / 2.0;
+        self.distance = (radius / (self.fov / 2.0).sin()).max(EPSILON);
     }
 
     pub fn position(&self, distance: f32) -> Vector3<f32> {

@@ -89,7 +89,10 @@ impl Project {
 
     pub fn update(&mut self) {
         let res = self.support_config.mesh_resolution;
-        (self.models.iter_mut()).for_each(|x| x.supports.set_resolution(res));
+        for model in self.models.iter_mut() {
+            model.supports.set_resolution(res);
+            model.supports.update();
+        }
     }
 }
 

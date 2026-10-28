@@ -1,5 +1,5 @@
 use encase::{ShaderSize, ShaderType, UniformBuffer};
-use nalgebra::{Matrix4, Vector3};
+use nalgebra::{Matrix4, Vector3, Vector4};
 use wgpu::{
     BindGroup, BlendState, Buffer, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
     Device, FragmentState, IndexFormat, MultisampleState, PipelineLayoutDescriptor, PrimitiveState,
@@ -7,7 +7,7 @@ use wgpu::{
 };
 
 use crate::{
-    core::App,
+    core::{App, palette},
     include_shader,
     render::{
         Gcx, VERTEX_BUFFER_LAYOUT,
@@ -33,6 +33,23 @@ pub struct SupportPipeline {
 struct SupportUniforms {
     transform: Matrix4<f32>,
     camera_direction: Vector3<f32>,
+    color: Vector4<f32>,
+}
+
+/// The preview in its model's support colour (see
+/// [`palette::support_color`]). A support
+/// being dragged is drawn solid, so it seems carried; a new one is a
+/// see-through proposal.
+fn preview_color(app: &App) -> Vector4<f32> {
+    let moving = app.state.support_drag.or(app.state.support_settling);
+    let model = (moving.map(|x| x.model))
+        .or(app.state.hovered_geometry.map(|hit| hit.model))
+        .and_then(|id| app.project.models.iter().find(|m| m.id == id));
+    let warning = app.config.ui.warning_color;
+    let color = model.map_or(Vector3::repeat(1.0), |m| {
+        palette::support_color(m.color, warning).into()
+    });
+    color.push(if moving.is_some() { 1.0 } else { 0.5 })
 }
 
 impl SupportPipeline {
@@ -104,6 +121,7 @@ impl SupportPipeline {
         let uniform = SupportUniforms {
             transform: app.view_projection(),
             camera_direction: app.camera.position(1.0),
+            color: preview_color(app),
         };
 
         let mut buffer = UniformBuffer::new(Vec::new());

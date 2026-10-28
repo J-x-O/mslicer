@@ -34,7 +34,7 @@ impl App {
             .map(|x| {
                 (
                     (
-                        x.supports.mesh().as_ref().map(|x| x.0.clone()),
+                        x.supports.finished_mesh().as_ref().map(|x| x.0.clone()),
                         x.supports.preview(device, invert_color(x.color)),
                     ),
                     x.clone(),

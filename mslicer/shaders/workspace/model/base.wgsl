@@ -1,12 +1,17 @@
 @group(0) @binding(0) var<uniform> ctx: Context;
-@group(0) @binding(1) var<storage, read> selected: array<vec2u>;
+@group(0) @binding(1) var<storage, read> selected: array<vec4u>;
 
 const STYLE_NORMAL: u32 = 0;
 const STYLE_RANDOM: u32 = 1;
 const STYLE_RENDERED: u32 = 2;
 
-const SELECTED_COLOR: vec3f = vec3f(0.2, 0.2, 1.0);
-const OOB_COLOR: vec3f = vec3f(1.0, 0.0, 0.0);
+// Face states, as bits; see `FaceState` in base.rs.
+const STATE_HOVERED: u32 = 1;
+const STATE_SELECTED: u32 = 2;
+const STATE_HIDDEN: u32 = 4;
+// Outlined by the lighting pass, through the normal target's w.
+const STATE_OUTLINED: u32 = 8;
+
 const OVERHANG_COLOR: vec3f = vec3f(0.67, 0.65, 0.38);
 
 struct Context {
@@ -17,7 +22,13 @@ struct Context {
     render_style: u32,
     overhang_angle: f32,
     id: u32,
-    selected: vec2u
+    selected: vec2u,
+    accent: vec3f,
+    // Hovered and selected faces mix towards rgb by w.
+    hover: vec4f,
+    select: vec4f,
+    // Marks faces outside the build volume.
+    warning: vec3f,
 }
 
 struct VertexOutput {
@@ -46,15 +57,20 @@ fn frag(
    @builtin(primitive_index) index: u32,
    in: VertexOutput
 ) -> FragmentOutput {
+    let state = face_state(index);
+    if (state & STATE_HIDDEN) != 0 {
+        discard;
+    }
+
     let normal = screen_normal(in.world_position);
     return FragmentOutput(
-        render(is_front, in, index, normal),
+        render(is_front, in, index, normal, state),
         vec2(ctx.id, index),
-        vec4(normal, 0.0)
+        vec4(normal, select(0.0, 1.0, (state & STATE_OUTLINED) != 0))
     );
 }
 
-fn render(is_front: bool, in: VertexOutput, index: u32, normal: vec3f) -> vec4f {
+fn render(is_front: bool, in: VertexOutput, index: u32, normal: vec3f, state: u32) -> vec4f {
     switch ctx.render_style {
         case STYLE_NORMAL: {
             return vec4f(normal * 0.5 + 0.5, 1.0);
@@ -69,9 +85,14 @@ fn render(is_front: bool, in: VertexOutput, index: u32, normal: vec3f) -> vec4f 
                 color = mix(color, OVERHANG_COLOR, 1.0 - smoothstep(0, ctx.overhang_angle, acos(-normal.z)));
             }
 
-            color = select(color, SELECTED_COLOR, is_selected(index));
+            if (state & STATE_SELECTED) != 0 {
+                color = mix(color, ctx.select.rgb, ctx.select.w);
+            }
+            if (state & STATE_HOVERED) != 0 {
+                color = min(mix(color, ctx.hover.rgb, ctx.hover.w) * 1.1, vec3f(1.0));
+            }
             color = select(vec3f(.5), color, is_front);
-            color = select(color, OOB_COLOR, outside_build_volume(in.world_position));
+            color = select(color, ctx.warning, outside_build_volume(in.world_position));
 
             return vec4f(color, 1.0);
         }
@@ -81,14 +102,16 @@ fn render(is_front: bool, in: VertexOutput, index: u32, normal: vec3f) -> vec4f 
     }
 }
 
+// The state bits of every range holding `face`, combined.
 // todo: binary search :hmm:
-fn is_selected(face: u32) -> bool {
-    for (var i = ctx.selected.x; i < ctx.selected.y; i++) {
+fn face_state(face: u32) -> u32 {
+    var state = 0u;
+    for (var i = ctx.selected.x; i < ctx.selected.x + ctx.selected.y; i++) {
         let range = selected[i];
-        if (face >= range.x && face < range.y) { return true; }
+        if (face >= range.x && face < range.y) { state |= range.z; }
     }
 
-    return false;
+    return state;
 }
 
 fn outside_build_volume(pos: vec3f) -> bool {

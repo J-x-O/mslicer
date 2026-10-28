@@ -1,18 +1,19 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use common::color::SRgb;
 use egui::Vec2;
 use egui_phosphor::regular::{CURSOR_CLICK, LINE_SEGMENT, TRIANGLE};
 use egui_tracing::EventCollector;
 use nalgebra::{Matrix4, Vector2, Vector3};
-use slicer::geometry::mesh::Mesh;
+use slicer::geometry::mesh::{Mesh, MeshId};
+use tools::supports::{SupportId, mesh::SupportPreset};
 use wgpu::Device;
 
 use crate::{
     core::{
         config::peripherals::Webhook,
         project::model::{Model, ModelId},
-        selected::{SelectedModel, SelectedPrinter, SelectedSupports},
+        selected::{SelectedModel, SelectedPrinter, SelectedSupport, SelectedSupports},
     },
     interface::tools::Tools,
     render::util::MeshBuffers,
@@ -38,6 +39,24 @@ pub struct UiState {
     pub selected_printer: SelectedPrinter,
     pub selected_supports: SelectedSupports,
     pub support_preview: Option<Mesh>,
+    pub support_drag: Option<SupportDrag>,
+    /// A dragged support that was let go, still hidden (with its preview
+    /// showing) until the support mesh is rebuilt with it in its new place.
+    pub support_settling: Option<SupportDrag>,
+    /// The supports inside the selection box being drawn.
+    pub boxed_supports: HashSet<SelectedSupport>,
+    /// An edit of the selected supports' settings, while it runs.
+    pub support_edit: Option<SupportEdit>,
+    /// An edit of the raft settings is under way, and its undo step already
+    /// recorded.
+    pub raft_edit: bool,
+    /// A short message shown over the viewport, and since when.
+    pub notice: Option<(String, Instant)>,
+    /// Supports the last settings edit found no route for, kept with their
+    /// old settings.
+    pub unrouted: Vec<SelectedSupport>,
+    /// Meshes whose acceleration structures are being built.
+    pub preparing: HashSet<MeshId>,
     pub selected_remap_point: Option<u8>,
 
     // remote send ui
@@ -79,7 +98,7 @@ pub enum PreviewMode {
     Static,
 }
 
-#[derive(Default, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     #[default]
     Select,
@@ -99,6 +118,56 @@ pub struct GeometryHit {
     pub support: bool,
 
     pub face: u32,
+}
+
+/// An edit of the selected supports' settings. The supports are re-routed on
+/// a worker, at most one run at a time: values that come in meanwhile wait for
+/// the run to finish, and only the newest is used.
+pub struct SupportEdit {
+    /// The shown support's settings when the edit began.
+    pub origin: SupportPreset,
+    /// The settings as edited now.
+    pub shown: SupportPreset,
+    /// A whole preset was picked, so every support takes all of `shown`.
+    pub whole: bool,
+    /// The edited supports as they were when the edit began.
+    pub supports: Vec<EditedSupport>,
+    /// A re-route is running.
+    pub running: bool,
+    /// `shown` changed since the running re-route started.
+    pub dirty: bool,
+    /// The pointer was let go; the edit ends once the last re-route is in.
+    pub released: bool,
+    /// Supports the newest values found no route for.
+    pub unrouted: Vec<SelectedSupport>,
+}
+
+pub struct EditedSupport {
+    pub model: ModelId,
+    pub id: SupportId,
+    pub preset: SupportPreset,
+    pub contact: Vector3<f32>,
+    /// The direction the tip leaves the contact.
+    pub tip: Vector3<f32>,
+}
+
+impl SupportEdit {
+    /// The settings `support` gets from this edit.
+    pub fn preset_for(&self, support: &EditedSupport) -> SupportPreset {
+        if self.whole {
+            return self.shown.clone();
+        }
+        let mut preset = support.preset.clone();
+        preset.apply_changes(&self.origin, &self.shown);
+        preset
+    }
+}
+
+/// A support whose contact point is being dragged.
+#[derive(Debug, Copy, Clone)]
+pub struct SupportDrag {
+    pub model: ModelId,
+    pub support: SupportId,
 }
 
 #[derive(Default)]
@@ -139,6 +208,26 @@ impl WorkspaceHover {
 
     pub fn hovered(&self) -> bool {
         self.uv.x >= 0.0 && self.uv.y >= 0.0
+    }
+}
+
+impl UiState {
+    /// Switches tools. Support selections, drags and previews only mean
+    /// something in the support tool, so leaving it drops them.
+    pub fn set_tool(&mut self, tool: Tool) {
+        if self.tool == Tool::Support && tool != Tool::Support {
+            self.selected_supports.clear();
+            self.support_drag = None;
+            self.support_preview = None;
+        }
+        self.tool = tool;
+    }
+
+    /// Ends the settings edit, keeping what it couldn't route.
+    pub fn end_support_edit(&mut self) {
+        if let Some(edit) = self.support_edit.take() {
+            self.unrouted = edit.unrouted;
+        }
     }
 }
 

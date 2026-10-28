@@ -281,6 +281,11 @@ pub fn place_points(
     let Some(grid) = footprint(mesh) else {
         return Vec::new();
     };
+    // The column cast ticks once per cell; the passes after it take about
+    // twice as long and tick in four steps.
+    let cells = grid.cell_count() as u64;
+    progress.set_total(3 * cells);
+    let step = || progress.add_complete(cells / 2);
     let pillar_diameter = edge.pillar_diameter;
     let mut placer = Placer::new(
         mesh,
@@ -298,10 +303,13 @@ pub fn place_points(
     for &pos in seed {
         placer.cover_seed(pos);
     }
+    step();
     let keys = placer.key_points();
     let islands = placer.place_islands();
+    step();
     let on_keys = placer.place_on_keys(&keys);
     let swept = placer.sweep();
+    step();
 
     // The loose islands come first, then every claimed gap in column-major
     // cell order; the thinning pass sees them in that order.
@@ -321,7 +329,9 @@ pub fn place_points(
         }
     }
     let mut points = remove_crowded(points, config.min_spacing, pillar_diameter);
+    step();
     let moved = edge::adjust_points(&mut points, &placer, mesh, bvh, edge);
+    progress.set_finished();
     info!("Edge re-seat moved {moved} of {} points", points.len());
     info!(
         "Placement: {} key points, {islands} islands, {on_keys} on keys, {swept} swept, {} points",

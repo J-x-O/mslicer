@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Instant};
 
 use egui::{Context, Theme, ViewportCommand, Visuals};
 use egui_tracing::EventCollector;
@@ -25,12 +25,13 @@ use crate::{
         camera::{Camera, spacenav::SpaceNav},
         workspace::model,
     },
-    task::{PrinterScan, TaskManager, update_check_if_scheduled},
+    task::{BuildAccelerationStructures, PrinterScan, TaskManager, update_check_if_scheduled},
     util::fps_tracker::FpsTracker,
 };
 
 pub mod config;
 pub mod history;
+pub mod palette;
 pub mod project;
 pub mod selected;
 pub mod slice;
@@ -108,6 +109,49 @@ impl App {
         this
     }
 
+    /// Drops selections of cleared supports and, when automatic preparation
+    /// is on, starts building acceleration structures for every model that
+    /// lacks them.
+    fn prepare_models(&mut self) {
+        for model in &mut self.project.models {
+            if model.supports.take_removed_by_move() {
+                let text = format!("Supports of `{}` removed. Ctrl+Z to undo.", model.name);
+                self.state.notice = Some((text, Instant::now()));
+            }
+        }
+
+        // A move that clears a model's supports leaves their selection behind.
+        let models = &self.project.models;
+        // Only the selected models' supports can be selected.
+        let selected = &self.state.selected;
+        (self.state.selected_supports).retain(|model, _| {
+            selected.contains_model(model)
+                && (models.iter()).any(|m| m.id == model && !m.supports.is_empty())
+        });
+        // The note on unroutable supports is about the selection it was made for.
+        let selected = &self.state.selected_supports;
+        (self.state.unrouted).retain(|x| selected.iter().any(|s| s == x));
+
+        // A let-go support stays hidden behind its preview until the support
+        // mesh shows it in its new place.
+        if let Some(settling) = self.state.support_settling {
+            let model = models.iter().find(|m| m.id == settling.model);
+            if model.is_none_or(|m| m.supports.is_current()) {
+                self.state.support_settling = None;
+                self.state.support_preview = None;
+            }
+        }
+
+        if !self.config.ui.auto_prepare {
+            return;
+        }
+        for model in &self.project.models {
+            if let Some(task) = BuildAccelerationStructures::request(&mut self.state, model) {
+                self.tasks.add(task);
+            }
+        }
+    }
+
     pub fn is_slicing(&self) -> bool {
         is_slicing(&self.slice_operation)
     }
@@ -148,6 +192,7 @@ impl eframe::App for App {
         save_before_close(self, ctx);
 
         self.project.update();
+        self.prepare_models();
         self.panels.update(ctx.viewport_rect().width());
         self.fps.update();
         self.history

@@ -730,7 +730,11 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
                 let (response, painter) =
                     ui.allocate_painter(vec2(available, available / large_aspect), Sense::all());
 
-                if interactive.camera.lock().handle_movement(&response, ui) {
+                if (interactive.camera.lock()).handle_movement(
+                    &response,
+                    ui,
+                    app.config.render.projection,
+                ) {
                     app.state.last_preview_interact = Some(Instant::now());
                 }
 

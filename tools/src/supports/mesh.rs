@@ -1,6 +1,9 @@
 use std::{collections::HashMap, range::Range, time::Instant};
 
-use common::units::{Milimeter, Milimeters};
+use common::{
+    serde::{Deserializer, Serializer},
+    units::{Milimeter, Milimeters},
+};
 use nalgebra::Vector3;
 use slicer::geometry::mesh::{Mesh, MeshBuilder};
 use tracing::info;
@@ -13,7 +16,7 @@ use crate::supports::{
 pub type FaceMap = HashMap<SupportId, Range<u32>>;
 
 /// Support sizes. Values in the docs are Light / Middle / Heavy.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SupportPreset {
     /// Pillar radius (0.8 / 1.2 / 1.5 Ø).
     pub radius: Milimeters,
@@ -242,6 +245,18 @@ impl SupportPreset {
         }
     }
 
+    /// Takes the raft settings from `raft`; its foot radius comes from the
+    /// base diameter, so it is left alone.
+    pub fn set_raft(&mut self, raft: &RaftConfig) {
+        self.raft_shape = raft.shape;
+        self.raft_area_ratio = raft.area_ratio;
+        self.raft_thickness = Milimeters::new(raft.thickness);
+        self.raft_height = Milimeters::new(raft.height);
+        self.raft_angle = raft.angle;
+        self.raft_grid_cell = Milimeters::new(raft.grid_cell);
+        self.raft_grid_width = Milimeters::new(raft.grid_width);
+    }
+
     /// The raft settings. A raft takes each base's footprint.
     pub fn raft_config(&self) -> RaftConfig {
         RaftConfig {
@@ -257,8 +272,134 @@ impl SupportPreset {
     }
 }
 
+/// Runs `$apply!(field)` for every length field of [`SupportPreset`], then
+/// `$other!(field)` for every other field. The destructuring makes adding a
+/// field without listing it here a compile error.
+macro_rules! preset_fields {
+    ($apply:ident, $other:ident) => {{
+        #[allow(unused)]
+        let SupportPreset {
+            radius,
+            margin,
+            tip_radius,
+            tip_length,
+            contact_depth,
+            tail_depth,
+            slim_radius,
+            slim_depth,
+            base_shape,
+            base_radius,
+            base_thickness,
+            boss_height,
+            boss_radius,
+            raft_shape,
+            raft_area_ratio,
+            raft_thickness,
+            raft_height,
+            raft_angle,
+            raft_grid_cell,
+            raft_grid_width,
+        } = SupportPreset::MIDDLE;
+        $apply!(radius);
+        $apply!(margin);
+        $apply!(tip_radius);
+        $apply!(tip_length);
+        $apply!(contact_depth);
+        $apply!(tail_depth);
+        $apply!(slim_radius);
+        $apply!(slim_depth);
+        $apply!(base_radius);
+        $apply!(base_thickness);
+        $apply!(boss_height);
+        $apply!(boss_radius);
+        $apply!(raft_thickness);
+        $apply!(raft_height);
+        $apply!(raft_grid_cell);
+        $apply!(raft_grid_width);
+        $other!(base_shape);
+        $other!(raft_shape);
+        $other!(raft_area_ratio);
+        $other!(raft_angle);
+    }};
+}
+
+impl SupportPreset {
+    /// Copies onto `self` every setting that differs between `before` and
+    /// `after`, leaving the rest as they are. Editing several supports at once
+    /// changes just the edited setting on each.
+    pub fn apply_changes(&mut self, before: &Self, after: &Self) {
+        macro_rules! copy {
+            ($field:ident) => {
+                if before.$field != after.$field {
+                    self.$field = after.$field;
+                }
+            };
+        }
+        preset_fields!(copy, copy);
+    }
+
+    pub fn serialize<T: Serializer>(&self, ser: &mut T) {
+        macro_rules! length {
+            ($field:ident) => {
+                ser.write_f32_be(self.$field.get::<Milimeter>())
+            };
+        }
+        macro_rules! skip {
+            ($field:ident) => {};
+        }
+        preset_fields!(length, skip);
+        ser.write_u8(self.base_shape.discriminant());
+        ser.write_u8(self.raft_shape.discriminant());
+        ser.write_f32_be(self.raft_area_ratio);
+        ser.write_f32_be(self.raft_angle);
+    }
+
+    pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
+        let mut preset = Self::MIDDLE;
+        macro_rules! length {
+            ($field:ident) => {
+                preset.$field = Milimeters::new(des.read_f32_be())
+            };
+        }
+        macro_rules! skip {
+            ($field:ident) => {};
+        }
+        preset_fields!(length, skip);
+        preset.base_shape = BaseShape::from_discriminant(des.read_u8());
+        preset.raft_shape = RaftShape::from_discriminant(des.read_u8());
+        preset.raft_area_ratio = des.read_f32_be();
+        preset.raft_angle = des.read_f32_be();
+        preset
+    }
+}
+
 impl Default for SupportPreset {
     fn default() -> Self {
         Self::MIDDLE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_changes_copies_only_edited_settings() {
+        let mut heavy = SupportPreset::HEAVY;
+        let before = SupportPreset::LIGHT;
+        let after = SupportPreset {
+            tip_radius: Milimeters::new(0.33),
+            base_shape: BaseShape::Cone,
+            ..before.clone()
+        };
+        heavy.apply_changes(&before, &after);
+        assert_eq!(
+            heavy,
+            SupportPreset {
+                tip_radius: Milimeters::new(0.33),
+                base_shape: BaseShape::Cone,
+                ..SupportPreset::HEAVY
+            }
+        );
     }
 }

@@ -2,7 +2,9 @@
 
 struct Context {
     transform: mat4x4f,
-    camera_direction: vec3f
+    camera_direction: vec3f,
+    // Accent colour and opacity: a ghost while placing, solid while dragging.
+    color: vec4f,
 }
 
 struct VertexOutput {
@@ -18,5 +20,5 @@ fn vert(@location(0) position: vec4f) -> VertexOutput {
 @fragment
 fn frag(in: VertexOutput) -> @location(0) vec4f {
     let intensity = blinn_phong(screen_normal(in.world_position), ctx.camera_direction);
-    return vec4(vec3(intensity), 1.0);
+    return vec4(ctx.color.rgb * intensity, ctx.color.a);
 }

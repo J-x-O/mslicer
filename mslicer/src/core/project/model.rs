@@ -1,8 +1,8 @@
-use std::{f32::consts::TAU, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use bitflags::bitflags;
 use common::{
-    color::{LinearRgb, START_COLOR},
+    color::LinearRgb,
     id_type,
     serde::{Deserializer, Serializer},
     units::{CubicMilimeters, Milimeters},
@@ -10,14 +10,16 @@ use common::{
 use nalgebra::Vector3;
 use wgpu::Device;
 
-use slicer::geometry::{
-    bounds::Bounds3D,
-    mesh::{HalfEdgeMesh, Mesh},
-    partitioning::Bvh,
-};
+use slicer::geometry::{bounds::Bounds3D, mesh::Mesh, partitioning::Bvh};
 
 use crate::{
-    core::project::{CollectionId, RenameState, supports::Supports},
+    core::{
+        palette,
+        project::{
+            CollectionId, RenameState,
+            supports::{Pose, Supports},
+        },
+    },
     render::util::MeshBuffers,
 };
 
@@ -29,7 +31,6 @@ pub struct Model {
     pub mesh: Mesh,
     pub bounds: Bounds3D,
     pub bvh: Option<Arc<Bvh>>,
-    pub half_edge: Option<Arc<HalfEdgeMesh>>,
     pub supports: Supports,
     base_volume: Option<CubicMilimeters>,
 
@@ -70,6 +71,8 @@ pub enum MeshUnit {
 
 impl Model {
     pub fn from_mesh(mesh: Mesh) -> Self {
+        let mut supports = Supports::default();
+        supports.set_pose(Pose::of(&mesh));
         Self {
             name: String::new(),
             id: ModelId::new(),
@@ -77,8 +80,7 @@ impl Model {
 
             base_volume: None,
             bvh: None,
-            half_edge: None,
-            supports: Supports::default(),
+            supports,
             bounds: Bounds3D::from_mesh(&mesh),
             mesh,
 
@@ -134,19 +136,20 @@ impl Model {
         self
     }
 
-    pub fn with_random_color(mut self) -> Self {
-        self.randomize_color();
+    /// A random colour clear of the `warning` colour (sRGB); see
+    /// [`palette::random_model_color`].
+    pub fn with_random_color(mut self, warning: [f32; 3]) -> Self {
+        self.randomize_color(warning);
         self
     }
 
-    pub fn randomize_color(&mut self) -> &mut Self {
-        let shift = rand::random::<f32>() * TAU;
-        self.color = START_COLOR.hue_shift(shift).to_linear_srgb();
+    pub fn randomize_color(&mut self, warning: [f32; 3]) -> &mut Self {
+        self.color = palette::random_model_color(warning);
         self
     }
 
     pub fn has_acceleration_structures(&self) -> bool {
-        self.bvh.is_some() && self.half_edge.is_some()
+        self.bvh.is_some()
     }
 
     pub fn try_get_buffers(&self) -> Option<&MeshBuffers> {
@@ -177,9 +180,9 @@ impl Model {
         self.mesh.update_transformation_matrix();
 
         self.file = file;
+        self.supports.clear();
         self.warnings = MeshWarnings::empty();
         self.bvh = None;
-        self.half_edge = None;
         self.buffers = None;
         self.update_oob(platform);
     }
@@ -189,9 +192,7 @@ impl Model {
     }
 
     pub fn mesh_memory_size(&self) -> usize {
-        self.mesh.memory_size()
-            + (self.bvh.as_ref().map(|x| x.memory_size())).unwrap_or_default()
-            + (self.half_edge.as_ref().map(|x| x.memory_size())).unwrap_or_default()
+        self.mesh.memory_size() + (self.bvh.as_ref().map(|x| x.memory_size())).unwrap_or_default()
     }
 }
 
@@ -204,11 +205,7 @@ impl Model {
     }
 
     pub fn update_oob(&mut self, platform: &Vector3<Milimeters>) {
-        self.supports.set_transform(
-            self.mesh.position(),
-            self.mesh.scale(),
-            self.mesh.rotation(),
-        );
+        self.supports.set_pose(Pose::of(&self.mesh));
 
         let bounds @ Bounds3D { min, max } = Bounds3D::from_mesh(&self.mesh);
         let half = platform.map(|x| x.raw()) / 2.0;
@@ -317,8 +314,7 @@ impl Clone for Model {
             mesh: self.mesh.clone(),
             bounds: self.bounds.clone(),
             bvh: self.bvh.clone(),
-            half_edge: self.half_edge.clone(),
-            supports: Supports::default(),
+            supports: self.supports.duplicate(),
             base_volume: self.base_volume,
 
             unit: self.unit,

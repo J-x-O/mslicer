@@ -56,6 +56,11 @@ pub const CONN_MIN_HEIGHT: f32 = 3.0;
 /// Clearance added under every brace floor (0.1 mm above the foot).
 const FLOOR_EXTRA: f32 = 0.1;
 
+/// A pillar added after generation is braced to at most this many neighbours,
+/// trying at most [`MAX_NEW_TRIES`] of the nearest.
+const MAX_NEW_LINKS: usize = 2;
+const MAX_NEW_TRIES: usize = 8;
+
 /// The brace floor of a plate pillar with the Middle preset's 1 mm base and
 /// 1 mm boss and no raft: `0.1 + base + boss + CONN_MIN_HEIGHT`.
 pub const DEFAULT_PLATE_FLOOR: f32 = FLOOR_EXTRA + 1.0 + 1.0 + CONN_MIN_HEIGHT;
@@ -213,6 +218,36 @@ fn tree_braces(
         }
     }
     braces
+}
+
+/// Braces a pillar added after generation into the existing pillars: to the
+/// nearest ones within the cross-brace spacing, at most [`MAX_NEW_LINKS`] of
+/// them and in clearly different directions, each as [`brace_pair`] would.
+pub fn brace_into(pillar: Pillar, others: &[Pillar], mesh: &Mesh, bvh: &Bvh) -> Vec<Part> {
+    let distance = |p: &Pillar| (p.xy - pillar.xy).magnitude();
+    let mut near: Vec<&Pillar> = (others.iter())
+        .filter(|p| distance(p) <= MAX_CROSS_SPACING_XY)
+        .collect();
+    near.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+
+    let mut leaving = Vec::new();
+    let mut parts = Vec::new();
+    for other in near.into_iter().take(MAX_NEW_TRIES) {
+        if leaving.len() >= MAX_NEW_LINKS {
+            break;
+        }
+        let Some(dir) = (other.xy - pillar.xy).try_normalize(f32::EPSILON) else {
+            continue;
+        };
+        if near_parallel(&leaving, dir) {
+            continue;
+        }
+        if let Some(braces) = brace_pair(pillar, *other, mesh, bvh) {
+            leaving.push(dir);
+            parts.extend(braces);
+        }
+    }
+    parts
 }
 
 /// Whether any of the brace directions `existing` leaves within 20° of `dir`
@@ -717,6 +752,24 @@ mod tests {
         let mesh = Mesh::new(Vec::new(), Vec::new());
         let bvh = Bvh::build(mesh.inner(), Progress::new());
         (mesh, bvh)
+    }
+
+    #[test]
+    fn added_pillar_is_braced_to_its_two_nearest_neighbours() {
+        let (mesh, bvh) = empty_scene();
+        let others = [
+            pillar(-4.0, 0.0, 20.0),
+            pillar(4.0, 0.0, 20.0),
+            pillar(5.0, 0.0, 20.0),
+        ];
+        let braces = brace_into(pillar(0.0, 0.0, 20.0), &others, &mesh, &bvh);
+
+        let ends = |x: f32| {
+            (links(&braces).iter()).any(|b| (b.a.x - x).abs() < 1e-4 || (b.b.x - x).abs() < 1e-4)
+        };
+        assert!(ends(-4.0) && ends(4.0));
+        // The third lies in the same direction as the second, so it is skipped.
+        assert!(!ends(5.0));
     }
 
     fn assert_45(brace: &Part) {

@@ -323,11 +323,7 @@ fn tasks_button(app: &mut App, ctx: &Context, ui: &mut Ui) {
                 .spacing([40.0, 4.0])
                 .striped(true)
                 .show(ui, |ui| {
-                    for task in app.tasks.iter() {
-                        let Some(status) = task.status() else {
-                            continue;
-                        };
-
+                    for status in app.tasks.statuses() {
                         let res1 = ui.label(status.name);
                         let res2 = ui.add(ProgressBar::new(status.progress).show_percentage());
                         if let Some(details) = status.details {

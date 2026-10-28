@@ -10,7 +10,10 @@ use rayon::prelude::*;
 use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 use tracing::info;
 
-use crate::supports::{BaseShape, auto::points::PlacedPoint, mesh::SupportPreset, raft::RaftShape};
+use crate::supports::{
+    BaseShape, Foot, Part, PartKind, Support, auto::points::PlacedPoint, mesh::SupportPreset,
+    raft::RaftShape,
+};
 
 pub mod collision;
 pub mod directional;
@@ -50,6 +53,13 @@ pub enum Routed {
     Model(Landing),
 }
 
+/// How far [`AutoPlacement::generate_supports`] is, per stage.
+#[derive(Clone, Default)]
+pub struct GenerationProgress {
+    pub placing: Progress,
+    pub routing: Progress,
+}
+
 pub struct AutoPlacement {
     pub placement: PlacementConfig,
     pub support: SupportPreset,
@@ -80,10 +90,15 @@ impl AutoPlacement {
         }
     }
 
-    pub fn generate_supports(&self, mesh: &Mesh, bvh: &Bvh, progress: &Progress) -> Generated {
-        let points = self.place(mesh, bvh, &[], progress);
+    pub fn generate_supports(
+        &self,
+        mesh: &Mesh,
+        bvh: &Bvh,
+        progress: &GenerationProgress,
+    ) -> Generated {
+        let points = self.place(mesh, bvh, &[], &progress.placing);
         info!("Placed {} supports", points.len());
-        let generated = self.route_all(mesh, bvh, points, progress);
+        let generated = self.route_all(mesh, bvh, points, &progress.routing);
         info!(
             "Routed {} supports to the plate and {} onto the model",
             generated.plate.len(),
@@ -250,6 +265,53 @@ impl AutoPlacement {
     }
 }
 
+/// Braces `support`, added after generation, to the nearest plate pillars
+/// among `others` (which may include `support` itself).
+pub fn brace_support<'a>(
+    mesh: &Mesh,
+    bvh: &Bvh,
+    support: &Support,
+    others: impl IntoIterator<Item = &'a Support>,
+) -> Vec<Part> {
+    let Some(pillar) = plate_pillar(support) else {
+        return Vec::new();
+    };
+    let others: Vec<topology::Pillar> = (others.into_iter())
+        .filter(|s| s.id != support.id)
+        .filter_map(plate_pillar)
+        .collect();
+    topology::brace_into(pillar, &others, mesh, bvh)
+}
+
+/// The brace geometry of a support standing on the plate, from its parts and
+/// the settings it was built with.
+fn plate_pillar(support: &Support) -> Option<topology::Pillar> {
+    if !matches!(support.foot, Foot::Plate { .. }) {
+        return None;
+    }
+    let pillar = support.parts.iter().find(|p| p.kind == PartKind::Pillar)?;
+    let tip_z = (support.parts.iter())
+        .find(|p| p.kind == PartKind::TipCone)
+        .map_or(pillar.a.z, |tip| tip.b.z);
+
+    let preset = &support.preset;
+    let base_height = if preset.raft_shape != RaftShape::None {
+        preset.raft_thickness.get::<Milimeter>()
+    } else if preset.base_shape != BaseShape::None {
+        preset.base_thickness.get::<Milimeter>()
+    } else {
+        0.0
+    };
+    let plate_floor = topology::plate_floor(base_height, preset.boss_height.get::<Milimeter>());
+    // A fork-cut pillar ends in the air; braces stay above its end.
+    let floor = plate_floor.max(pillar.b.z + topology::CONN_MIN_HEIGHT);
+    Some(
+        topology::Pillar::plate(pillar.a.xy(), pillar.a.z, tip_z, pillar.radius_a)
+            .with_floor(floor)
+            .with_clearance(preset.margin.get::<Milimeter>()),
+    )
+}
+
 /// Routes one contact point the way auto supports are routed: to the plate
 /// first, and onto the model below when there is no way down.
 /// Manual placement uses this too.
@@ -388,7 +450,8 @@ mod tests {
         let bed = Vector3::repeat(Milimeters::new(100.0));
         let placement =
             AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
-        let supports = placement.generate_supports(&mesh, &bvh, &Progress::new());
+        let supports =
+            placement.generate_supports(&mesh, &bvh, &super::GenerationProgress::default());
         assert!(!supports.plate.is_empty());
 
         for [contact, tip, joint] in supports.plate {
@@ -463,7 +526,8 @@ mod tests {
         let bed = Vector3::repeat(Milimeters::new(100.0));
         let placement =
             AutoPlacement::new(PlacementConfig::default(), SupportPreset::default(), bed);
-        let supports = placement.generate_supports(&mesh, &bvh, &Progress::new());
+        let supports =
+            placement.generate_supports(&mesh, &bvh, &super::GenerationProgress::default());
         assert!(!supports.landings.is_empty(), "ledge points must land");
 
         for landing in &supports.landings {

@@ -22,9 +22,11 @@ pub enum SelectedModel {
 #[derive(Default)]
 pub struct SelectedSupports {
     supports: HashSet<SelectedSupport>,
+    /// The most recently selected support.
+    last: Option<SelectedSupport>,
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct SelectedSupport {
     pub model: ModelId,
     pub support: SupportId,
@@ -143,6 +145,14 @@ impl SelectedSupports {
 
     pub fn clear(&mut self) {
         self.supports.clear();
+        self.last = None;
+    }
+
+    /// The support whose settings the panel shows: the most recently selected
+    /// one, else any.
+    pub fn focus(&self) -> Option<SelectedSupport> {
+        (self.last.filter(|x| self.supports.contains(x)))
+            .or_else(|| self.supports.iter().next().copied())
     }
 
     pub fn for_model(&self, model: ModelId) -> impl Iterator<Item = SupportId> {
@@ -168,16 +178,29 @@ impl SelectedSupports {
     pub fn select_support(&mut self, model: ModelId, support: SupportId) {
         let key = SelectedSupport::new(model, support);
         self.supports.insert(key);
+        self.last = Some(key);
     }
 
-    pub fn support_clicked(&mut self, model: ModelId, support: SupportId) {
+    /// Selects just the clicked support, or with `shift` toggles it in the
+    /// selection.
+    pub fn support_clicked(&mut self, model: ModelId, support: SupportId, shift: bool) {
         let key = SelectedSupport::new(model, support);
 
-        if self.supports.contains(&key) {
+        if !shift {
+            self.supports.clear();
+            self.supports.insert(key);
+        } else if self.supports.contains(&key) {
             self.supports.remove(&key);
+            return;
         } else {
             self.supports.insert(key);
         }
+        self.last = Some(key);
+    }
+
+    /// Keeps only the supports for which `exists` holds.
+    pub fn retain(&mut self, mut exists: impl FnMut(ModelId, SupportId) -> bool) {
+        self.supports.retain(|x| exists(x.model, x.support));
     }
 }
 

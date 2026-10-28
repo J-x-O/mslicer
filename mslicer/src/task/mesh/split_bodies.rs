@@ -84,7 +84,7 @@ impl Task for SplitBodies {
                     let mut model = Model::from_mesh(mesh)
                         .with_name(format!("Body {i}"))
                         .with_collection(Some(collection.id))
-                        .with_random_color();
+                        .with_random_color(app.config.ui.warning_color);
                     model.update_oob(&app.project.slice_config.platform_size);
                     result = result.with_task(MeshAnalysis::new(&model));
                     app.project.models.push(model);

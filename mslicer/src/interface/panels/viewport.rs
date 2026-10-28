@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use egui::{
-    Align2, Area, Button, Color32, Context, Frame, Id, Key, Order, Painter, PointerButton, Pos2,
-    Rect, RichText, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, Widget, pos2, vec2,
+    Align2, Area, Button, Color32, Context, FontId, Frame, Id, Key, Order, Painter, PointerButton,
+    Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, Widget, pos2, vec2,
 };
 use egui_phosphor::regular::{INFO, MAGNIFYING_GLASS};
 use egui_wgpu::Callback;
@@ -11,10 +13,15 @@ use tools::supports::PartKind;
 use crate::{
     core::{
         App,
+        history::ModelAction,
         project::model::Model,
+        selected::SelectedSupport,
         state::{GeometryHit, Tool, WorkspaceHover},
     },
-    interface::{components::grid, panels::supports::manual_support_placement},
+    interface::{
+        components::grid,
+        panels::supports::{drag_support, manual_support_placement, start_support_drag},
+    },
     render::{
         interface::basis::BasisRenderCallback,
         workspace::{WorkspaceRenderCallback, model::pick::pick_selection},
@@ -35,12 +42,22 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     let px = ui.input(|i| i.pointer.latest_pos()).unwrap_or_default();
     let uv = (px - rect.min) / rect.size();
 
-    let shift_down = ui.input(|i| i.modifiers.shift);
-    if shift_down
-        && response.drag_started_by(PointerButton::Primary)
+    let modifiers = ui.input(|i| i.modifiers);
+    let shift_down = modifiers.shift;
+
+    // The left button belongs to the tools: dragging a support in the support
+    // tool moves it, any other drag draws a selection box. Alt + left orbits.
+    if response.drag_started_by(PointerButton::Primary)
+        && !modifiers.alt
         && app.state.select_start.is_none()
+        && app.state.support_drag.is_none()
     {
-        app.state.select_start = Some(uv);
+        let grabbed = app.state.tool == Tool::Support
+            && !shift_down
+            && start_support_drag(app, app.state.hovered_geometry);
+        if !grabbed {
+            app.state.select_start = Some(uv);
+        }
     }
 
     if !response.dragged_by(PointerButton::Primary)
@@ -50,11 +67,58 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
             Vector2::new(start.x, start.y),
             Vector2::new(uv.x, uv.y),
         ]);
-        pick_selection(app, bounds);
+        // Shift adds to the selection, a plain box replaces it.
+        if !shift_down && !bounds.is_empty() {
+            match app.state.tool {
+                Tool::Select => app.state.selected.clear(),
+                Tool::Support => app.state.selected_supports.clear(),
+                Tool::Orient => {}
+            }
+        }
+        match app.state.tool {
+            Tool::Support => {
+                for x in supports_in(app, &bounds) {
+                    (app.state.selected_supports).select_support(x.model, x.support);
+                }
+            }
+            _ => pick_selection(app, bounds),
+        }
+    }
+    // While a box is drawn, the supports it would select show as hovered.
+    app.state.boxed_supports = match app.state.select_start {
+        Some(start) if app.state.tool == Tool::Support => {
+            let bounds = Bounds2D::<f32>::new_containing(&[
+                Vector2::new(start.x, start.y),
+                Vector2::new(uv.x, uv.y),
+            ]);
+            supports_in(app, &bounds).into_iter().collect()
+        }
+        _ => HashSet::new(),
+    };
+
+    let keyboard_free = !ctx.wants_keyboard_input();
+    if keyboard_free && ui.input(|i| i.key_pressed(Key::Escape)) {
+        // Escape cancels what is under way, else clears the selection.
+        let cancelled =
+            app.state.support_drag.take().is_some() || app.state.select_start.take().is_some();
+        if cancelled {
+            app.state.support_preview = None;
+        } else {
+            app.state.selected.clear();
+            app.state.selected_supports.clear();
+        }
+    }
+    if keyboard_free && response.hovered() && ui.input(|i| i.key_pressed(Key::F)) {
+        frame_selection(app);
     }
 
     let dragging_area = app.state.select_start.is_some();
-    (!dragging_area).then(|| app.camera.handle_movement(&response, ui));
+    let dragging_support = app.state.support_drag.is_some();
+    let camera_moving = !dragging_area
+        && !dragging_support
+        && app
+            .camera
+            .handle_movement(&response, ui, app.config.render.projection);
 
     let focused = ui.input(|i| i.focused);
     let mut is_moving = app.spacenav().handle_movement(focused);
@@ -64,40 +128,57 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         app.state.move_timeout -= 1;
         is_moving = true;
     }
-    is_moving |= response.dragged() && !dragging_area;
+    is_moving |= camera_moving;
     app.state.workspace = WorkspaceHover::new(is_moving, aspect, uv);
 
-    if app.state.tool == Tool::Support {
-        manual_support_placement(app, false)
-    } else {
+    if app.state.tool != Tool::Support {
+        app.state.support_drag = None;
         app.state.support_preview = None;
+    } else if dragging_support {
+        drag_support(app, !response.dragged_by(PointerButton::Primary));
+    } else if dragging_area {
+        app.state.support_preview = None;
+    } else if app.state.support_settling.is_none() {
+        manual_support_placement(app, false)
     }
 
     if response.clicked() && !is_moving {
         match app.state.tool {
-            Tool::Select => {
-                if let Some(hover) = app.state.hovered_geometry {
-                    let shift = ui.input(|x| x.modifiers.shift);
-                    if !hover.support {
-                        app.state.selected.model_clicked(hover.model, shift);
-                    }
-                }
-            }
+            Tool::Select => match app.state.hovered_geometry {
+                Some(hover) => app.state.selected.model_clicked(hover.model, shift_down),
+                None if !shift_down => app.state.selected.clear(),
+                None => {}
+            },
             Tool::Support => {
-                manual_support_placement(app, true);
-
-                if let Some(hover) = app.state.hovered_geometry
-                    && let Some(model) = app.project.model(hover.model)
-                    && let Some(support) = model.supports.support_for_face(hover.face)
-                {
-                    (app.state.selected_supports).support_clicked(model.id, support);
+                let selected = &mut app.state.selected;
+                match app.state.hovered_geometry {
+                    // Empty space clears everything.
+                    None if !shift_down => {
+                        selected.clear();
+                        app.state.selected_supports.clear();
+                    }
+                    None => {}
+                    // A model you aren't working on: work on it now. Its
+                    // supports only become editable once it is selected.
+                    Some(hit) if !selected.contains_model(hit.model) => {
+                        selected.model_clicked(hit.model, shift_down);
+                    }
+                    Some(hit) if hit.support => {
+                        if let Some(model) = app.project.model(hit.model)
+                            && let Some(support) = model.supports.support_for_face(hit.face)
+                        {
+                            (app.state.selected_supports)
+                                .support_clicked(model.id, support, shift_down);
+                        }
+                    }
+                    Some(_) => manual_support_placement(app, true),
                 }
 
                 if let Some(hover) = app.state.hovered_geometry
-                    && let Some(model) = app.project.model(hover.model)
-                    && !model.has_acceleration_structures()
+                    && let Some(model) = app.project.models.iter().find(|x| x.id == hover.model)
+                    && let Some(task) = BuildAccelerationStructures::request(&mut app.state, model)
                 {
-                    app.tasks.add(BuildAccelerationStructures::new(model));
+                    app.tasks.add(task);
                 }
             }
             Tool::Orient => {
@@ -106,6 +187,12 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
                     && let Some(model) = app.project.model(hover.model)
                 {
                     let rotation = hover_rotation(model, hover.face as usize);
+                    let undo = ModelAction::Orientation(
+                        model.mesh.rotation(),
+                        model.mesh.position(),
+                        model.supports.snapshot(),
+                    );
+                    app.history.track_model(model.id, undo);
 
                     let center = model.bounds.center();
                     model.set_rotation(&platform, rotation);
@@ -129,6 +216,7 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     painter.add(Callback::new_paint_callback(rect, callback));
 
     paint_area_selection(painter, app, &rect, px);
+    paint_notice(painter, app, &rect);
     paint_basis_vectors(painter, app, &rect);
     paint_toolbar(app, ctx, &rect);
 
@@ -143,13 +231,61 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     }
 }
 
+/// Every support of a selected model with a point inside the screen-space
+/// box `area` (in viewport uv), hidden or not.
+fn supports_in(app: &App, area: &Bounds2D<f32>) -> Vec<SelectedSupport> {
+    let view_projection = app.view_projection();
+    let inside = |p: Vector3<f32>| {
+        let clip = view_projection * p.push(1.0);
+        if clip.w <= 0.0 {
+            return false;
+        }
+        let ndc = clip.xy() / clip.w;
+        let uv = Vector2::new(ndc.x + 1.0, 1.0 - ndc.y) / 2.0;
+        (area.min.x..=area.max.x).contains(&uv.x) && (area.min.y..=area.max.y).contains(&uv.y)
+    };
+
+    let mut out = Vec::new();
+    let selected = (app.project.models.iter()).filter(|m| app.state.selected.contains_model(m.id));
+    for model in selected {
+        let ids = model.supports.find_by_point(inside);
+        out.extend(ids.into_iter().map(|id| SelectedSupport::new(model.id, id)));
+    }
+    out
+}
+
+/// Points the camera at the selected models, the models of the selected
+/// supports, or else every model.
+fn frame_selection(app: &mut App) {
+    let models = &app.project.models;
+    let selected = |id| {
+        app.state.selected.contains_model(id)
+            || app.state.selected_supports.for_model(id).next().is_some()
+    };
+    let any = models.iter().any(|m| selected(m.id));
+    let mut bounds = (models.iter())
+        .filter(|m| !any || selected(m.id))
+        .map(|m| (m.bounds.min, m.bounds.max));
+    let Some(first) = bounds.next() else {
+        return;
+    };
+    let (min, max) = bounds.fold(first, |(min, max), (a, b)| (min.inf(&a), max.sup(&b)));
+    app.camera.frame(min, max);
+}
+
 fn paint_area_selection(painter: &Painter, app: &mut App, rect: &Rect, px: Pos2) {
     if let Some(start) = app.state.select_start {
         let start = start * rect.size() + rect.min.to_vec2();
         let rect = Rect::from_two_pos(start.to_pos2(), px);
 
-        let stroke = Stroke::new(2_f32, Color32::LIGHT_BLUE);
-        let fill = Color32::LIGHT_BLUE.lerp_to_gamma(Color32::TRANSPARENT, 0.9);
+        let [r, g, b] = app
+            .config
+            .ui
+            .accent_color
+            .map(|x| (x * 255.0).round() as u8);
+        let accent = Color32::from_rgb(r, g, b);
+        let stroke = Stroke::new(2_f32, accent);
+        let fill = accent.lerp_to_gamma(Color32::TRANSPARENT, 0.9);
 
         painter.rect_filled(rect, 4.0, fill);
         painter.rect_stroke(rect, 4.0, stroke, StrokeKind::Middle);
@@ -176,7 +312,7 @@ fn paint_toolbar(app: &mut App, ctx: &Context, rect: &Rect) {
 
                         let shortcut = ui.input(|x| x.key_pressed(NUMBER_KEYS[i + 1]))
                             && !ui.ctx().wants_keyboard_input();
-                        (button.clicked() || shortcut).then(|| app.state.tool = tool);
+                        (button.clicked() || shortcut).then(|| app.state.set_tool(tool));
                     }
 
                     ui.separator();
@@ -190,6 +326,34 @@ fn paint_toolbar(app: &mut App, ctx: &Context, rect: &Rect) {
                             .clicked();
                 })
         });
+}
+
+/// How long a notice stays up, fading out over its last second.
+const NOTICE_TIME: f32 = 4.0;
+
+/// The current notice, centred near the bottom of the viewport.
+fn paint_notice(painter: &Painter, app: &mut App, rect: &Rect) {
+    let Some((text, since)) = &app.state.notice else {
+        return;
+    };
+    let age = since.elapsed().as_secs_f32();
+    if age > NOTICE_TIME {
+        app.state.notice = None;
+        return;
+    }
+    painter.ctx().request_repaint();
+    let alpha = (NOTICE_TIME - age).min(1.0);
+
+    let visuals = painter.ctx().style().visuals.clone();
+    let galley = painter.layout_no_wrap(
+        text.clone(),
+        FontId::proportional(14.0),
+        visuals.text_color().gamma_multiply(alpha),
+    );
+    let center = rect.center_bottom() - Vec2::new(0.0, 40.0);
+    let frame = Rect::from_center_size(center, galley.size() + Vec2::new(24.0, 12.0));
+    painter.rect_filled(frame, 6.0, visuals.window_fill.gamma_multiply(0.9 * alpha));
+    painter.galley(frame.min + Vec2::new(12.0, 6.0), galley, Color32::WHITE);
 }
 
 fn paint_basis_vectors(painter: &Painter, app: &mut App, rect: &Rect) {

@@ -5,13 +5,14 @@ use const_format::concatcp;
 use nalgebra::Vector3;
 
 use crate::core::project::{
-    Collection, CollectionId, PostProcessing, Project, RenameState,
+    Collection, CollectionId, PostProcessing, Project, RenameState, SupportConfig,
     model::{MeshUnit, Model},
 };
 use common::{
     progress::Progress,
     serde::{Deserializer, SerdeExt, Serializer},
     slice::SliceConfig,
+    units::{Milimeter, Milimeters},
 };
 use slicer::{
     geometry::mesh::{Mesh, MeshInner},
@@ -19,7 +20,7 @@ use slicer::{
         elephant_foot_fixer::ElephantFootFixer, variable_layer_height::VariableLayerHeight,
     },
 };
-use tools::supports::SupportSet;
+use tools::supports::{SupportSet, auto::PlacementConfig, mesh::SupportPreset, raft::RaftConfig};
 
 /// Project format version. Value should be incremented whenever the save format
 /// changes, even in development so anyone using the dev/prerelease versions
@@ -47,7 +48,8 @@ use tools::supports::SupportSet;
 /// - v3 (v0.6.0) — Added the PWM value to SliceConfig -> ExposureConfig.
 /// - v2 (v0.5.0) — A complete rewrite using a custom serilizer/deserilizer
 ///   because of the bincode drama...
-/// - v17 (v0.11.0) — Store support sets (auto and manual) per model.
+/// - v17 (v0.11.0) — Store support sets (auto and manual, each support with the
+///   settings it was built with) per model, and the project's support settings.
 const VERSION: u16 = 17;
 const DESCRIPTION: &str = concatcp!(
     "Saved by mslicer v",
@@ -70,6 +72,7 @@ struct ModelInfo {
     rotation: Vector3<f32>,
 
     supports: (SupportSet, SupportSet),
+    raft: RaftConfig,
 }
 
 impl ModelInfo {
@@ -85,10 +88,8 @@ impl ModelInfo {
             position: model.mesh.position(),
             scale: model.mesh.scale(),
             rotation: model.mesh.rotation(),
-            supports: (
-                model.supports.auto().clone(),
-                model.supports.manual().clone(),
-            ),
+            supports: model.supports.world_sets(),
+            raft: model.supports.raft(),
         }
     }
 
@@ -107,7 +108,7 @@ impl ModelInfo {
             .with_collection(self.collection)
             .with_unit(self.unit);
 
-        model.supports.restore(self.supports.0, self.supports.1);
+        (model.supports).restore(self.supports.0, self.supports.1, self.raft);
         model
     }
 
@@ -138,6 +139,7 @@ impl ModelInfo {
         // Support sets (auto, manual)
         self.supports.0.serialize(ser);
         self.supports.1.serialize(ser);
+        self.raft.serialize(ser);
     }
 
     pub fn deserialize<T: Deserializer>(des: &mut T, version: u16) -> Self {
@@ -169,6 +171,11 @@ impl ModelInfo {
                 (SupportSet::default(), SupportSet::default())
             } else {
                 (SupportSet::deserialize(des), SupportSet::deserialize(des))
+            },
+            raft: if version < 17 {
+                RaftConfig::default()
+            } else {
+                RaftConfig::deserialize(des)
             },
         }
     }
@@ -215,6 +222,7 @@ impl Project {
 
         ser.write_u32_be(self.collections.len() as u32);
         self.collections.iter().for_each(|c| c.serialize(ser));
+        self.support_config.serialize(ser);
         progress.set_finished();
     }
 
@@ -274,16 +282,44 @@ impl Project {
             CollectionId::bump_past(max_id);
         }
 
+        let support_config = if version < 17 {
+            SupportConfig::default()
+        } else {
+            SupportConfig::deserialize(des)
+        };
+
         progress.set_finished();
         Ok(Self {
             path: None,
             notes,
             slice_config,
-            support_config: Default::default(),
+            support_config,
             post_processing,
             models,
             collections,
         })
+    }
+}
+
+impl SupportConfig {
+    pub fn serialize<T: Serializer>(&self, ser: &mut T) {
+        self.preset.serialize(ser);
+        ser.write_f32_be(self.auto_placement.min_spacing);
+        ser.write_f32_be(self.auto_placement.max_angle);
+        ser.write_u32_be(self.mesh_resolution);
+        ser.write_f32_be(self.default_lift.get::<Milimeter>());
+    }
+
+    pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
+        Self {
+            preset: SupportPreset::deserialize(des),
+            auto_placement: PlacementConfig {
+                min_spacing: des.read_f32_be(),
+                max_angle: des.read_f32_be(),
+            },
+            mesh_resolution: des.read_u32_be(),
+            default_lift: Milimeters::new(des.read_f32_be()),
+        }
     }
 }
 

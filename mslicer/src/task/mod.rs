@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     path::PathBuf,
     sync::mpsc::{self, Receiver, SyncSender},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -45,9 +46,14 @@ pub struct TaskStatus<'a> {
     pub progress: f32,
 }
 
+/// Tasks show their status only once they have run this long, so quick
+/// ones (most support edits) don't flash up for a frame.
+const SHOW_STATUS_AFTER: Duration = Duration::from_millis(300);
+
 pub struct TaskManager {
-    /// List of current tasks that get polled every frame.
-    tasks: Vec<Box<dyn Task>>,
+    /// List of current tasks that get polled every frame, with when each
+    /// was added.
+    tasks: Vec<(Instant, Box<dyn Task>)>,
     /// MPSC channel to add tasks to be polled from the UI from async threads.
     task_queue: TaskQueue,
 }
@@ -86,28 +92,30 @@ impl TaskManager {
     }
 
     pub fn add_boxed(&mut self, task: Box<dyn Task>) {
-        self.tasks.push(task);
+        self.tasks.push((Instant::now(), task));
     }
 
     pub fn extend_boxed(&mut self, task: impl IntoIterator<Item = Box<dyn Task>>) {
-        self.tasks.extend(task);
+        let now = Instant::now();
+        self.tasks.extend(task.into_iter().map(|task| (now, task)));
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Box<dyn Task>> {
-        self.tasks.iter()
+    /// The statuses of the tasks that have run long enough to show.
+    pub fn statuses(&self) -> impl Iterator<Item = TaskStatus<'_>> {
+        (self.tasks.iter())
+            .filter(|(since, _)| since.elapsed() >= SHOW_STATUS_AFTER)
+            .filter_map(|(_, task)| task.status())
     }
 
     pub fn any_with_status(&self) -> bool {
-        self.iter().any(|x| x.status().is_some())
+        self.statuses().next().is_some()
     }
 
     pub fn progress(&self) -> f32 {
         let (mut t, mut n) = (0.0, 0);
-        for task in self.tasks.iter() {
-            if let Some(status) = task.status() {
-                t += status.progress;
-                n += 1;
-            }
+        for status in self.statuses() {
+            t += status.progress;
+            n += 1;
         }
 
         if n == 0 { 0.0 } else { t / n as f32 }
@@ -134,15 +142,14 @@ impl<'a> TaskManagerRef<'a> {
 
         let mut i = 0;
         while i < this.tasks.len() {
-            let task = &mut this.tasks[i];
-            let result = task.poll(&mut app);
+            let result = this.tasks[i].1.poll(&mut app);
             if result.complete {
                 this.tasks.remove(i);
             } else {
                 i += 1;
             }
 
-            this.tasks.extend(result.new_tasks);
+            this.extend_boxed(result.new_tasks);
         }
     }
 }

@@ -7,13 +7,16 @@
 //! support lands. Meshes are generated per part so editing, slicing and the
 //! raft stay independent of how the route was found.
 
-use nalgebra::{Vector2, Vector3};
+use std::{collections::HashSet, mem};
+
+use nalgebra::{Isometry3, Point3, Vector2, Vector3};
 
 use common::serde::{Deserializer, SerdeExt, Serializer};
 
 use crate::supports::{
     SupportId,
     auto::{Landing, LandingKind},
+    mesh::SupportPreset,
     raft::{Raft, RaftConfig},
 };
 
@@ -90,9 +93,14 @@ pub enum PartKind {
 pub const SHORT_PILLAR: f32 = 5.0;
 /// Stacked parts overlap by this much at each joint so faces don't coincide.
 pub const JOINT_SHRINK: f32 = 0.002;
-/// Wall angle of a Skate base, from the plate; the same as the Skate raft's
-/// wall.
-const SKATE_ANGLE: f32 = 30.0;
+/// How far a Skate base is drawn in on the plate, per millimetre of base
+/// thickness (1.7 mm at 1 mm thick, a wall about 30° from the plate). The base
+/// is its full size on top, so its edge lifts off the plate and a scraper
+/// finds a way under.
+const SKATE_INSET: f32 = 1.7;
+/// Brace ends closer than this, in millimetres, to a pillar's axis or to a
+/// fork point belong to it.
+const ATTACH_TOLERANCE: f32 = 1e-3;
 
 /// The base under a plate pillar. Cube and Prism
 /// are meshed round until parts carry other cross-sections.
@@ -100,7 +108,8 @@ const SKATE_ANGLE: f32 = 30.0;
 pub enum BaseShape {
     /// No base or boss.
     None,
-    /// A disc whose outer wall slopes in at [`SKATE_ANGLE`].
+    /// A disc of the base diameter on top, narrower on the plate by
+    /// [`SKATE_INSET`] per millimetre of thickness.
     Skate,
     /// A frustum from the base diameter down to the boss bottom diameter.
     Cone,
@@ -145,6 +154,8 @@ pub struct Support {
     /// Shared-trunk group id; unused for now, but part of the serialised form
     /// so the format stays stable.
     pub group: u32,
+    /// The settings the support was built with.
+    pub preset: SupportPreset,
 }
 
 /// Everything a generated set of supports consists of.
@@ -259,6 +270,7 @@ impl SupportSet {
             parts,
             foot,
             group: 0,
+            preset: SupportPreset::default(),
         });
     }
 
@@ -336,6 +348,7 @@ impl SupportSet {
                 normal: foot_normal,
             },
             group: 0,
+            preset: SupportPreset::default(),
         });
     }
 
@@ -378,20 +391,8 @@ impl SupportSet {
     /// [`JOINT_SHRINK`] deep and with no base or boss.
     /// Feet outside the raft stay on the plate.
     pub fn stand_on_raft(&mut self, raft: &Raft) {
-        let floor = raft.top() - JOINT_SHRINK;
         for support in &mut self.supports {
-            let Some(pillar) = plate_pillar(support) else {
-                continue;
-            };
-            let a = support.parts[pillar].a;
-            if !raft.contains(a.xy()) {
-                continue;
-            }
-            if a.z - floor > JOINT_SHRINK {
-                support.parts[pillar].b.z = floor;
-            } else {
-                support.parts.remove(pillar);
-            }
+            stand_on_raft(support, raft);
         }
     }
 
@@ -407,52 +408,233 @@ impl SupportSet {
             return;
         }
         for support in &mut self.supports {
+            add_base(support, cfg);
+        }
+    }
+}
+
+/// Stands `support` on the raft if it is a plate pillar inside it.
+fn stand_on_raft(support: &mut Support, raft: &Raft) {
+    let floor = raft.top() - JOINT_SHRINK;
+    let Some(pillar) = plate_pillar(support) else {
+        return;
+    };
+    let a = support.parts[pillar].a;
+    if !raft.contains(a.xy()) {
+        return;
+    }
+    if a.z - floor > JOINT_SHRINK {
+        support.parts[pillar].b.z = floor;
+    } else {
+        support.parts.remove(pillar);
+    }
+}
+
+/// Gives `support` a base (and a boss when it is long), if it is a plate
+/// pillar. See [`SupportSet::add_bases`].
+fn add_base(support: &mut Support, cfg: &BaseConfig) {
+    if cfg.shape == BaseShape::None {
+        return;
+    }
+    let Some(pillar) = plate_pillar(support) else {
+        return;
+    };
+    let tip = (support.parts.iter())
+        .find(|p| p.kind == PartKind::TipCone)
+        .map_or(0.0, |p| (p.b - p.a).magnitude());
+    let Part { a, radius_b, .. } = support.parts[pillar];
+    let short = a.z + 0.6 * tip < SHORT_PILLAR;
+    let xy = a.xy();
+
+    let (bottom, top) = match cfg.shape {
+        BaseShape::Skate => (cfg.radius - SKATE_INSET * cfg.thickness, cfg.radius),
+        BaseShape::Cone => (cfg.radius, cfg.boss_radius),
+        BaseShape::Cylinder | BaseShape::None => (cfg.radius, cfg.radius),
+    };
+    let mut parts = vec![round(
+        PartKind::Base,
+        xy.push(0.0),
+        xy.push(cfg.thickness),
+        bottom,
+        top,
+    )];
+    let mut floor = cfg.thickness - JOINT_SHRINK;
+    if !short {
+        let boss_top = floor + cfg.boss_height;
+        parts.push(round(
+            PartKind::Boss,
+            xy.push(floor),
+            xy.push(boss_top),
+            cfg.boss_radius,
+            radius_b,
+        ));
+        floor = boss_top - JOINT_SHRINK;
+    }
+    // A joint already inside the base needs no pillar at all.
+    if a.z - floor > JOINT_SHRINK {
+        support.parts[pillar].b.z = floor;
+    } else {
+        support.parts.remove(pillar);
+    }
+    support.parts.extend(parts);
+}
+
+impl SupportSet {
+    /// Moves every coordinate in the set by `motion`. Supports have to stay
+    /// upright on the plate, so `motion` may only turn about the z axis and
+    /// must not change z.
+    pub fn transform(&mut self, motion: &Isometry3<f32>) {
+        let point = |p: &mut Vector3<f32>| *p = motion.transform_point(&Point3::from(*p)).coords;
+        let flat = |xy: &mut Vector2<f32>| {
+            let mut p = xy.push(0.0);
+            point(&mut p);
+            *xy = p.xy();
+        };
+        let part = |part: &mut Part| {
+            point(&mut part.a);
+            point(&mut part.b);
+        };
+
+        for support in &mut self.supports {
+            point(&mut support.point.pos);
+            support.point.normal = motion.transform_vector(&support.point.normal);
+            support.parts.iter_mut().for_each(part);
+            match &mut support.foot {
+                Foot::Plate { xy } => flat(xy),
+                Foot::Model { pos, normal } => {
+                    point(pos);
+                    *normal = motion.transform_vector(normal);
+                }
+            }
+        }
+        self.braces.iter_mut().for_each(part);
+        if let Some(raft) = &mut self.raft {
+            for vertex in raft.islands.iter_mut().flatten().flatten() {
+                let mut xy = Vector2::from(*vertex);
+                flat(&mut xy);
+                *vertex = xy.into();
+            }
+        }
+    }
+
+    /// Removes the supports with the given ids and every brace that ends on
+    /// one of them, returning the removed supports.
+    ///
+    /// A fork-cut pillar hangs on its two fork braces. If either of them goes,
+    /// the pillar drops the other one too and reaches down to the plate again.
+    pub fn remove(&mut self, ids: &HashSet<SupportId>) -> Vec<Support> {
+        let (removed, kept) = (mem::take(&mut self.supports).into_iter())
+            .partition::<Vec<_>, _>(|s| ids.contains(&s.id));
+        self.supports = kept;
+        self.remove_braces_on(&removed);
+        removed
+    }
+
+    /// Removes every brace that ends on one of `supports`, which may belong
+    /// to another set, and releases the forks that loses.
+    pub fn remove_braces_on(&mut self, supports: &[Support]) {
+        let axes: Vec<Vector2<f32>> = supports.iter().flat_map(axes).collect();
+        if axes.is_empty() {
+            return;
+        }
+        let on_removed =
+            |p: Vector3<f32>| (axes.iter()).any(|xy| (p.xy() - xy).magnitude() < ATTACH_TOLERANCE);
+        let (removed, kept) = (mem::take(&mut self.braces).into_iter())
+            .partition::<Vec<_>, _>(|b| on_removed(b.a) || on_removed(b.b));
+        self.braces = kept;
+        self.release_forks(&removed);
+    }
+
+    /// Lets every fork-cut pillar that lost a fork brace among `removed`
+    /// reach the plate again. Its foot comes from [`Self::with_feet`].
+    fn release_forks(&mut self, removed: &[Part]) {
+        let near = |a: Vector3<f32>, b: Vector3<f32>| (a - b).magnitude() < ATTACH_TOLERANCE;
+        if removed.is_empty() {
+            return;
+        }
+        for index in 0..self.supports.len() {
+            let support = &self.supports[index];
+            let Some(pillar) = (support.parts.iter()).position(|p| p.kind == PartKind::Pillar)
+            else {
+                continue;
+            };
+            // Only a pillar that lost a brace at its bottom can have lost its
+            // fork; checking just those keeps big removals cheap.
+            let bottom = support.parts[pillar].b;
+            if !(removed.iter()).any(|b| near(b.a, bottom) || near(b.b, bottom)) {
+                continue;
+            }
+            let forked =
+                (self.braces.iter()).any(|b| b.kind == PartKind::Joint && near(b.a, bottom));
+            let legs = (self.braces.iter())
+                .filter(|b| b.kind == PartKind::Brace && near(b.a, bottom))
+                .count();
+            if !forked || legs >= 2 {
+                continue;
+            }
+
+            self.braces
+                .retain(|b| !near(b.a, bottom) && !near(b.b, bottom));
+            self.supports[index].parts[pillar].b.z = 0.0;
+        }
+    }
+
+    /// The xy of every pillar that reaches the plate.
+    pub fn plate_feet(&self) -> impl Iterator<Item = Vector2<f32>> + '_ {
+        (self.supports.iter()).filter_map(|s| plate_pillar(s).map(|i| s.parts[i].a.xy()))
+    }
+
+    /// A copy with every plate pillar standing on something: on `raft` where
+    /// its foot lies inside it, else on a base from the support's own
+    /// settings.
+    pub fn with_feet(&self, raft: Option<&Raft>) -> SupportSet {
+        let mut set = self.clone();
+        for support in &mut set.supports {
             let Some(pillar) = plate_pillar(support) else {
                 continue;
             };
-            let tip = (support.parts.iter())
-                .find(|p| p.kind == PartKind::TipCone)
-                .map_or(0.0, |p| (p.b - p.a).magnitude());
-            let Part { a, radius_b, .. } = support.parts[pillar];
-            let short = a.z + 0.6 * tip < SHORT_PILLAR;
-            let xy = a.xy();
+            let on_raft = raft.filter(|r| r.contains(support.parts[pillar].a.xy()));
+            match on_raft {
+                Some(raft) => stand_on_raft(support, raft),
+                None => add_base(support, &support.preset.base_config()),
+            }
+        }
+        set.raft = raft.cloned();
+        set
+    }
 
-            let top = match cfg.shape {
-                BaseShape::Skate => {
-                    let inset = cfg.thickness / SKATE_ANGLE.to_radians().tan();
-                    (cfg.radius - inset).max(cfg.boss_radius)
-                }
-                BaseShape::Cone => cfg.boss_radius,
-                BaseShape::Cylinder | BaseShape::None => cfg.radius,
-            };
-            let mut parts = vec![round(
-                PartKind::Base,
-                xy.push(0.0),
-                xy.push(cfg.thickness),
-                cfg.radius,
-                top,
-            )];
-            let mut floor = cfg.thickness - JOINT_SHRINK;
-            if !short {
-                let boss_top = floor + cfg.boss_height;
-                parts.push(round(
-                    PartKind::Boss,
-                    xy.push(floor),
-                    xy.push(boss_top),
-                    cfg.boss_radius,
-                    radius_b,
-                ));
-                floor = boss_top - JOINT_SHRINK;
-            }
-            // A joint already inside the base needs no pillar at all.
-            if a.z - floor > JOINT_SHRINK {
-                support.parts[pillar].b.z = floor;
-            } else {
-                support.parts.remove(pillar);
-            }
-            support.parts.extend(parts);
+    /// Records `preset` as the settings every support was built with.
+    pub fn set_preset(&mut self, preset: &SupportPreset) {
+        for support in &mut self.supports {
+            support.preset = preset.clone();
         }
     }
+
+    /// Roughly how many bytes the set occupies.
+    pub fn memory_size(&self) -> usize {
+        let parts =
+            (self.supports.iter()).map(|s| s.parts.len()).sum::<usize>() + self.braces.len();
+        let raft = (self.raft.iter())
+            .flat_map(|r| r.islands.iter().flatten())
+            .map(|c| c.len())
+            .sum::<usize>();
+        self.supports.len() * size_of::<Support>()
+            + parts * size_of::<Part>()
+            + raft * size_of::<[f32; 2]>()
+    }
+}
+
+/// The xy positions of a support's vertical bodies, where braces attach.
+fn axes(support: &Support) -> impl Iterator<Item = Vector2<f32>> + '_ {
+    (support.parts.iter())
+        .filter(|p| {
+            matches!(
+                p.kind,
+                PartKind::Pillar | PartKind::PillarLower | PartKind::Slim
+            )
+        })
+        .filter(|p| (p.a.xy() - p.b.xy()).magnitude() < ATTACH_TOLERANCE)
+        .map(|p| p.a.xy())
 }
 
 /// The pillar of a support that still reaches the plate, if any.
@@ -518,6 +700,26 @@ impl PartKind {
             8 => PartKind::Base,
             9 => PartKind::Tail,
             _ => PartKind::Brace,
+        }
+    }
+}
+
+impl BaseShape {
+    pub(crate) const fn discriminant(self) -> u8 {
+        match self {
+            BaseShape::None => 0,
+            BaseShape::Skate => 1,
+            BaseShape::Cone => 2,
+            BaseShape::Cylinder => 3,
+        }
+    }
+
+    pub(crate) fn from_discriminant(x: u8) -> Self {
+        match x {
+            1 => BaseShape::Skate,
+            2 => BaseShape::Cone,
+            3 => BaseShape::Cylinder,
+            _ => BaseShape::None,
         }
     }
 }
@@ -625,6 +827,7 @@ impl Support {
             part.serialize(ser);
         }
         ser.write_u32_be(self.group);
+        self.preset.serialize(ser);
     }
 
     pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
@@ -635,12 +838,14 @@ impl Support {
             .map(|_| Part::deserialize(des))
             .collect();
         let group = des.read_u32_be();
+        let preset = SupportPreset::deserialize(des);
         Self {
             id,
             point,
             parts,
             foot,
             group,
+            preset,
         }
     }
 }
@@ -731,6 +936,12 @@ mod tests {
             shape: Shape::Round,
         });
         set.raft = Raft::build(&RAFT, &[Vector2::new(1.0, 2.0)]);
+        set.supports[0].preset = SupportPreset {
+            base_shape: BaseShape::Cone,
+            raft_shape: RaftShape::CrossGrid,
+            raft_angle: 42.0,
+            ..SupportPreset::HEAVY
+        };
 
         let mut buffer = vec![0; 4096];
         {
@@ -749,6 +960,7 @@ mod tests {
         assert_eq!(raft.islands, original.islands);
 
         assert_eq!(out.supports[0].id.raw(), 7);
+        assert_eq!(out.supports[0].preset, set.supports[0].preset);
         assert_eq!(out.supports[1].id.raw(), 9);
 
         for (a, b) in out.supports.iter().zip(set.supports.iter()) {
@@ -762,6 +974,128 @@ mod tests {
                 assert_eq!(pa.radius_a, pb.radius_a);
                 assert_eq!(pa.radius_b, pb.radius_b);
             }
+        }
+    }
+
+    /// Three plate supports in a row at x = 0, 4, 8; the middle one is cut
+    /// at z = 17 and hangs on fork braces to its neighbours, and a tree brace
+    /// ties the first two higher up.
+    fn forked_row() -> SupportSet {
+        let mut set = SupportSet::default();
+        for (raw, x) in [(1, 0.0), (2, 4.0), (3, 8.0)] {
+            let joint = Vector3::new(x, 0.0, 20.0);
+            let contact = joint + Vector3::z() * 3.0;
+            set.add_routed(
+                SupportId::from_raw(raw),
+                0.2,
+                0.5,
+                0.3,
+                [contact, joint, joint],
+            );
+        }
+        set.truncate_pillar(1, 17.0);
+        let part = |kind, a, b| round(kind, a, b, 0.5, 0.5);
+        let fork = Vector3::new(4.0, 0.0, 17.0);
+        set.braces = vec![
+            part(PartKind::Brace, fork, Vector3::new(0.0, 0.0, 13.0)),
+            part(PartKind::Brace, fork, Vector3::new(8.0, 0.0, 13.0)),
+            part(PartKind::Joint, fork, fork),
+            part(
+                PartKind::Brace,
+                Vector3::new(0.0, 0.0, 19.0),
+                Vector3::new(4.0, 0.0, 18.0),
+            ),
+        ];
+        set.add_bases(&BASE);
+        set
+    }
+
+    #[test]
+    fn skate_base_is_full_size_on_top_and_drawn_in_on_the_plate() {
+        let set = forked_row();
+        let base = (set.supports[0].parts.iter())
+            .find(|p| p.kind == PartKind::Base)
+            .unwrap();
+        assert_eq!(base.radius_b, BASE.radius);
+        let inset = SKATE_INSET * BASE.thickness;
+        assert!((base.radius_a - (BASE.radius - inset)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn transform_moves_everything_rigidly() {
+        let mut set = forked_row();
+        set.raft = Raft::build(&RAFT, &[Vector2::new(0.0, 0.0)]);
+        let original = set.clone();
+
+        let motion = Isometry3::new(Vector3::new(5.0, -3.0, 0.0), Vector3::z() * 0.7);
+        set.transform(&motion);
+        let pillar = |s: &SupportSet| {
+            s.supports[0]
+                .parts
+                .iter()
+                .find(|p| p.kind == PartKind::Pillar)
+                .unwrap()
+                .a
+        };
+        let moved = motion
+            .transform_point(&Point3::from(pillar(&original)))
+            .coords;
+        assert!((pillar(&set) - moved).magnitude() < 1e-5);
+        assert_eq!(pillar(&set).z, pillar(&original).z);
+
+        set.transform(&motion.inverse());
+        let close = |a: Vector3<f32>, b: Vector3<f32>| (a - b).magnitude() < 1e-4;
+        for (a, b) in set.supports.iter().zip(&original.supports) {
+            assert!(close(a.point.pos, b.point.pos));
+            for (pa, pb) in a.parts.iter().zip(&b.parts) {
+                assert!(close(pa.a, pb.a) && close(pa.b, pb.b));
+            }
+        }
+        for (a, b) in set.braces.iter().zip(&original.braces) {
+            assert!(close(a.a, b.a) && close(a.b, b.b));
+        }
+        let vertices = |s: &SupportSet| -> Vec<[f32; 2]> {
+            s.raft
+                .iter()
+                .flat_map(|r| r.islands.iter().flatten().flatten().copied())
+                .collect()
+        };
+        for (a, b) in vertices(&set).into_iter().zip(vertices(&original)) {
+            assert!((a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn removing_a_fork_anchor_releases_the_fork() {
+        let mut set = forked_row();
+        set.remove(&HashSet::from([SupportId::from_raw(3)]));
+
+        assert_eq!(set.supports.len(), 2);
+        // Only the tree brace between the first two pillars is left.
+        assert_eq!(set.braces.len(), 1);
+        assert_eq!(set.braces[0].a, Vector3::new(0.0, 0.0, 19.0));
+
+        // The middle pillar reaches the plate again and gets a base there.
+        let pillar = |s: &Support| *s.parts.iter().find(|p| p.kind == PartKind::Pillar).unwrap();
+        assert_eq!(pillar(&set.supports[1]).b.z, 0.0);
+        let footed = set.with_feet(None);
+        assert!(
+            footed.supports[1]
+                .parts
+                .iter()
+                .any(|p| p.kind == PartKind::Base)
+        );
+    }
+
+    #[test]
+    fn removing_the_fork_middle_keeps_its_neighbours() {
+        let mut set = forked_row();
+        set.remove(&HashSet::from([SupportId::from_raw(2)]));
+
+        assert_eq!(set.supports.len(), 2);
+        assert!(set.braces.is_empty());
+        for support in &set.supports {
+            assert!(support.parts.iter().any(|p| p.kind == PartKind::Base));
         }
     }
 
@@ -935,8 +1269,8 @@ mod tests {
         let boss = part(&set, PartKind::Boss).unwrap();
         let pillar = part(&set, PartKind::Pillar).unwrap();
         assert_eq!((base.a.z, base.b.z), (0.0, 1.0));
-        assert_eq!(base.radius_a, 6.0);
-        assert!(base.radius_b < base.radius_a && base.radius_b >= BASE.boss_radius);
+        assert!((base.radius_a - 4.3).abs() < 1e-5);
+        assert_eq!(base.radius_b, 6.0);
         assert!((boss.a.z - 0.998).abs() < 1e-6 && (boss.b.z - 1.998).abs() < 1e-6);
         assert_eq!((boss.radius_a, boss.radius_b), (1.1, 0.6));
         assert!((pillar.b.z - 1.996).abs() < 1e-6);

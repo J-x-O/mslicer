@@ -41,7 +41,7 @@ use common::{
 use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 use tools::supports::{
     SupportSet,
-    auto::{AutoPlacement, PlacementConfig, collision},
+    auto::{AutoPlacement, GenerationProgress, PlacementConfig, collision},
     mesh::{SupportPreset, Transform, build_supports},
     parts::PartKind,
 };
@@ -281,7 +281,7 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
     let pos = model.position();
     model.set_position(Vector3::new(pos.x, pos.y, pos.z + (default_lift - min_z)));
 
-    let progress = Progress::new();
+    let progress = GenerationProgress::default();
     let bvh = Bvh::build(model.inner(), Progress::new());
 
     // Build the auto placement exactly as the app's generate button does.

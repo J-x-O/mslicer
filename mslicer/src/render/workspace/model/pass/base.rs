@@ -2,7 +2,7 @@ use std::num::NonZero;
 
 use common::units::Milimeter;
 use encase::{DynamicUniformBuffer, ShaderSize, ShaderType};
-use nalgebra::{Matrix4, Vector2, Vector3};
+use nalgebra::{Matrix4, Vector2, Vector3, Vector4};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, BlendState, BufferBinding,
@@ -15,15 +15,24 @@ use wgpu::{
 };
 
 use crate::{
-    core::{App, config::render::RenderStyle, project::model::ModelId, state::Tool},
+    core::{App, config::render::RenderStyle, palette, project::model::ModelId, state::Tool},
     include_shader,
     render::{
         Gcx, VERTEX_BUFFER_LAYOUT,
         util::ResizingBuffer,
-        workspace::model::{MultiStage, selected::Selected},
+        workspace::model::{
+            MultiStage,
+            selected::{FaceState, Selected},
+        },
     },
-    util::misc::invert_color,
 };
+
+/// What isn't being worked on is grey, its supports a little lighter. A
+/// model shows its own colour when selected, and when hovered as a preview of
+/// selecting it.
+const GREY_MODEL: Vector3<f32> = Vector3::new(0.55, 0.55, 0.56);
+const GREY_SUPPORT: Vector3<f32> = Vector3::new(0.68, 0.68, 0.69);
+const WHITE: Vector3<f32> = Vector3::new(1.0, 1.0, 1.0);
 
 pub struct BasePass {
     pipeline: RenderPipeline,
@@ -47,6 +56,12 @@ struct Uniforms {
     overhang_angle: f32,
     id: u32,
     selected: Vector2<u32>, // start, length
+    accent: Vector3<f32>,
+    /// What hovered and selected faces are mixed towards (rgb) and how far
+    /// (w).
+    hover: Vector4<f32>,
+    select: Vector4<f32>,
+    warning: Vector3<f32>,
 }
 
 impl BasePass {
@@ -73,7 +88,7 @@ impl BasePass {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
-                        min_binding_size: NonZero::new(8),
+                        min_binding_size: NonZero::new(16),
                     },
                     count: None,
                 },
@@ -304,7 +319,7 @@ impl BaseResources {
         gcx: &Gcx,
         app: &mut App,
         layout: &BindGroupLayout,
-        mut callback: impl FnMut(&mut App, &Gcx, ModelId) -> Vec<(Uniforms, Vec<[u32; 2]>)>,
+        mut callback: impl FnMut(&mut App, &Gcx, ModelId) -> Vec<(Uniforms, Vec<[u32; 4]>)>,
     ) {
         self.uniform_offsets.clear();
 
@@ -330,7 +345,7 @@ impl BaseResources {
             }
         }
 
-        selected_words.resize(selected_words.len().max(1), [0; 2]);
+        selected_words.resize(selected_words.len().max(1), [0; 4]);
         let uniform = self.uniform.write(gcx, &uniform_buffer.into_inner());
         let selected = self.selected.write_slice(gcx, &selected_words);
 
@@ -357,51 +372,122 @@ impl BaseResources {
             .map(|x| x.to_radians())
             .unwrap_or(f32::from_bits(u32::MAX));
 
+        let accent = Vector3::from(app.config.ui.accent_color);
+        let warning = app.config.ui.warning_color;
         self.write_uniforms(gcx, app, &pass.group_layout, |app, gcx, model_id| {
+            let (tool, hover) = (app.state.tool, app.state.hovered_geometry);
+            let moving = [app.state.support_drag, app.state.support_settling];
+            let moving = moving.into_iter().flatten().filter(|x| x.model == model_id);
+            let selected = app.state.selected.contains_model(model_id);
+            let hovered = hover.is_some_and(|hit| hit.model == model_id);
+
             let model = app.project.model(model_id).unwrap();
             model.get_buffers(&gcx.device);
 
+            let own = model.color.to_srgb().into();
+            let model_color = if selected || hovered { own } else { GREY_MODEL };
             let model_transform = *model.mesh.transformation_matrix();
             let base = Uniforms {
                 transform: view_projection * model_transform,
                 model_transform,
                 build_volume,
-                model_color: model.color.to_srgb().into(),
+                model_color,
                 render_style,
                 overhang_angle,
                 id: model.id.raw(),
                 selected: Vector2::zeros(),
+                accent,
+                // Hovering a selected model just brightens it a little.
+                hover: WHITE.push(0.15),
+                select: accent.push(0.75),
+                warning: warning.into(),
             };
 
-            let mut selected = Selected::default();
-            if app.state.tool == Tool::Orient
-                && let Some(hover) = app.state.hovered_geometry
-                && !hover.support
-                && hover.model == model.id
-            {
-                selected.set_selected(hover.face);
+            let mut states = Selected::default();
+            selected.then(|| states.set_all(FaceState::Outlined));
+            match tool {
+                Tool::Select => {
+                    (selected && hovered).then(|| states.set_all(FaceState::Hovered));
+                }
+                Tool::Orient => {
+                    if let Some(hit) = hover.filter(|hit| !hit.support && hit.model == model_id) {
+                        states.set_face(hit.face, FaceState::Selected);
+                    }
+                }
+                Tool::Support => {}
             }
-
-            let mut out = vec![(base.clone(), selected.into_inner())];
+            let mut out = vec![(base.clone(), states.into_inner())];
 
             if model.supports.get_buffers(&gcx.device).is_some() {
+                let hovered_support = (hover.filter(|hit| hit.support && hit.model == model_id))
+                    .and_then(|hit| model.supports.support_for_face(hit.face));
                 let (mesh, support_faces) = model.supports.mesh().as_ref().unwrap();
+                let support_color = match tool {
+                    // Supports move with their model, so they wear its colour.
+                    Tool::Select | Tool::Orient => {
+                        if selected || hovered {
+                            own
+                        } else {
+                            GREY_SUPPORT
+                        }
+                    }
+                    // While you work on them, they stand out against it.
+                    // See palette::support_color.
+                    Tool::Support if selected || hovered => {
+                        palette::support_color(model.color, warning).into()
+                    }
+                    Tool::Support => GREY_SUPPORT,
+                };
                 let model_transform = mesh.transformation_matrix();
                 let uniform = Uniforms {
                     transform: view_projection * model_transform,
                     model_transform: *model_transform,
-                    model_color: invert_color(model.color).into(),
+                    model_color: support_color,
+                    hover: match tool {
+                        Tool::Support => WHITE.push(1.0),
+                        _ => base.hover,
+                    },
+                    select: WHITE.push(1.0),
                     id: base.id | 1 << 31,
                     overhang_angle: f32::from_bits(0xFFFFFFFF),
                     ..base
                 };
 
-                let mut selected = Selected::default();
-                for support in app.state.selected_supports.for_model(model.id) {
-                    selected.set_selected_range(support_faces[&support]);
+                let mut states = Selected::default();
+                selected.then(|| states.set_all(FaceState::Outlined));
+                let mut set = |support, state| {
+                    if let Some(range) = support_faces.get(&support) {
+                        states.set_range(*range, state);
+                    }
+                };
+                match tool {
+                    Tool::Select => {
+                        (selected && hovered).then(|| states.set_all(FaceState::Hovered));
+                    }
+                    Tool::Support => {
+                        // White under the pointer even on a model you aren't
+                        // working on yet: clicking it starts working on it.
+                        if let Some(support) = hovered_support {
+                            set(support, FaceState::Hovered);
+                        }
+                        // Only a selected model's supports can be worked on.
+                        if selected {
+                            for support in app.state.selected_supports.for_model(model_id) {
+                                set(support, FaceState::Selected);
+                            }
+                            for boxed in app.state.boxed_supports.iter() {
+                                (boxed.model == model_id)
+                                    .then(|| set(boxed.support, FaceState::Hovered));
+                            }
+                            for moving in moving {
+                                set(moving.support, FaceState::Hidden);
+                            }
+                        }
+                    }
+                    Tool::Orient => {}
                 }
 
-                out.push((uniform, selected.into_inner()));
+                out.push((uniform, states.into_inner()));
             }
 
             out
@@ -436,6 +522,10 @@ impl BaseResources {
                 overhang_angle: f32::from_bits(0xFFFFFFFF),
                 id: 0,
                 selected: Vector2::zeros(),
+                accent: Vector3::zeros(),
+                hover: Vector4::zeros(),
+                select: Vector4::zeros(),
+                warning: Vector3::zeros(),
             };
 
             let selected = Selected::default().into_inner();
@@ -445,7 +535,7 @@ impl BaseResources {
             self.uniform_offsets.push(offset.unwrap() as u32);
         }
 
-        selected_words.resize(selected_words.len().max(1), [0; 2]);
+        selected_words.resize(selected_words.len().max(1), [0; 4]);
         let uniform = self.uniform.write(gcx, &uniform_buffer.into_inner());
         let selected = self.selected.write_slice(gcx, &selected_words);
 

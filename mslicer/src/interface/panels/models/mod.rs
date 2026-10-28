@@ -1,4 +1,4 @@
-use std::{collections::HashMap, f32};
+use std::f32;
 
 use const_format::concatcp;
 use egui::{
@@ -223,7 +223,8 @@ fn selection_properties(app: &mut App, ui: &mut Ui) {
         }
 
         if shortcut(ui.button(concatcp!(COPY, " Duplicate")), DUPLICATE_SHORTCUT) {
-            for id in app.state.selected.selected_models() {
+            let selected = app.state.selected.selected_models().collect::<Vec<_>>();
+            for id in selected {
                 if let Some(model) = app.project.models.iter().find(|x| x.id == id) {
                     let new = model.clone();
                     app.history.track(Action::ModelAdded { id: new.id });
@@ -232,18 +233,14 @@ fn selection_properties(app: &mut App, ui: &mut Ui) {
             }
         }
 
-        if ui.button(concatcp!(LINE_SEGMENT, " Prepare")).clicked() {
-            let meshes = (app.state.selected.selected_models())
-                .filter_map(|id| {
-                    (app.project.model(id))
-                        .filter(|model| !model.has_acceleration_structures())
-                        .map(|model| (model.mesh.mesh_id(), model.mesh.inner().clone()))
-                })
-                .collect::<HashMap<_, _>>();
-
-            for (id, mesh) in meshes.into_iter() {
-                app.tasks
-                    .add(BuildAccelerationStructures::new_mesh(id, mesh));
+        if !app.config.ui.auto_prepare && ui.button(concatcp!(LINE_SEGMENT, " Prepare")).clicked() {
+            let selected = app.state.selected.selected_models().collect::<Vec<_>>();
+            for id in selected {
+                if let Some(model) = app.project.models.iter().find(|x| x.id == id)
+                    && let Some(task) = BuildAccelerationStructures::request(&mut app.state, model)
+                {
+                    app.tasks.add(task);
+                }
             }
         }
     });

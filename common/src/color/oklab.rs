@@ -50,6 +50,25 @@ impl OkLab<f32> {
         }
     }
 
+    /// From lightness, chroma and hue (radians).
+    pub fn from_lch(l: f32, chroma: f32, hue: f32) -> Self {
+        Self {
+            l,
+            a: chroma * hue.cos(),
+            b: chroma * hue.sin(),
+        }
+    }
+
+    /// The hue angle in radians, in (-π, π].
+    pub fn hue(&self) -> f32 {
+        self.b.atan2(self.a)
+    }
+
+    /// Like saturation: the distance from grey.
+    pub fn chroma(&self) -> f32 {
+        (self.a * self.a + self.b * self.b).sqrt()
+    }
+
     pub fn hue_shift(&self, shift: f32) -> Self {
         let hue = self.b.atan2(self.a);
         let chroma = (self.a * self.a + self.b * self.b).sqrt();

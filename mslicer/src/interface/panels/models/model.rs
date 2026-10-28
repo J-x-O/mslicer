@@ -4,8 +4,8 @@ use common::{
 };
 use const_format::concatcp;
 use egui::{
-    Align, CollapsingHeader, Color32, ComboBox, Context, DragValue, Label, Layout, Popup, Response,
-    Sense, TextEdit, Ui, UiBuilder, Widget, text::CCursorRange, vec2,
+    Align, Button, CollapsingHeader, Color32, ComboBox, Context, DragValue, Label, Layout, Popup,
+    Response, Sense, TextEdit, Ui, UiBuilder, Widget, text::CCursorRange, vec2,
 };
 use egui_phosphor::regular::{
     ARROW_LINE_DOWN, ARROWS_COUNTER_CLOCKWISE, BANDAIDS, COPY, CUBE, CURSOR_TEXT, DICE_THREE, EYE,
@@ -23,6 +23,7 @@ use crate::{
             Collection, RenameState,
             model::{MeshUnit, MeshWarnings},
         },
+        state::Tool,
     },
     interface::{
         components::{being_edited, dragger, grid, history_tracked_model},
@@ -139,6 +140,8 @@ pub fn model_entry(
     response
 }
 
+const LOCKED_TIP: &str = "This would remove the supports. Switch to the select tool to change it.";
+
 pub fn model_properties(
     app: &mut App,
     ui: &mut Ui,
@@ -150,6 +153,9 @@ pub fn model_properties(
 
     let platform = &app.project.slice_config.platform_size;
     let id = model.id;
+    // In the support tool, changes that would remove the supports are locked.
+    let locked = app.state.tool == Tool::Support && !model.supports.is_empty();
+    let warning = app.config.ui.warning_color;
 
     ui.horizontal_wrapped(|ui| {
         if shortcut(
@@ -177,12 +183,16 @@ pub fn model_properties(
             app.project.collections.push(collection);
         }
 
-        if shortcut(
-            ui.button(concatcp!(ARROW_LINE_DOWN, " Align to Bed")),
-            ALIGN_SHORTCUT,
-        ) {
+        let align = ui.add_enabled(
+            !locked,
+            Button::new(concatcp!(ARROW_LINE_DOWN, " Align to Bed")),
+        );
+        if shortcut(align.on_disabled_hover_text(LOCKED_TIP), ALIGN_SHORTCUT) && !locked {
             let old_pos = model.mesh.position();
-            app.history.track_model(id, ModelAction::Position(old_pos));
+            app.history.track_model(
+                id,
+                ModelAction::Position(old_pos, model.supports.snapshot()),
+            );
 
             model.align_to_bed();
             model.update_oob(platform);
@@ -254,10 +264,14 @@ pub fn model_properties(
                 ui.label("Position");
                 ui.horizontal(|ui| {
                     let mut position = model.mesh.position();
-                    let editing = dragger::vec3(ui, position.as_mut(), |x| x);
+                    let editable = [true, true, !locked];
+                    let editing =
+                        dragger::vec3_partial(ui, position.as_mut(), |x| x, editable, LOCKED_TIP);
                     history_tracked_model(
                         (editing, ui, &mut app.history),
-                        (id, || ModelAction::Position(model.mesh.position())),
+                        (id, || {
+                            ModelAction::Position(model.mesh.position(), model.supports.snapshot())
+                        }),
                     );
                     (editing && model.mesh.position() != position)
                         .then(|| model.set_position(platform, position));
@@ -267,40 +281,54 @@ pub fn model_properties(
 
                 ui.label("Scale");
 
-                ui.horizontal(|ui| {
-                    let factor = model.unit.conversion();
-                    let mut scale = model.mesh.scale() / factor;
+                ui.add_enabled_ui(!locked, |ui| {
+                    ui.horizontal(|ui| {
+                        let factor = model.unit.conversion();
+                        let mut scale = model.mesh.scale() / factor;
 
-                    let editing = if model.ui.locked_scale {
-                        dragger::vec3_proportional(ui, scale.as_mut(), |x| {
-                            x.speed(0.01).range(0.001..=f32::MAX)
-                        })
-                    } else {
-                        dragger::vec3(ui, scale.as_mut(), |x| {
-                            x.speed(0.01).range(0.001..=f32::MAX)
-                        })
-                    };
-                    history_tracked_model(
-                        (editing, ui, &mut app.history),
-                        (id, || ModelAction::Scale(model.mesh.scale())),
-                    );
+                        let editing = if model.ui.locked_scale {
+                            dragger::vec3_proportional(ui, scale.as_mut(), |x| {
+                                x.speed(0.01).range(0.001..=f32::MAX)
+                            })
+                        } else {
+                            dragger::vec3(ui, scale.as_mut(), |x| {
+                                x.speed(0.01).range(0.001..=f32::MAX)
+                            })
+                        };
+                        history_tracked_model(
+                            (editing, ui, &mut app.history),
+                            (id, || {
+                                ModelAction::Scale(model.mesh.scale(), model.supports.snapshot())
+                            }),
+                        );
 
-                    scale *= factor;
-                    (editing && model.mesh.scale() != scale)
-                        .then(|| model.set_scale(platform, scale));
+                        scale *= factor;
+                        (editing && model.mesh.scale() != scale)
+                            .then(|| model.set_scale(platform, scale));
 
-                    model.ui.locked_scale ^= ui
-                        .button([LINK_BREAK, LINK_SIMPLE][model.ui.locked_scale as usize])
-                        .clicked();
-                });
+                        model.ui.locked_scale ^= ui
+                            .button([LINK_BREAK, LINK_SIMPLE][model.ui.locked_scale as usize])
+                            .clicked();
+                    })
+                })
+                .response
+                .on_disabled_hover_text(LOCKED_TIP);
                 ui.end_row();
 
                 ui.label("Rotation");
                 let mut rotation = rad_to_deg(model.mesh.rotation());
-                let editing = dragger::vec3(ui, rotation.as_mut(), |x| x.suffix("°"));
+                let editing = dragger::vec3_partial(
+                    ui,
+                    rotation.as_mut(),
+                    |x| x.suffix("°"),
+                    [!locked, !locked, true],
+                    LOCKED_TIP,
+                );
                 history_tracked_model(
                     (editing, ui, &mut app.history),
-                    (id, || ModelAction::Rotation(model.mesh.rotation())),
+                    (id, || {
+                        ModelAction::Rotation(model.mesh.rotation(), model.supports.snapshot())
+                    }),
                 );
 
                 if editing {
@@ -325,7 +353,7 @@ pub fn model_properties(
 
                     if ui.button(concatcp!(DICE_THREE, " Random")).clicked() {
                         app.history.track_model(id, ModelAction::Color(model.color));
-                        model.randomize_color();
+                        model.randomize_color(warning);
                     }
                 });
             });

@@ -4,9 +4,9 @@ use common::units::Milimeter;
 use egui::{Context, Key, KeyboardShortcut, Modifiers, ViewportCommand};
 
 use crate::{
-    core::{App, project::Project},
+    core::{App, project::Project, state::Tool},
     include_asset,
-    interface::popup::confirm_unsaved,
+    interface::{panels::supports::delete_selected, popup::confirm_unsaved},
     task::{AutoLayout, FileDialog, LoadSliced, MeshLoad, MultiFileDialog},
 };
 
@@ -26,6 +26,12 @@ pub const REDO_SHORTCUT: Shortcut = Shortcut::new(Key::Y, redo);
 pub const LAYOUT_SHORTCUT: Shortcut = Shortcut::new(Key::L, quick_layout);
 pub const SELECT_ALL_SHORTCUT: Shortcut = Shortcut::new(Key::A, select_all).input_exclusive();
 pub const SELECT_NONE_SHORTCUT: Shortcut = Shortcut::new(Key::D, select_none).command_shift();
+pub const DELETE_SUPPORTS_SHORTCUT: Shortcut = Shortcut::new(Key::Delete, delete_supports)
+    .modifier(Modifiers::NONE)
+    .input_exclusive();
+pub const BACKSPACE_SUPPORTS_SHORTCUT: Shortcut = Shortcut::new(Key::Backspace, delete_supports)
+    .modifier(Modifiers::NONE)
+    .input_exclusive();
 
 const SHORTCUTS: &[Shortcut] = &[
     IMPORT_SLICED_SHORTCUT,
@@ -42,6 +48,8 @@ const SHORTCUTS: &[Shortcut] = &[
     LAYOUT_SHORTCUT,
     SELECT_ALL_SHORTCUT,
     SELECT_NONE_SHORTCUT,
+    DELETE_SUPPORTS_SHORTCUT,
+    BACKSPACE_SUPPORTS_SHORTCUT,
 ];
 
 type ShortcutCallback = fn(&mut App, &Context);
@@ -172,6 +180,10 @@ fn redo(app: &mut App, _ctx: &Context) {
     app.history().redo();
 }
 
+fn delete_supports(app: &mut App, _ctx: &Context) {
+    delete_selected(app);
+}
+
 fn select_none(app: &mut App, _ctx: &Context) {
     app.state.selected.clear();
 }
@@ -189,7 +201,28 @@ fn quick_layout(app: &mut App, _ctx: &Context) {
     ));
 }
 
+/// Selects every model, or in the support tool every support (of the selected
+/// models, if any).
 fn select_all(app: &mut App, _ctx: &Context) {
+    // In the support tool: every support of the selected models, or with
+    // none selected, every model and all their supports.
+    if app.state.tool == Tool::Support {
+        let state = &mut app.state;
+        if !state.selected.has_models() {
+            for model in &app.project.models {
+                state.selected.select_model(model.id);
+            }
+        }
+        for model in &app.project.models {
+            if state.selected.contains_model(model.id) {
+                for id in model.supports.ids() {
+                    state.selected_supports.select_support(model.id, id);
+                }
+            }
+        }
+        return;
+    }
+
     app.state.selected.clear();
     for model in app.project.models.iter() {
         app.state.selected.select_model(model.id);

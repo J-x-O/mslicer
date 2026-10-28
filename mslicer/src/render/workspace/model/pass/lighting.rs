@@ -35,6 +35,7 @@ pub struct LightingResources {
 struct Uniforms {
     camera_position: Vector3<f32>,
     flags: u32,
+    outline: Vector3<f32>,
 }
 
 impl LightingPass {
@@ -237,6 +238,7 @@ impl LightingResources {
         let uniform = Uniforms {
             camera_position: camera.position(camera.distance),
             flags: ao as u32,
+            outline: Vector3::repeat(1.0),
         };
 
         buffer.write(&uniform).unwrap();

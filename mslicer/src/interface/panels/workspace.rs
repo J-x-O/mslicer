@@ -32,11 +32,13 @@ use crate::{
     system::memory::MemoryBreakdown,
 };
 
+const WARNING_COLOR_TIP: &str = "Marks problems, like a model outside the build volume. Random model colors and support colors keep clear of its hue.";
 const BASIS_TIP: &str = "Set size to 0px to disable.";
 const AA_DESC: &str = "Anti-aliasing smooths jagged edges at the borders of models.";
 const SSAO_DESC: &str = "Ambient occlusion (SSAO) simulates how ambient light gets blocked in convex areas, making the rendering a little more realistic.";
 const SSAO_SCALE_TIP: &str = "Calculate ambient occlusion at a lower resolution to get better performance at the cost of quality.";
 const MAX_BUFFER_SIZE_TIP: &str = "The maximum GPU mesh size, high-poly meshes may require raising this setting but not all GPUs support larger values. Requires full app restart to take affect.";
+const AUTO_PREPARE_TIP: &str = "Builds the acceleration structures supports need in the background as soon as a model is loaded. Turn off to save memory and CPU time on large meshes.";
 const MAX_HISTORY_MESH_TIP: &str =
     "Meshes larger than this will be immediately unloaded on deletion, undo won't bring them back.";
 const SPACENAV_CONNECTED: &str = "Connected to Spacenav.";
@@ -330,6 +332,23 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
                 });
             ui.end_row();
 
+            ui.label("Accent Color");
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut app.config.ui.accent_color);
+                ui.take_available_width();
+            });
+            ui.end_row();
+
+            ui.horizontal(|ui| {
+                ui.label("Warning Color");
+                ui.label(INFO).on_hover_text(WARNING_COLOR_TIP);
+            });
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut app.config.ui.warning_color);
+                ui.take_available_width();
+            });
+            ui.end_row();
+
             ui.label("Grid Size");
             ui.horizontal(|ui| {
                 dragger(ui, "", &mut app.config.render.grid_size, |x| {
@@ -361,6 +380,13 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
                         ui.selectable_value(&mut app.config.ui.update_check, freq, freq.name());
                     }
                 });
+            ui.end_row();
+
+            ui.horizontal(|ui| {
+                ui.label("Prepare Models for Supports");
+                ui.label(INFO).on_hover_text(AUTO_PREPARE_TIP);
+            });
+            ui.checkbox(&mut app.config.ui.auto_prepare, "");
             ui.end_row();
 
             ui.horizontal(|ui| {
