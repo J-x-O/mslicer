@@ -12,8 +12,6 @@ const STATE_HIDDEN: u32 = 4;
 // Outlined by the lighting pass, through the normal target's w.
 const STATE_OUTLINED: u32 = 8;
 
-const OVERHANG_COLOR: vec3f = vec3f(0.67, 0.65, 0.38);
-
 struct Context {
     transform: mat4x4f,
     model_transform: mat4x4f,
@@ -29,6 +27,8 @@ struct Context {
     select: vec4f,
     // Marks faces outside the build volume.
     warning: vec3f,
+    // What overhanging faces are tinted towards.
+    overhang_color: vec3f,
 }
 
 struct VertexOutput {
@@ -82,7 +82,7 @@ fn render(is_front: bool, in: VertexOutput, index: u32, normal: vec3f, state: u3
         case STYLE_RENDERED: {
             var color = ctx.model_color;
             if bitcast<u32>(ctx.overhang_angle) != 0xFFFFFFFF {
-                color = mix(color, OVERHANG_COLOR, 1.0 - smoothstep(0, ctx.overhang_angle, acos(-normal.z)));
+                color = mix(color, ctx.overhang_color, 1.0 - smoothstep(0, ctx.overhang_angle, acos(-normal.z)));
             }
 
             if (state & STATE_SELECTED) != 0 {

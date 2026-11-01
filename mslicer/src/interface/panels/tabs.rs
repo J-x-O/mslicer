@@ -12,6 +12,7 @@ pub struct Tabs<'a> {
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tab {
+    Islands,
     Logs,
     Models,
     RemotePrint,
@@ -24,7 +25,8 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [
+    pub const ALL: [Tab; 9] = [
+        Self::Islands,
         Self::Logs,
         Self::Models,
         Self::Notes,
@@ -37,6 +39,7 @@ impl Tab {
 
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Islands => "Islands",
             Self::Logs => "Logs",
             Self::Models => "Models",
             Self::Notes => "Notes",
@@ -59,6 +62,7 @@ impl TabViewer for Tabs<'_> {
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
         match tab {
+            Tab::Islands => islands::ui(self.app, ui, self.ctx),
             Tab::Logs => logs::ui(self.app, ui, self.ctx),
             Tab::Models => models::ui(self.app, ui, self.ctx),
             Tab::Notes => notes::ui(self.app, ui, self.ctx),

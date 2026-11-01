@@ -22,6 +22,7 @@ pub mod grid;
 pub mod landing;
 pub mod legs;
 pub mod merge;
+pub mod mini;
 mod order;
 pub mod placement;
 pub mod points;
@@ -32,6 +33,7 @@ pub mod topology;
 pub use directional::{DirectionMode, Directional, build_directional, build_upward_tip};
 pub use landing::{Landing, LandingConfig, LandingKind};
 pub use merge::{Merged, PostMerged, extract_merge_candidates, merge_pillars, post_merge};
+pub use mini::{MINI_REACH, route_hand, route_mini};
 pub use route::{RouteSizes, route_support};
 pub use topology::BraceNetwork;
 

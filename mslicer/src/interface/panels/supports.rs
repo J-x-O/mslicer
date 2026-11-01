@@ -7,7 +7,7 @@ use egui_phosphor::regular::{ERASER, LINE_SEGMENT, SELECTION_INVERSE, SPARKLE, T
 use nalgebra::Vector3;
 use tools::supports::{
     BaseShape, SupportId,
-    auto::{Routed, route_point},
+    auto::{Routed, route_hand},
     mesh::SupportPreset,
     raft::{RaftConfig, RaftShape},
 };
@@ -24,7 +24,7 @@ use crate::{
 };
 
 const IN_DEV_WARNING: &str = "Support generation and placement is still in development. For the time being consider using RuneBrace for support placement.";
-const EDIT_HELP: &str = "Click a model to work on it (shift adds it), then click it to add a support. Click a support to select it (shift adds to the selection), drag a support to move its contact point, drag elsewhere to box select. Clicking empty space clears the selection. Delete removes the selected supports, Escape cancels a drag.\n\nRight drag orbits, middle drag pans (or shift + right drag), alt + left drag orbits too. F frames the selection.";
+const EDIT_HELP: &str = "Click a model to work on it (shift adds it), then click it to add a support. Click a support to select it (shift adds to the selection), drag a support to move its contact point, drag elsewhere to box select. Clicking empty space clears the selection. Delete removes the selected supports, Escape cancels a drag. Where the model below is too close for a full support, a mini support (a short strut onto the model) is placed instead; Ctrl + click always places a mini support.\n\nRight drag orbits, middle drag pans (or shift + right drag), alt + left drag orbits too. F frames the selection.";
 
 pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
     ui.horizontal_wrapped(|ui| {
@@ -435,7 +435,7 @@ fn diameter(ui: &mut Ui, radius: &mut Milimeters) {
 /// The models the Auto and Clear buttons act on: the selected ones (or the
 /// models of the selected supports), else the only model. `None` when there
 /// is no selection and several models to choose from.
-fn targets(app: &App) -> Option<Vec<usize>> {
+pub(super) fn targets(app: &App) -> Option<Vec<usize>> {
     let models = &app.project.models;
     let selected: Vec<usize> = (0..models.len())
         .filter(|&i| app.state.selected.contains_model(models[i].id))
@@ -574,7 +574,14 @@ fn route_under_pointer(
         return None;
     }
     let bvh = model.bvh.as_ref()?;
-    let routed = route_point(&model.mesh, bvh, config, point, normal)?;
+    let routed = route_hand(
+        &model.mesh,
+        bvh,
+        config,
+        point,
+        normal,
+        app.state.mini_support,
+    )?;
     Some((model.id, routed))
 }
 

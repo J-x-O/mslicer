@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use egui::{
     Align2, Area, Button, Color32, Context, FontId, Frame, Id, Key, Order, Painter, PointerButton,
-    Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, Widget, pos2, vec2,
+    Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, Widget, pos2, vec2,
 };
 use egui_phosphor::regular::{INFO, MAGNIFYING_GLASS};
 use egui_wgpu::Callback;
@@ -14,15 +14,17 @@ use crate::{
     core::{
         App,
         history::ModelAction,
+        islands,
         project::model::Model,
         selected::SelectedSupport,
-        state::{GeometryHit, Tool, WorkspaceHover},
+        state::{CameraFocus, GeometryHit, Tool, WorkspaceHover},
     },
     interface::{
         components::grid,
         panels::supports::{drag_support, manual_support_placement, start_support_drag},
     },
     render::{
+        camera::{Limits, Pivots},
         interface::basis::BasisRenderCallback,
         workspace::{WorkspaceRenderCallback, model::pick::pick_selection},
     },
@@ -44,6 +46,7 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
 
     let modifiers = ui.input(|i| i.modifiers);
     let shift_down = modifiers.shift;
+    app.state.mini_support = modifiers.command;
 
     // The left button belongs to the tools: dragging a support in the support
     // tool moves it, any other drag draws a selection box. Alt + left orbits.
@@ -111,14 +114,23 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     if keyboard_free && response.hovered() && ui.input(|i| i.key_pressed(Key::F)) {
         frame_selection(app);
     }
+    // Steps through the unsupported islands while a check runs.
+    if keyboard_free
+        && response.hovered()
+        && app.state.island_check.is_some()
+        && ui.input(|i| i.key_pressed(Key::N) && !i.modifiers.command)
+    {
+        islands::step(app, !ui.input(|i| i.modifiers.shift));
+    }
 
     let dragging_area = app.state.select_start.is_some();
     let dragging_support = app.state.support_drag.is_some();
+    let pivots = camera_pivots(app, &response, ui);
     let camera_moving = !dragging_area
         && !dragging_support
         && app
             .camera
-            .handle_movement(&response, ui, app.config.render.projection);
+            .handle_movement(&response, ui, app.config.render.projection, pivots);
 
     let focused = ui.input(|i| i.focused);
     let mut is_moving = app.spacenav().handle_movement(focused);
@@ -130,6 +142,14 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     }
     is_moving |= camera_moving;
     app.state.workspace = WorkspaceHover::new(is_moving, aspect, uv);
+
+    // During an island check, the support tool lights up the island under
+    // the pointer. Supports still go exactly where it points.
+    if app.state.tool == Tool::Support && !is_moving {
+        islands::track_hover(app);
+    } else {
+        islands::clear_hover(app);
+    }
 
     if app.state.tool != Tool::Support {
         app.state.support_drag = None;
@@ -254,6 +274,104 @@ fn supports_in(app: &App, area: &Bounds2D<f32>) -> Vec<SelectedSupport> {
     out
 }
 
+/// What zoom and orbit go about. Normally the point under the pointer: for an
+/// orbit, where the drag started. While the camera is focused on something,
+/// its target, until the view is scrolled three notches out or panned.
+fn camera_pivots(app: &mut App, response: &Response, ui: &Ui) -> Pivots {
+    let (scroll, modifiers) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers));
+    // Shift turns the wheel into a horizontal scroll in egui.
+    let scroll = if modifiers.shift {
+        scroll.x + scroll.y
+    } else {
+        scroll.y
+    };
+    let secondary = response.dragged_by(PointerButton::Secondary);
+    let panning = response.dragged_by(PointerButton::Middle) || (secondary && modifiers.shift);
+    let pan_start = response.drag_started_by(PointerButton::Middle)
+        || (response.drag_started_by(PointerButton::Secondary) && modifiers.shift);
+    let orbit_start = (response.drag_started_by(PointerButton::Secondary) && !modifiers.shift)
+        || (response.drag_started_by(PointerButton::Primary) && modifiers.alt);
+    let orbiting = (secondary && !modifiers.shift)
+        || (response.dragged_by(PointerButton::Primary) && modifiers.alt);
+
+    if let Some(focus) = &mut app.state.camera_focus {
+        if response.hovered() {
+            focus.scrolled_out = (focus.scrolled_out - scroll).max(0.0);
+        }
+        if panning || focus.scrolled_out >= CameraFocus::RELEASE {
+            app.state.camera_focus = None;
+        }
+    }
+    if !orbiting {
+        app.state.orbit_pivot = None;
+    }
+    let limits = Some(camera_limits(app));
+    if app.state.camera_focus.is_some() {
+        return Pivots {
+            limits,
+            ..Default::default()
+        };
+    }
+
+    let scrolling = scroll != 0.0 && response.hovered();
+    if !(scrolling || pan_start || orbit_start) {
+        return Pivots {
+            orbit: app.state.orbit_pivot,
+            limits,
+            ..Default::default()
+        };
+    }
+    let ray = app.hovered_ray();
+    let hit = ray.and_then(|ray| pointer_hit(app, ray));
+    let point = ray.zip(hit).map(|((pos, dir), t)| pos + dir * t);
+    // Pan and orbit work at the depth of what was grabbed.
+    if (pan_start || orbit_start)
+        && let Some(point) = point
+    {
+        app.camera.reseat(app.config.render.projection, point);
+    }
+    if orbit_start {
+        app.state.orbit_pivot = point;
+    }
+    Pivots {
+        ray: scrolling.then_some(ray).flatten(),
+        hit: scrolling.then_some(hit).flatten(),
+        orbit: app.state.orbit_pivot,
+        limits,
+    }
+}
+
+/// How far along `ray` the nearest visible model surface is, else the build
+/// plate.
+fn pointer_hit(app: &App, (pos, dir): (Vector3<f32>, Vector3<f32>)) -> Option<f32> {
+    let surface = (app.project.models.iter())
+        .filter(|m| !m.hidden)
+        .filter_map(|m| {
+            let hit = m.bvh.as_ref()?.intersect_ray(&m.mesh, pos, dir)?;
+            Some((m.mesh.transform(&hit.position) - pos).norm())
+        })
+        .min_by(f32::total_cmp);
+    surface.or_else(|| {
+        let half = app.project.slice_config.platform_size.map(|x| x.raw()) / 2.0;
+        let t = -pos.z / dir.z;
+        let at = pos + dir * t;
+        (t > 0.0 && at.x.abs() <= half.x && at.y.abs() <= half.y).then_some(t)
+    })
+}
+
+/// The build volume grown by its diagonal holds the target; the camera stays
+/// within ten diagonals of it.
+fn camera_limits(app: &App) -> Limits {
+    let size = app.project.slice_config.platform_size.map(|x| x.raw());
+    let diagonal = size.norm();
+    let half = Vector3::new(size.x / 2.0, size.y / 2.0, 0.0);
+    Limits {
+        min: -half - Vector3::repeat(diagonal),
+        max: half + Vector3::new(0.0, 0.0, size.z) + Vector3::repeat(diagonal),
+        max_distance: 10.0 * diagonal,
+    }
+}
+
 /// Points the camera at the selected models, the models of the selected
 /// supports, or else every model.
 fn frame_selection(app: &mut App) {
@@ -271,6 +389,7 @@ fn frame_selection(app: &mut App) {
     };
     let (min, max) = bounds.fold(first, |(min, max), (a, b)| (min.inf(&a), max.sup(&b)));
     app.camera.frame(min, max);
+    app.state.camera_focus = Some(Default::default());
 }
 
 fn paint_area_selection(painter: &Painter, app: &mut App, rect: &Rect, px: Pos2) {

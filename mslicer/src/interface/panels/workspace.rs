@@ -198,6 +198,7 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
                     .speed(0.1)
                     .suffix("°")
                     .ui(ui);
+                ui.color_edit_button_rgb(&mut app.config.render.overhang_color);
             });
             ui.end_row();
 

@@ -307,6 +307,10 @@ impl SupportSet {
             LandingKind::Pillar => (PartKind::Pillar, radius, radius * 1.04),
             // The slim's end ball is exactly the slim radius.
             LandingKind::Slim { radius } => (PartKind::Slim, radius, radius),
+            LandingKind::Mini { radius: waist } => {
+                self.add_mini(id, tip_radius, waist, landing);
+                return;
+            }
         };
         let joint = body_radius * 1.04;
         let mut parts = vec![
@@ -345,6 +349,57 @@ impl SupportSet {
             parts,
             foot: Foot::Model {
                 pos,
+                normal: foot_normal,
+            },
+            group: 0,
+            preset: SupportPreset::default(),
+        });
+    }
+
+    /// A mini support: tip cone down to the waist, a cone from the waist into
+    /// the lower surface, and a contact ball at each end.
+    fn add_mini(&mut self, id: SupportId, tip_radius: f32, waist: f32, landing: &Landing) {
+        let round = |kind, a, b, radius_a, radius_b| Part {
+            kind,
+            a,
+            b,
+            radius_a,
+            radius_b,
+            shape: Shape::Round,
+        };
+        let Landing {
+            contact,
+            tip,
+            foot,
+            depth,
+            ..
+        } = *landing;
+        let parts = vec![
+            round(
+                PartKind::ContactSphere,
+                contact,
+                contact,
+                tip_radius,
+                tip_radius,
+            ),
+            round(PartKind::TipCone, contact, tip, tip_radius, waist),
+            round(PartKind::Joint, tip, tip, waist, waist),
+            round(PartKind::TipCone, foot, tip, tip_radius, waist),
+            round(PartKind::ContactSphere, foot, foot, tip_radius, tip_radius),
+        ];
+        let normal = (tip - contact).try_normalize(f32::EPSILON);
+        let foot_normal = landing.tails.first().map_or(Vector3::z(), |(_, n)| *n);
+        self.supports.push(Support {
+            id,
+            point: SupportPoint {
+                pos: contact,
+                normal: normal.unwrap_or(-Vector3::z()),
+                kind: PointKind::Contact,
+                depth,
+            },
+            parts,
+            foot: Foot::Model {
+                pos: foot,
                 normal: foot_normal,
             },
             group: 0,

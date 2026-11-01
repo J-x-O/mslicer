@@ -4,7 +4,11 @@ use common::progress::Progress;
 use nalgebra::Vector3;
 use rayon::prelude::*;
 use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
-use tools::supports::{SupportId, SupportSet, auto::route_point, mesh::SupportPreset};
+use tools::supports::{
+    PartKind, SupportId, SupportSet,
+    auto::{route_hand, route_point},
+    mesh::SupportPreset,
+};
 
 use crate::{
     core::{
@@ -100,10 +104,19 @@ fn run(job: Job, progress: &Progress) -> Rerouted {
     let (mut auto, mut manual) = ((*job.base.0).clone(), (*job.base.1).clone());
     // Routing is the slow part, and each support's is its own: route them
     // all in parallel, then put them in one by one.
+    // Hand-placed supports route as by hand, and a mini stays a mini.
+    let by_hand = |id: SupportId| {
+        let support = manual.supports.iter().find(|s| s.id == id)?;
+        let cones = (support.parts.iter()).filter(|p| p.kind == PartKind::TipCone);
+        Some(cones.count() == 2)
+    };
     let routes: Vec<_> = (job.changes.into_par_iter())
         .map(|(id, preset, contact, tip)| {
             let normal = surface_normal(&job.mesh, &job.bvh, contact, tip);
-            let routed = route_point(&job.mesh, &job.bvh, &preset, contact, normal);
+            let routed = match by_hand(id) {
+                Some(mini) => route_hand(&job.mesh, &job.bvh, &preset, contact, normal, mini),
+                None => route_point(&job.mesh, &job.bvh, &preset, contact, normal),
+            };
             progress.add_complete(1);
             (id, preset, routed)
         })

@@ -1,6 +1,7 @@
 pub mod auto_layout;
 mod exposure;
 pub mod graphics_3d;
+pub mod islands;
 pub mod misc;
 pub mod phonograph_record;
 pub mod printed_circuit_board;

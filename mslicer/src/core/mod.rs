@@ -31,6 +31,7 @@ use crate::{
 
 pub mod config;
 pub mod history;
+pub mod islands;
 pub mod palette;
 pub mod project;
 pub mod selected;
@@ -199,6 +200,7 @@ impl eframe::App for App {
             .set_max_mesh_size(self.config.ui.history_max_mesh_size);
         self.popup().render(ctx);
         self.tasks().poll();
+        islands::update(self);
 
         // todo: only update the visuals if the theme has changed?
         ctx.set_visuals(Visuals {

@@ -20,7 +20,8 @@
 //! supports to `<dir>/<model>_{top,side}.png`, braces in red.
 //! `DUMP_STL=<dir>` writes our support mesh to `<dir>/<model>_ours.stl`.
 //! `DUMP_POINTS=<dir>` writes the contacts and routes as text, and
-//! `ROTATE_X=<deg>` tilts the model about x first.
+//! `ROTATE_X=<deg>` tilts the model about x first. Each model also reports its
+//! islands (0.05 mm planes on the plate grid) and how many no contact holds.
 
 use std::{
     fs,
@@ -39,6 +40,7 @@ use common::{
     units::{Milimeter, Milimeters},
 };
 use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
+use tools::islands::{self, Cover, Planes};
 use tools::supports::{
     SupportSet,
     auto::{AutoPlacement, GenerationProgress, PlacementConfig, collision},
@@ -256,6 +258,9 @@ struct ModelReport {
     generate_ms: u128,
     build_ms: u128,
     acceptance: Acceptance,
+    islands: usize,
+    /// Heights of the islands no contact holds.
+    unsupported: Vec<f32>,
 }
 
 fn process_model(model_path: &Path) -> Result<ModelReport> {
@@ -409,6 +414,17 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
         std::fs::write(Path::new(&dir).join(format!("{name}_ours.stl")), out)?;
     }
 
+    let detection = islands::detect(&model, &bvh, Planes::layers(0.05, 1), &Progress::new());
+    let contacts: Vec<(Vector3<f32>, f32)> = (generated.plate.iter().map(|[contact, ..]| *contact))
+        .chain(generated.landings.iter().map(|l| l.contact))
+        .map(|c| (c, tip_radius))
+        .collect();
+    let cover = islands::coverage(&detection, &contacts);
+    let unsupported = (detection.islands.iter().zip(&cover))
+        .filter(|(_, c)| **c == Cover::Unsupported)
+        .map(|(i, _)| i.z)
+        .collect();
+
     let our_volume = mesh_volume(&mesh);
     let our_triangles = mesh.face_count();
 
@@ -481,6 +497,8 @@ fn process_model(model_path: &Path) -> Result<ModelReport> {
         acceptance,
         generate_ms,
         build_ms,
+        islands: detection.islands.len(),
+        unsupported,
     })
 }
 
@@ -561,6 +579,16 @@ fn main() -> Result<()> {
         println!(
             "    accept: unbraced>10mm {}/{} failed_braces {} floating_brace_ends {} tail_sink {sink}",
             a.unbraced_tall, a.tall, a.failed_braces, a.floating_ends
+        );
+        let heights = (r.unsupported.iter().take(12))
+            .map(|z| format!("{z:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "    islands: {} unsupported {} {heights}{}",
+            r.islands,
+            r.unsupported.len(),
+            if r.unsupported.len() > 12 { " …" } else { "" }
         );
     }
     println!();

@@ -136,6 +136,9 @@ pub enum LandingKind {
     /// A slim pillar of this radius for a drop too short for pillar and tail.
     /// Its lower end ball is centred on `foot`.
     Slim { radius: f32 },
+    /// A mini support (see [`super::mini`]): two cones meeting at a waist of
+    /// this radius at `tip`, the lower one sunk into the surface at `foot`.
+    Mini { radius: f32 },
 }
 
 /// A support that lands on the model: tip cone from `contact` to `tip`,

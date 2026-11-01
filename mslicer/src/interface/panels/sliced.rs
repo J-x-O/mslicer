@@ -734,6 +734,7 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
                     &response,
                     ui,
                     app.config.render.projection,
+                    Default::default(),
                 ) {
                     app.state.last_preview_interact = Some(Instant::now());
                 }

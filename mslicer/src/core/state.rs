@@ -12,6 +12,7 @@ use wgpu::Device;
 use crate::{
     core::{
         config::peripherals::Webhook,
+        islands::{IslandCheck, IslandSettings},
         project::model::{Model, ModelId},
         selected::{SelectedModel, SelectedPrinter, SelectedSupport, SelectedSupports},
     },
@@ -57,6 +58,17 @@ pub struct UiState {
     pub unrouted: Vec<SelectedSupport>,
     /// Meshes whose acceleration structures are being built.
     pub preparing: HashSet<MeshId>,
+    /// The island check, while one runs.
+    pub island_check: Option<IslandCheck>,
+    pub island_settings: IslandSettings,
+    /// Ctrl is held in the viewport: supports placed by hand are mini ones.
+    pub mini_support: bool,
+    /// The camera was pointed at something (F, or stepping to an island), so
+    /// it zooms and orbits about its target, not the point under the pointer,
+    /// until scrolled out of it.
+    pub camera_focus: Option<CameraFocus>,
+    /// The point a rotate drag turns about, from where it started.
+    pub orbit_pivot: Option<Vector3<f32>>,
     pub selected_remap_point: Option<u8>,
 
     // remote send ui
@@ -81,6 +93,18 @@ pub struct UiState {
 
     pub tools: Tools,
     pub move_timeout: u32, // todo: having this in frames is fragile!
+}
+
+/// How far out (in scroll points) the view has been zoomed since it was
+/// pointed at something.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CameraFocus {
+    pub scrolled_out: f32,
+}
+
+impl CameraFocus {
+    /// Three wheel notches out end the focus.
+    pub const RELEASE: f32 = 150.0;
 }
 
 pub struct PreviewModel {

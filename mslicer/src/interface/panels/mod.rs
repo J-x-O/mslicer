@@ -3,6 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+mod islands;
 mod logs;
 mod models;
 mod notes;
@@ -111,7 +112,7 @@ fn default_dock_layout(surface: &mut Tree<Tab>) {
     let [_old_node, new_node] = surface.split_below(
         new_node,
         0.4,
-        vec![Tab::SliceConfig, Tab::Supports, Tab::Notes],
+        vec![Tab::SliceConfig, Tab::Supports, Tab::Islands, Tab::Notes],
     );
     surface.split_below(new_node, 0.6, vec![Tab::Workspace, Tab::RemotePrint]);
 }

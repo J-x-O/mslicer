@@ -62,6 +62,7 @@ struct Uniforms {
     hover: Vector4<f32>,
     select: Vector4<f32>,
     warning: Vector3<f32>,
+    overhang_color: Vector3<f32>,
 }
 
 impl BasePass {
@@ -374,6 +375,7 @@ impl BaseResources {
 
         let accent = Vector3::from(app.config.ui.accent_color);
         let warning = app.config.ui.warning_color;
+        let overhang_color = app.config.render.overhang_color;
         self.write_uniforms(gcx, app, &pass.group_layout, |app, gcx, model_id| {
             let (tool, hover) = (app.state.tool, app.state.hovered_geometry);
             let moving = [app.state.support_drag, app.state.support_settling];
@@ -401,6 +403,7 @@ impl BaseResources {
                 hover: WHITE.push(0.15),
                 select: accent.push(0.75),
                 warning: warning.into(),
+                overhang_color: overhang_color.into(),
             };
 
             let mut states = Selected::default();
@@ -526,6 +529,7 @@ impl BaseResources {
                 hover: Vector4::zeros(),
                 select: Vector4::zeros(),
                 warning: Vector3::zeros(),
+                overhang_color: Vector3::zeros(),
             };
 
             let selected = Selected::default().into_inner();

@@ -328,6 +328,18 @@ impl Supports {
             .collect()
     }
 
+    /// Every support's contact in world space, with its tip radius.
+    pub fn contacts(&self) -> Vec<(Vector3<f32>, f32)> {
+        let motion = (self.frame.motion_to(&self.pose)).unwrap_or_else(Isometry3::identity);
+        (self.auto.supports.iter())
+            .chain(self.manual.supports.iter())
+            .map(|s| {
+                let pos = motion.transform_point(&s.point.pos.into()).coords;
+                (pos, s.preset.tip_radius.get::<Milimeter>())
+            })
+            .collect()
+    }
+
     /// A support in world space.
     pub fn get(&self, id: SupportId) -> Option<Support> {
         let support = (self.auto.supports.iter())

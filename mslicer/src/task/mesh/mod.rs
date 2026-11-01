@@ -1,6 +1,7 @@
 mod acceleration_structures;
 mod analysis;
 mod auto_layout;
+mod detect_islands;
 mod flip_winding;
 mod generate;
 mod generate_supports;
@@ -12,6 +13,7 @@ pub use self::{
     acceleration_structures::{BuildAccelerationStructures, store_bvh},
     analysis::MeshAnalysis,
     auto_layout::AutoLayout,
+    detect_islands::DetectIslands,
     flip_winding::FlipWinding,
     generate::GenerateMesh,
     generate_supports::GenerateSupports,

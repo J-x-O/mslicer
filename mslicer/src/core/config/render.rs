@@ -24,6 +24,8 @@ pub struct RenderConfig {
     pub normals: DebugRender,
     pub bounding_box: DebugRender,
     pub overhangs: (bool, f32),
+    /// What overhanging faces are tinted towards (sRGB).
+    pub overhang_color: [f32; 3],
     pub basis_size: f32,
 }
 
@@ -147,6 +149,7 @@ impl Default for RenderConfig {
 
             grid_size: 12.16,
             overhangs: (false, 30.0),
+            overhang_color: [0.67, 0.65, 0.38],
             normals: DebugRender::new().with_color(SRgb::new(0.5, 0.5, 1.0)),
             bounding_box: DebugRender::new().with_color(SRgb::new(1.0, 0.5, 1.0)),
             basis_size: 100.0,
