@@ -6,6 +6,7 @@ use nalgebra::Vector3;
 
 use crate::core::project::{
     Collection, CollectionId, PostProcessing, Project, RenameState, SupportConfig,
+    hollow::HollowSpec,
     model::{MeshUnit, Model},
 };
 use common::{
@@ -50,7 +51,9 @@ use tools::supports::{SupportSet, auto::PlacementConfig, mesh::SupportPreset, ra
 ///   because of the bincode drama...
 /// - v17 (v0.11.0) — Store support sets (auto and manual, each support with the
 ///   settings it was built with) per model, and the project's support settings.
-const VERSION: u16 = 17;
+/// - v18 (v0.11.0) — Store each model's hollowing: the wall kept and the drain
+///   holes.
+const VERSION: u16 = 18;
 const DESCRIPTION: &str = concatcp!(
     "Saved by mslicer v",
     crate::VERSION,
@@ -73,6 +76,7 @@ struct ModelInfo {
 
     supports: (SupportSet, SupportSet),
     raft: RaftConfig,
+    hollow: HollowSpec,
 }
 
 impl ModelInfo {
@@ -90,6 +94,7 @@ impl ModelInfo {
             rotation: model.mesh.rotation(),
             supports: model.supports.world_sets(),
             raft: model.supports.raft(),
+            hollow: model.hollow.spec.clone(),
         }
     }
 
@@ -109,6 +114,7 @@ impl ModelInfo {
             .with_unit(self.unit);
 
         (model.supports).restore(self.supports.0, self.supports.1, self.raft);
+        model.hollow.spec = self.hollow;
         model
     }
 
@@ -140,6 +146,7 @@ impl ModelInfo {
         self.supports.0.serialize(ser);
         self.supports.1.serialize(ser);
         self.raft.serialize(ser);
+        self.hollow.serialize(ser);
     }
 
     pub fn deserialize<T: Deserializer>(des: &mut T, version: u16) -> Self {
@@ -176,6 +183,11 @@ impl ModelInfo {
                 RaftConfig::default()
             } else {
                 RaftConfig::deserialize(des)
+            },
+            hollow: if version < 18 {
+                HollowSpec::default()
+            } else {
+                HollowSpec::deserialize(des)
             },
         }
     }

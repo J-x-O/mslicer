@@ -14,7 +14,7 @@ use crate::{
     core::{
         App,
         history::ModelAction,
-        islands,
+        hollow, islands,
         project::model::Model,
         selected::SelectedSupport,
         state::{CameraFocus, GeometryHit, Tool, WorkspaceHover},
@@ -102,8 +102,9 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     let keyboard_free = !ctx.wants_keyboard_input();
     if keyboard_free && ui.input(|i| i.key_pressed(Key::Escape)) {
         // Escape cancels what is under way, else clears the selection.
-        let cancelled =
-            app.state.support_drag.take().is_some() || app.state.select_start.take().is_some();
+        let cancelled = app.state.support_drag.take().is_some()
+            || app.state.select_start.take().is_some()
+            || std::mem::take(&mut app.state.hole_placement);
         if cancelled {
             app.state.support_preview = None;
         } else {
@@ -151,7 +152,14 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         islands::clear_hover(app);
     }
 
-    if app.state.tool != Tool::Support {
+    // Placing drain holes takes over clicks on the model from the tools.
+    if app.state.hole_placement && !is_moving {
+        hollow::track_preview(app);
+    } else {
+        app.state.hole_preview = None;
+    }
+
+    if app.state.tool != Tool::Support || app.state.hole_placement {
         app.state.support_drag = None;
         app.state.support_preview = None;
     } else if dragging_support {
@@ -162,7 +170,9 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         manual_support_placement(app, false)
     }
 
-    if response.clicked() && !is_moving {
+    if response.clicked() && !is_moving && app.state.hole_placement {
+        hollow::click(app);
+    } else if response.clicked() && !is_moving {
         match app.state.tool {
             Tool::Select => match app.state.hovered_geometry {
                 Some(hover) => app.state.selected.model_clicked(hover.model, shift_down),

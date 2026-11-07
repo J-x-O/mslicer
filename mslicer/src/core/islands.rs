@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use common::units::Milimeter;
 use nalgebra::Vector3;
-use slicer::geometry::mesh::Mesh;
+use slicer::geometry::mesh::{Mesh, MeshId};
 use tools::{
     islands::{Cover, Detection, Island, OVERLAY_GROW, Planes, coverage, overlay_mesh},
     supports::auto::route_hand,
@@ -91,6 +91,8 @@ pub struct CheckedModel {
 
 pub struct Checked {
     pub pose: Pose,
+    /// The print mesh it was found on: a new cavity calls for a new check.
+    pub source: MeshId,
     pub detection: Detection,
     pub cover: Vec<Cover>,
 }
@@ -201,9 +203,9 @@ impl IslandCheck {
     pub fn finished(
         &mut self,
         model: ModelId,
-        pose: Pose,
+        (pose, source): (Pose, MeshId),
         detection: Detection,
-        now: Pose,
+        now: (Pose, MeshId),
         spacing: f32,
     ) {
         let Some(checked) = self.models.iter_mut().find(|m| m.model == model) else {
@@ -212,12 +214,13 @@ impl IslandCheck {
         if checked.running == Some(pose) {
             checked.running = None;
         }
-        if pose != now || detection.spacing != spacing {
+        if (pose, source) != now || detection.spacing != spacing {
             return;
         }
         let cover = vec![Cover::Unsupported; detection.islands.len()];
         checked.result = Some(Checked {
             pose,
+            source,
             detection,
             cover,
         });
@@ -290,7 +293,18 @@ pub fn update(app: &mut App) {
     for checked in &mut check.models {
         let model = models.iter().find(|m| m.id == checked.model).unwrap();
         let now = Pose::of(&model.mesh);
+        // Islands are found on the mesh as it prints, inner walls included.
+        let print = model.hollow.print_mesh(&model.mesh);
 
+        if checked
+            .result
+            .as_ref()
+            .is_some_and(|r| r.source != print.mesh_id())
+        {
+            checked.result = None;
+            checked.ignored.clear();
+            changed = true;
+        }
         if let Some(result) = &mut checked.result {
             match result.pose.motion_to(&now) {
                 Some(motion) if result.detection.spacing == spacing => {
@@ -319,12 +333,21 @@ pub fn update(app: &mut App) {
             }
             // One detection per model at a time; a stale one is dropped when
             // it finishes and the next frame starts a fresh one.
+            // A hollowed model's print mesh gets its own hit-testing
+            // structure, built by the detection.
+            None if checked.running.is_none() && print.mesh_id() != model.mesh.mesh_id() => {
+                checked.running = Some(now);
+                let planes = Planes::layers(layer, settings.accuracy.step());
+                app.tasks
+                    .add(DetectIslands::new(model.id, print, None, planes, now));
+            }
             None if checked.running.is_none() => match &model.bvh {
                 Some(bvh) => {
                     checked.running = Some(now);
                     let planes = Planes::layers(layer, settings.accuracy.step());
+                    let bvh = Some(bvh.clone());
                     app.tasks
-                        .add(DetectIslands::new(model, bvh.clone(), planes, now));
+                        .add(DetectIslands::new(model.id, print, bvh, planes, now));
                 }
                 None => {
                     if let Some(task) = BuildAccelerationStructures::request(&mut app.state, model)

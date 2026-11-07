@@ -14,6 +14,7 @@ use crate::{
     render::{
         Gcx,
         consts::{FILTERING_SAMPLER, NONFILTERING_SAMPLER},
+        workspace::hollow::CavityPass,
         workspace::model::{
             bindings::texture_size,
             pass::{
@@ -42,6 +43,7 @@ pub struct ModelPipeline {
 
     picker: ModelPicker,
     base: BasePass,
+    cavity: CavityPass,
     ssao: SsaoPass,
     blur: BlurPass,
     lighting: LightingPass,
@@ -101,6 +103,7 @@ impl ModelPipeline {
             preview: None,
             picker: ModelPicker::new(device),
             base: BasePass::create(device, texture),
+            cavity: CavityPass::new(device, texture),
             ssao: SsaoPass::create(device),
             blur: BlurPass::create(device),
             lighting: LightingPass::create(device, texture),
@@ -125,7 +128,7 @@ impl ModelPipeline {
         let index = &self.post_index_buffer;
 
         match target {
-            Target::Viewport => self.base.paint(encoder, app, multi),
+            Target::Viewport => self.base.paint(encoder, app, multi, &self.cavity),
             Target::Preview => self.base.paint_preview(encoder, app, multi),
         }
         if ssao {
@@ -178,9 +181,12 @@ impl ModelPipeline {
             view_projection = Matrix4::new_translation(&clip.to_homogeneous()) * view_projection;
         }
 
+        self.cavity.prepare(gcx, app, view_projection);
         self.size_textures(gcx, app, Target::Viewport, size);
         let multi = self.viewport.as_mut().unwrap();
-        multi.base.prepare(gcx, app, &self.base, view_projection);
+        multi
+            .base
+            .prepare(gcx, app, &self.base, &self.cavity, view_projection);
 
         multi.ssao.prepare(gcx, app, view_projection);
         multi.blur.prepare(gcx, app, occlusion_size);

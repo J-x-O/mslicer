@@ -73,11 +73,17 @@ impl RerouteSupports {
         let jobs: Vec<Job> = (changes.into_iter())
             .filter_map(|(id, changes)| {
                 let model = models.iter_mut().find(|m| m.id == id)?;
+                // On the inner walls too, once their structure is built;
+                // else on the model's own surface.
+                let (mesh, bvh) = match model.support_surface() {
+                    (mesh, Some(bvh)) => (mesh, bvh),
+                    _ => (model.mesh.clone(), model.bvh.clone()?),
+                };
                 Some(Job {
                     model: id,
-                    bvh: model.bvh.clone()?,
+                    bvh,
                     base: model.supports.edit_base(),
-                    mesh: model.mesh.clone(),
+                    mesh,
                     changes,
                 })
             })

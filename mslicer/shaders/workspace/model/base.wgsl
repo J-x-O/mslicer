@@ -29,7 +29,14 @@ struct Context {
     warning: vec3f,
     // What overhanging faces are tinted towards.
     overhang_color: vec3f,
+    // Drain holes cut out of the surface: where in `selected` they start, and
+    // how many. Each is two entries, floats as bits: the point where its axis
+    // meets the surface and its radius, then its direction and depth.
+    holes: vec2u,
 }
+
+// How far before the surface a hole starts (mm); see `HOLE_LEAD`.
+const HOLE_LEAD: f32 = 1.0;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -58,7 +65,7 @@ fn frag(
    in: VertexOutput
 ) -> FragmentOutput {
     let state = face_state(index);
-    if (state & STATE_HIDDEN) != 0 {
+    if (state & STATE_HIDDEN) != 0 || in_hole(in.world_position) {
         discard;
     }
 
@@ -100,6 +107,19 @@ fn render(is_front: bool, in: VertexOutput, index: u32, normal: vec3f, state: u3
             return vec4f();
         }
     }
+}
+
+// Whether a point is inside one of the model's holes.
+fn in_hole(p: vec3f) -> bool {
+    for (var i = 0u; i < ctx.holes.y; i++) {
+        let at = ctx.holes.x + 2u * i;
+        let a = bitcast<vec4f>(selected[at]);
+        let b = bitcast<vec4f>(selected[at + 1u]);
+        let rel = p - a.xyz;
+        let t = dot(rel, b.xyz);
+        if t > -HOLE_LEAD && t < b.w && length(rel - b.xyz * t) < a.w { return true; }
+    }
+    return false;
 }
 
 // The state bits of every range holding `face`, combined.

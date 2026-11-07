@@ -69,6 +69,15 @@ pub struct UiState {
     pub camera_focus: Option<CameraFocus>,
     /// The point a rotate drag turns about, from where it started.
     pub orbit_pivot: Option<Vector3<f32>>,
+    /// How new drain holes are made.
+    pub hole_settings: HoleSettings,
+    /// Clicking a model drills a hole there (or removes the one clicked).
+    pub hole_placement: bool,
+    /// Where a click would drill, while placing holes (world space).
+    pub hole_preview: Option<tools::hollow::Hole>,
+    /// The hole picked out in the Hollowing tab (its model and index), to
+    /// show which one it is.
+    pub hole_highlight: Option<(ModelId, usize)>,
     pub selected_remap_point: Option<u8>,
 
     // remote send ui
@@ -93,6 +102,18 @@ pub struct UiState {
 
     pub tools: Tools,
     pub move_timeout: u32, // todo: having this in frames is fragile!
+}
+
+/// How new drain holes are made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoleSettings {
+    pub diameter: f32,
+}
+
+impl Default for HoleSettings {
+    fn default() -> Self {
+        Self { diameter: 2.0 }
+    }
 }
 
 /// How far out (in scroll points) the view has been zoomed since it was

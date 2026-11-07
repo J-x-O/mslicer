@@ -537,7 +537,7 @@ impl Supports {
     }
 
     /// The shown mesh, which may lag the supports by a background build.
-    pub fn mesh(&mut self) -> &Option<(Mesh, FaceMap)> {
+    pub fn mesh(&self) -> &Option<(Mesh, FaceMap)> {
         &self.mesh
     }
 

@@ -15,11 +15,18 @@ use wgpu::{
 };
 
 use crate::{
-    core::{App, config::render::RenderStyle, palette, project::model::ModelId, state::Tool},
+    core::{
+        App,
+        config::render::RenderStyle,
+        palette,
+        project::model::{Model, ModelId},
+        state::Tool,
+    },
     include_shader,
     render::{
         Gcx, VERTEX_BUFFER_LAYOUT,
         util::ResizingBuffer,
+        workspace::hollow::CavityPass,
         workspace::model::{
             MultiStage,
             selected::{FaceState, Selected},
@@ -42,8 +49,20 @@ pub struct BasePass {
 pub struct BaseResources {
     uniform: ResizingBuffer,
     uniform_offsets: Vec<u32>,
+    /// What each uniform is for, in the viewport.
+    draws: Vec<(ModelId, Draw)>,
     selected: ResizingBuffer,
     bind_group: Option<BindGroup>,
+}
+
+/// What a model's draw is of.
+#[derive(Clone, Copy, PartialEq)]
+enum Draw {
+    Model,
+    /// A hollowed model's cavity, as part of its surface: seen from inside
+    /// the model or through its holes.
+    Cavity,
+    Supports,
 }
 
 #[derive(ShaderType, Clone)]
@@ -63,6 +82,8 @@ struct Uniforms {
     select: Vector4<f32>,
     warning: Vector3<f32>,
     overhang_color: Vector3<f32>,
+    /// The model's holes in the storage buffer: start, count.
+    holes: Vector2<u32>,
 }
 
 impl BasePass {
@@ -217,38 +238,57 @@ impl BasePass {
         })
     }
 
-    pub fn paint(&self, encoder: &mut CommandEncoder, app: &mut App, multi: &MultiStage) {
+    /// The models and their cavities, then the cavities seen through them
+    /// (with the Hollowing tab open), then the supports: a support in front
+    /// of a model covers its cavity.
+    pub fn paint(
+        &self,
+        encoder: &mut CommandEncoder,
+        app: &mut App,
+        multi: &MultiStage,
+        cavities: &CavityPass,
+    ) {
         let resources = &multi.base;
         let Some(bind_group) = &resources.bind_group else {
             return;
         };
-
         let mut render_pass = self.render_pass(encoder, multi);
         render_pass.set_pipeline(&self.pipeline);
 
-        let indexes = (app.project.models.iter().enumerate())
-            .filter(|(_, x)| !x.hidden)
-            .map(|(idx, _)| idx);
+        let draws = || resources.draws.iter().zip(&resources.uniform_offsets);
+        for (&(id, draw), &offset) in draws().filter(|((_, d), _)| *d != Draw::Supports) {
+            let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+                continue;
+            };
+            let (vertices, indices, count) = match draw {
+                Draw::Model => {
+                    let buffers = model.try_get_buffers().unwrap();
+                    let count = model.mesh.face_count() as u32 * 3;
+                    (&buffers.vertex_buffer, &buffers.index_buffer, count)
+                }
+                _ => match cavities.buffers(id) {
+                    Some(buffers) => buffers,
+                    None => continue,
+                },
+            };
+            render_pass.set_bind_group(0, bind_group, &[offset]);
+            render_pass.set_vertex_buffer(0, vertices.slice(..));
+            render_pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+            render_pass.draw_indexed(0..count, 0, 0..1);
+        }
 
-        let mut i = 0;
-        for idx in indexes {
-            render_pass.set_bind_group(0, bind_group, &[resources.uniform_offsets[i]]);
-            i += 1;
+        cavities.paint(&mut render_pass, app);
 
-            let model = &app.project.models[idx];
-            let buffers = model.try_get_buffers().unwrap();
+        render_pass.set_pipeline(&self.pipeline);
+        for (&(id, _), &offset) in draws().filter(|((_, d), _)| *d == Draw::Supports) {
+            let model = app.project.models.iter().find(|m| m.id == id);
+            let Some((buffers, count)) = model.and_then(|m| m.supports.try_get_buffers()) else {
+                continue;
+            };
+            render_pass.set_bind_group(0, bind_group, &[offset]);
             render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
             render_pass.set_index_buffer(buffers.index_buffer.slice(..), IndexFormat::Uint32);
-            render_pass.draw_indexed(0..(model.mesh.face_count() as u32 * 3), 0, 0..1);
-
-            if let Some((buffers, count)) = model.supports.try_get_buffers() {
-                render_pass.set_bind_group(0, bind_group, &[resources.uniform_offsets[i]]);
-                i += 1;
-
-                render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(buffers.index_buffer.slice(..), IndexFormat::Uint32);
-                render_pass.draw_indexed(0..count, 0, 0..1);
-            }
+            render_pass.draw_indexed(0..count, 0, 0..1);
         }
     }
 
@@ -284,6 +324,7 @@ impl BaseResources {
             uniform,
             selected,
             uniform_offsets: Vec::new(),
+            draws: Vec::new(),
             bind_group: None,
         }
     }
@@ -320,9 +361,14 @@ impl BaseResources {
         gcx: &Gcx,
         app: &mut App,
         layout: &BindGroupLayout,
-        mut callback: impl FnMut(&mut App, &Gcx, ModelId) -> Vec<(Uniforms, Vec<[u32; 4]>)>,
+        mut callback: impl FnMut(
+            &mut App,
+            &Gcx,
+            ModelId,
+        ) -> Vec<(Draw, Uniforms, Vec<[u32; 4]>, Vec<[u32; 4]>)>,
     ) {
         self.uniform_offsets.clear();
+        self.draws.clear();
 
         let mut uniform_buffer = DynamicUniformBuffer::new(Vec::new());
         let mut selected_words = Vec::new();
@@ -337,9 +383,12 @@ impl BaseResources {
             model.get_buffers(&gcx.device);
             model.supports.get_buffers(&gcx.device);
 
-            for (mut uniform, selected) in callback(app, gcx, model_id) {
+            for (draw, mut uniform, selected, holes) in callback(app, gcx, model_id) {
+                self.draws.push((model_id, draw));
                 uniform.selected = Vector2::new(selected_words.len(), selected.len()).cast();
                 selected_words.extend_from_slice(&selected);
+                uniform.holes = Vector2::new(selected_words.len(), holes.len() / 2).cast();
+                selected_words.extend_from_slice(&holes);
 
                 let offset = uniform_buffer.write(&uniform);
                 self.uniform_offsets.push(offset.unwrap() as u32);
@@ -360,6 +409,7 @@ impl BaseResources {
         gcx: &Gcx,
         app: &mut App,
         pass: &BasePass,
+        cavities: &CavityPass,
         view_projection: Matrix4<f32>,
     ) {
         let render_style = app.config.render.style as u32;
@@ -404,6 +454,7 @@ impl BaseResources {
                 select: accent.push(0.75),
                 warning: warning.into(),
                 overhang_color: overhang_color.into(),
+                holes: Vector2::zeros(),
             };
 
             let mut states = Selected::default();
@@ -419,7 +470,21 @@ impl BaseResources {
                 }
                 Tool::Support => {}
             }
-            let mut out = vec![(base.clone(), states.into_inner())];
+            let holes = hole_words(model);
+            let mut out = vec![(
+                Draw::Model,
+                base.clone(),
+                states.into_inner(),
+                holes.clone(),
+            )];
+            if cavities.buffers(model_id).is_some() {
+                // Part of the model, but nothing to pick or outline.
+                let cavity = Uniforms {
+                    id: u32::MAX,
+                    ..base.clone()
+                };
+                out.push((Draw::Cavity, cavity, Vec::new(), holes));
+            }
 
             if model.supports.get_buffers(&gcx.device).is_some() {
                 let hovered_support = (hover.filter(|hit| hit.support && hit.model == model_id))
@@ -490,7 +555,7 @@ impl BaseResources {
                     Tool::Orient => {}
                 }
 
-                out.push((uniform, states.into_inner()));
+                out.push((Draw::Supports, uniform, states.into_inner(), Vec::new()));
             }
 
             out
@@ -530,6 +595,7 @@ impl BaseResources {
                 select: Vector4::zeros(),
                 warning: Vector3::zeros(),
                 overhang_color: Vector3::zeros(),
+                holes: Vector2::zeros(),
             };
 
             let selected = Selected::default().into_inner();
@@ -547,4 +613,23 @@ impl BaseResources {
             self.recreate_bind_group(gcx, &pass.group_layout);
         }
     }
+}
+
+/// A model's holes for the shader to cut out of its surface (see `in_hole` in
+/// base.wgsl), in world space.
+fn hole_words(model: &Model) -> Vec<[u32; 4]> {
+    // Holes drain a cavity: only a hollowed model has them.
+    let Some(shell) = model.hollow.spec.shell else {
+        return Vec::new();
+    };
+    (model.hollow.spec.holes.iter().enumerate())
+        // A hole that couldn't be drilled isn't there.
+        .filter(|(index, _)| !model.hollow.failed(&model.mesh, *index))
+        .map(|(_, h)| h.world(&model.mesh, shell))
+        .flat_map(|h| {
+            let d = h.direction.try_normalize(f32::EPSILON).unwrap_or_default();
+            [h.point.push(h.diameter / 2.0), d.push(h.depth)]
+        })
+        .map(|v| v.map(f32::to_bits).into())
+        .collect()
 }

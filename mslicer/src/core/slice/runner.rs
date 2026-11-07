@@ -56,6 +56,21 @@ impl App {
             return;
         }
 
+        // A hollowed model slices only once its cavity and holes are done.
+        if let Some(model) =
+            (self.project.models.iter()).find(|m| !m.hidden && !m.hollow.ready(&m.mesh))
+        {
+            self.popup.open(Popup::simple(
+                "Still Hollowing",
+                PopupIcon::Info,
+                format!(
+                    "The cavity or the holes of `{}` are still being computed. Slice again once they are done.",
+                    model.name
+                ),
+            ));
+            return;
+        }
+
         info!("Starting slicing operation");
 
         let slice_config = self.project.slice_config.clone();
@@ -78,8 +93,8 @@ impl App {
             preview_models.push(PreviewModel::for_model(device, &mut model));
 
             // slicing
-            let (mut mesh, exposure) = (model.mesh, model.exposure);
             let offset = (platform / 2.0).push(-slice_height / 2.0);
+            let (mut mesh, exposure) = (model.hollow.print_mesh(&model.mesh), model.exposure);
 
             transform_mesh(&mut mesh, mm_to_px, offset);
             triangles += mesh.face_count() as u64;

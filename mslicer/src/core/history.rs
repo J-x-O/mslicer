@@ -24,6 +24,7 @@ use crate::{
         config::ui::B_PER_MIB,
         project::{
             Collection, CollectionId,
+            hollow::HollowSpec,
             model::{Model, ModelId},
             supports::SupportsSnapshot,
         },
@@ -102,6 +103,7 @@ pub enum ModelAction {
     /// Auto generation, which also lifts the model.
     GeneratedSupports(Vector3<f32>, SupportsSnapshot),
     Supports(SupportsSnapshot),
+    Hollow(HollowSpec),
     RelativeExposure(u8),
     Collection(Option<CollectionId>),
     Move(usize, Option<CollectionId>),
@@ -357,6 +359,7 @@ impl ModelAction {
             Self::Orientation(..) => ActionDescription::new("Oriented Model"),
             Self::GeneratedSupports(..) => ActionDescription::new("Generated Supports"),
             Self::Supports(_) => ActionDescription::new("Edited Supports"),
+            Self::Hollow(_) => ActionDescription::new("Changed Hollowing"),
             Self::RelativeExposure(_) => ActionDescription::new("Changed Model Exposure"),
             Self::Collection(_) => ActionDescription::new("Changed Model Collection"),
             Self::Move(..) => ActionDescription::new("Moved Model"),
@@ -413,6 +416,7 @@ impl ModelAction {
                 model.supports.restore_snapshot(supports);
                 Self::Supports(old)
             }
+            Self::Hollow(spec) => Self::Hollow(mem::replace(&mut model.hollow.spec, spec)),
             Self::RelativeExposure(exposure) => {
                 Self::RelativeExposure(mem::replace(&mut model.exposure, exposure))
             }

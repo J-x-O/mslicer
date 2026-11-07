@@ -243,7 +243,8 @@ pub fn model_properties(
                         .button(format!("{} ({})", format.name(), format.extension()))
                         .clicked()
                     {
-                        let mesh = model.mesh.inner().clone();
+                        // As it prints: hollowed, if it is.
+                        let mesh = model.hollow.print_mesh(&model.mesh).inner().clone();
                         app.tasks.add(FileDialog::save_file(
                             ("Mesh", &[format.extension()]),
                             move |_app, path, tasks| {

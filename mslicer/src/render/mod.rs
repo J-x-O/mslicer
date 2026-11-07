@@ -8,8 +8,8 @@ use crate::render::{
     interface::basis::BasisPipeline,
     slice_preview::{SlicePreviewPipeline, SlicePreviewRenderResources},
     workspace::{
-        WorkspaceRenderResources, islands::IslandPipeline, line::LineDispatch,
-        model::ModelPipeline, point::PointDispatch, support::SupportPipeline,
+        WorkspaceRenderResources, hollow::HollowPipeline, islands::IslandPipeline,
+        line::LineDispatch, model::ModelPipeline, point::PointDispatch, support::SupportPipeline,
     },
 };
 
@@ -52,6 +52,7 @@ pub fn init_wgpu(cc: &CreationContext) -> RenderState {
         model: ModelPipeline::new(device, texture),
         support: SupportPipeline::new(device, texture),
         islands: IslandPipeline::new(device, texture),
+        hollow: HollowPipeline::new(device, texture),
         point: PointDispatch::new(device, texture),
         solid_line: LineDispatch::new(device, texture),
     });

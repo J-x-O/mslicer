@@ -17,6 +17,7 @@ use crate::{
         palette,
         project::{
             CollectionId, RenameState,
+            hollow::Hollow,
             supports::{Pose, Supports},
         },
     },
@@ -32,6 +33,7 @@ pub struct Model {
     pub bounds: Bounds3D,
     pub bvh: Option<Arc<Bvh>>,
     pub supports: Supports,
+    pub hollow: Hollow,
     base_volume: Option<CubicMilimeters>,
 
     pub unit: MeshUnit,
@@ -81,6 +83,7 @@ impl Model {
             base_volume: None,
             bvh: None,
             supports,
+            hollow: Hollow::default(),
             bounds: Bounds3D::from_mesh(&mesh),
             mesh,
 
@@ -146,6 +149,18 @@ impl Model {
     pub fn randomize_color(&mut self, warning: [f32; 3]) -> &mut Self {
         self.color = palette::random_model_color(warning);
         self
+    }
+
+    /// The surface supports are placed and routed on: the mesh as it
+    /// prints (a hollowed model's cavity walls included, so the inside gets
+    /// supports too), with its hit-testing structure if that is built.
+    pub fn support_surface(&self) -> (Mesh, Option<Arc<Bvh>>) {
+        let print = self.hollow.print_mesh(&self.mesh);
+        let bvh = match print.mesh_id() == self.mesh.mesh_id() {
+            true => self.bvh.clone(),
+            false => self.hollow.print_bvh(&print),
+        };
+        (print, bvh)
     }
 
     pub fn has_acceleration_structures(&self) -> bool {
@@ -315,6 +330,7 @@ impl Clone for Model {
             bounds: self.bounds.clone(),
             bvh: self.bvh.clone(),
             supports: self.supports.duplicate(),
+            hollow: self.hollow.clone(),
             base_volume: self.base_volume,
 
             unit: self.unit,

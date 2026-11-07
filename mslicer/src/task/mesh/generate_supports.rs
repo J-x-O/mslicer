@@ -5,7 +5,7 @@ use std::sync::{
 
 use common::{progress::Progress, units::Milimeters};
 use nalgebra::Vector3;
-use slicer::geometry::partitioning::Bvh;
+use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
 use tools::supports::{
     auto::{AutoPlacement, BraceNetwork, Generated, GenerationProgress, PlacementConfig},
     mesh::SupportPreset,
@@ -22,8 +22,12 @@ use crate::{
 /// Tells generations apart, so a newer one or an undo can cancel an older one.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
-/// The routed supports plus the brace network computed over them.
+/// The routed supports plus the brace network computed over them, and the
+/// surface they were routed on.
 struct RoutedWithBraces {
+    mesh: Box<Mesh>,
+    /// Routed on the model's own mesh, not a hollowed one's print mesh.
+    own: bool,
     bvh: Arc<Bvh>,
     generated: Generated,
     network: BraceNetwork,
@@ -36,6 +40,8 @@ pub struct GenerateSupports {
 
     progress: Stages,
     state: State,
+    /// Waiting for the model's cavity or holes.
+    hollowing: bool,
 }
 
 /// Progress per stage. Each counts for its share of the bar, by how long it
@@ -86,7 +92,7 @@ impl Stages {
 }
 
 enum State {
-    /// Waiting for the model's acceleration structures to be built.
+    /// Waiting for the model's hollowing, or its acceleration structures.
     Waiting(Option<AutoPlacement>),
     Running {
         at: Pose,
@@ -114,6 +120,7 @@ impl GenerateSupports {
             preset: support,
             progress: Stages::default(),
             state: State::Waiting(Some(generator)),
+            hollowing: false,
         }
     }
 }
@@ -129,15 +136,24 @@ impl Task for GenerateSupports {
                     return PollResult::complete();
                 }
 
+                // A hollowed model is supported as it prints, inside too:
+                // once its cavity and holes are done.
+                if !model.hollow.ready(&model.mesh) {
+                    self.hollowing = true;
+                    return PollResult::pending();
+                }
+                self.hollowing = false;
+                let (mesh, bvh) = model.support_surface();
+                let own = mesh.mesh_id() == model.mesh.mesh_id();
+
                 // Without acceleration structures, build them here unless a
                 // preparation task already is; then wait for it.
-                let bvh = model.bvh.clone();
-                if bvh.is_none() && app.state.preparing.contains(&model.mesh.mesh_id()) {
+                if own && bvh.is_none() && app.state.preparing.contains(&model.mesh.mesh_id()) {
                     return PollResult::pending();
                 }
 
                 let at = Pose::of(&model.mesh);
-                let mesh = model.mesh.clone();
+                let inner = mesh.inner().clone();
                 let generator = generator.take().unwrap();
                 let generate = move |bvh: Arc<Bvh>, progress: Stages| {
                     let generated = generator.generate_supports(&mesh, &bvh, &progress.generation);
@@ -145,6 +161,8 @@ impl Task for GenerateSupports {
                     let network = generator.generate_braces(&mesh, &bvh, &generated);
                     progress.bracing.set_finished();
                     RoutedWithBraces {
+                        mesh: Box::new(mesh),
+                        own,
                         bvh,
                         generated,
                         network,
@@ -156,8 +174,9 @@ impl Task for GenerateSupports {
                         TaskThread::spawn(move || generate(bvh, progress))
                     }
                     None => {
-                        let inner = model.mesh.inner().clone();
-                        app.state.preparing.insert(model.mesh.mesh_id());
+                        if own {
+                            app.state.preparing.insert(model.mesh.mesh_id());
+                        }
                         let bvh_progress = Progress::new();
                         self.progress.bvh = Some(bvh_progress.clone());
                         let progress = self.progress.clone();
@@ -179,9 +198,17 @@ impl Task for GenerateSupports {
                     let mesh_id = (app.project.models.iter())
                         .find(|x| x.id == model_id)
                         .map(|x| x.mesh.mesh_id());
-                    if let Some(mesh_id) = mesh_id {
-                        store_bvh(&mut app.project.models, mesh_id, &out.bvh);
-                        app.state.preparing.remove(&mesh_id);
+                    match (mesh_id, out.own) {
+                        (Some(mesh_id), true) => {
+                            store_bvh(&mut app.project.models, mesh_id, &out.bvh);
+                            app.state.preparing.remove(&mesh_id);
+                        }
+                        (Some(_), false) => {
+                            let model = app.project.model(model_id).unwrap();
+                            let print = (out.mesh.mesh_id(), out.bvh.clone());
+                            model.hollow.print_bvh = Some(print);
+                        }
+                        (None, _) => {}
                     }
 
                     let taken = app.project.model(model_id).is_some_and(|model| {
@@ -190,7 +217,7 @@ impl Task for GenerateSupports {
                             at,
                             preset,
                             (out.generated, out.network),
-                            &model.mesh,
+                            &out.mesh,
                             &out.bvh,
                         )
                     });
@@ -211,6 +238,7 @@ impl Task for GenerateSupports {
 
     fn status(&self) -> Option<TaskStatus<'_>> {
         let details = match self.state {
+            State::Waiting(_) if self.hollowing => "Waiting for hollowing",
             State::Waiting(_) => "Waiting for acceleration structures",
             _ => self.progress.stage(),
         };

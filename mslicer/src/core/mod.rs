@@ -31,6 +31,7 @@ use crate::{
 
 pub mod config;
 pub mod history;
+pub mod hollow;
 pub mod islands;
 pub mod palette;
 pub mod project;
@@ -201,6 +202,7 @@ impl eframe::App for App {
         self.popup().render(ctx);
         self.tasks().poll();
         islands::update(self);
+        hollow::update(self);
 
         // todo: only update the visuals if the theme has changed?
         ctx.set_visuals(Visuals {
