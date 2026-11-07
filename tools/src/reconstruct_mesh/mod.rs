@@ -8,7 +8,7 @@ use common::{
     slice::{Layer, SliceConfig},
 };
 
-mod marching_cubes;
+pub(crate) mod marching_cubes;
 mod voxel;
 
 use slicer::geometry::mesh::Mesh;

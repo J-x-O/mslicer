@@ -15,17 +15,17 @@ use itertools::Itertools;
 use nalgebra::{Vector2, Vector3};
 use ordered_float::OrderedFloat;
 
-mod table;
-use table::{EDGE_TABLE, TRIANGULATION_TABLE};
+pub(crate) mod table;
+pub(crate) use table::{EDGE_TABLE, TRIANGULATION_TABLE};
 
 #[rustfmt::skip]
-const EDGE_CONNECTIONS: [(usize, usize); 12] = [
+pub(crate) const EDGE_CONNECTIONS: [(usize, usize); 12] = [
     (0, 1), (1, 2), (2, 3), (3, 0),
     (4, 5), (5, 6), (6, 7), (7, 4),
     (0, 4), (1, 5), (2, 6), (3, 7)
 ];
 
-const GRID_POINTS: [Vector3<u32>; 8] = [
+pub(crate) const GRID_POINTS: [Vector3<u32>; 8] = [
     Vector3::new(0, 0, 0),
     Vector3::new(1, 0, 0),
     Vector3::new(1, 0, 1),

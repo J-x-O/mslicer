@@ -28,3 +28,4 @@ i_triangle.workspace = true
 spade.workspace = true
 svg.workspace = true
 tracing.workspace = true
+boolmesh = { version = "0.2.2", features = ["rayon"] }
