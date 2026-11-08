@@ -355,6 +355,15 @@ impl Supports {
         set.supports.pop()
     }
 
+    /// Each support and where its tip meets the model (world space).
+    pub fn contacts_by_id(&self) -> Vec<(SupportId, Vector3<f32>)> {
+        let motion = (self.frame.motion_to(&self.pose)).unwrap_or_else(Isometry3::identity);
+        (self.auto.supports.iter())
+            .chain(self.manual.supports.iter())
+            .map(|s| (s.id, motion.transform_point(&s.point.pos.into()).coords))
+            .collect()
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = SupportId> + '_ {
         (self.auto.supports.iter())
             .chain(self.manual.supports.iter())

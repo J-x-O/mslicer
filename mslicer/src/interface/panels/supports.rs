@@ -548,10 +548,7 @@ fn route_under_pointer(
 
     let mut nearest = None;
     for model in (app.project.models.iter()).filter(|m| only.is_none_or(|id| m.id == id)) {
-        let Some(bvh) = model.bvh.as_ref() else {
-            continue;
-        };
-        let Some(hit) = bvh.intersect_ray(&model.mesh, pos, dir) else {
+        let Some(hit) = model.visible_hit(pos, dir, app.state.cut_height) else {
             continue;
         };
         let point = model.mesh.transform(&hit.position);

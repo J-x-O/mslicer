@@ -1,12 +1,13 @@
 use const_format::concatcp;
 use egui::{Button, ComboBox, Context, DragValue, Response, Ui, Widget};
-use egui_phosphor::regular::{CROSSHAIR, DROP, TRASH, WARNING, X};
+use egui_phosphor::regular::{DROP, MAGIC_WAND, TRASH, WARNING, X};
 
 use crate::{
     core::{
         App,
-        hollow::{self, edit},
+        hollow::{self, HoleRef, edit},
         project::{hollow::Shell, model::ModelId},
+        state::Tool,
     },
     interface::{components::grid, panels::supports::targets},
 };
@@ -16,8 +17,7 @@ const FAILED_HELP: &str = "This hole couldn't be drilled here, so it is left out
 const WALL_HELP: &str = "How thick the kept wall is. Thinner walls save more resin but are weaker.";
 const DETAIL_HELP: &str =
     "How finely the cavity follows the model. Finer takes longer on large models.";
-const PLACE_HELP: &str =
-    "Click the model to drill a hole straight in there; click a hole to remove it. Esc stops.";
+const PLACE_HELP: &str = "In the hole tool: click a hollowed model to drill a hole straight in there, click a hole to select it (Shift adds), drag a hole to move it, Delete removes the selected ones.";
 
 /// Sample spacings offered for the cavity (mm).
 const DETAIL: [(&str, f32); 3] = [("Fine", 0.3), ("Normal", 0.5), ("Coarse", 0.8)];
@@ -27,7 +27,6 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
     ui.add_space(8.0);
 
     let Some(id) = target(app) else {
-        app.state.hole_placement = false;
         ui.label("Select a model to hollow it.");
         return;
     };
@@ -46,7 +45,6 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
     // Holes drain a cavity: only a hollowed model has them.
     let hollowed = (app.project.models.iter()).any(|m| m.id == id && m.hollow.spec.shell.is_some());
     if !hollowed {
-        app.state.hole_placement = false;
         return;
     }
     ui.add_space(8.0);
@@ -149,23 +147,27 @@ fn holes(app: &mut App, ui: &mut Ui, id: ModelId) {
     });
 
     ui.horizontal_wrapped(|ui| {
-        let placing = app.state.hole_placement;
+        let active = app.state.tool == Tool::Holes;
         if ui
-            .add(Button::new(concatcp!(CROSSHAIR, " Place Holes")).selected(placing))
+            .add(Button::new(concatcp!(DROP, " Hole Tool")).selected(active))
             .on_hover_text(PLACE_HELP)
             .clicked()
         {
-            app.state.hole_placement = !placing;
+            app.state
+                .set_tool(if active { Tool::Select } else { Tool::Holes });
         }
         if ui
-            .add_enabled(drains, Button::new(concatcp!(DROP, " Add Drain Holes")))
+            .add_enabled(
+                drains,
+                Button::new(concatcp!(MAGIC_WAND, " Add Drain Holes")),
+            )
             .on_hover_text("A hole up into the lowest point of each void")
             .clicked()
         {
             hollow::add_drains(app, id);
         }
     });
-    if app.state.hole_placement {
+    if app.state.tool == Tool::Holes {
         ui.label(PLACE_HELP);
     }
     if sealed > 0 {
@@ -198,11 +200,14 @@ fn holes(app: &mut App, ui: &mut Ui, id: ModelId) {
     }
     let (mut remove, mut focus, mut hovered) = (None, None, None);
     for (index, (text, failed)) in rows.into_iter().enumerate() {
-        let shown = app.state.hole_highlight == Some((id, index));
+        let shown = app
+            .state
+            .selected_holes
+            .contains(&HoleRef { model: id, index });
         let row = ui.horizontal(|ui| {
             if ui
                 .selectable_label(shown, text)
-                .on_hover_text("Show this hole")
+                .on_hover_text("Select this hole and show it")
                 .clicked()
             {
                 focus = Some(index);
@@ -223,23 +228,16 @@ fn holes(app: &mut App, ui: &mut Ui, id: ModelId) {
             hovered = Some(index);
         }
     }
-    // The hole under the pointer stands out, else the one shown last.
-    match hovered {
-        Some(index) => app.state.hole_highlight = Some((id, index)),
-        None if (app.state.hole_highlight).is_some_and(|(m, _)| m != id) => {
-            app.state.hole_highlight = None
-        }
-        None => {}
-    }
+    // The hole under the pointer stands out in the viewport.
+    app.state.listed_hole = hovered.map(|index| HoleRef { model: id, index });
     if let Some(index) = focus {
-        app.state.hole_highlight = Some((id, index));
+        app.state.set_tool(Tool::Holes);
+        app.state.selected_holes = vec![HoleRef { model: id, index }];
         hollow::focus(app, id, index);
     }
     if ui.button(concatcp!(TRASH, " Remove All")).clicked() {
-        app.state.hole_highlight = None;
         edit(app, id, true, |spec| spec.holes.clear());
     } else if let Some(index) = remove {
-        app.state.hole_highlight = None;
         edit(app, id, true, |spec| {
             spec.holes.remove(index);
         });

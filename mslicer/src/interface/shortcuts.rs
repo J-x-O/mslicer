@@ -181,7 +181,10 @@ fn redo(app: &mut App, _ctx: &Context) {
 }
 
 fn delete_supports(app: &mut App, _ctx: &Context) {
-    delete_selected(app);
+    match app.state.tool {
+        Tool::Holes => crate::core::hollow::delete_selected(app),
+        _ => delete_selected(app),
+    }
 }
 
 fn select_none(app: &mut App, _ctx: &Context) {
@@ -206,6 +209,10 @@ fn quick_layout(app: &mut App, _ctx: &Context) {
 fn select_all(app: &mut App, _ctx: &Context) {
     // In the support tool: every support of the selected models, or with
     // none selected, every model and all their supports.
+    if app.state.tool == Tool::Holes {
+        crate::core::hollow::select_all(app);
+        return;
+    }
     if app.state.tool == Tool::Support {
         let state = &mut app.state;
         if !state.selected.has_models() {

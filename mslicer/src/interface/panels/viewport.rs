@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use egui::{
     Align2, Area, Button, Color32, Context, FontId, Frame, Id, Key, Order, Painter, PointerButton,
-    Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, Widget, pos2, vec2,
+    Pos2, Rect, Response, RichText, Sense, Slider, Stroke, StrokeKind, Theme, Ui, Vec2, Widget,
+    pos2, vec2,
 };
 use egui_phosphor::regular::{INFO, MAGNIFYING_GLASS};
 use egui_wgpu::Callback;
@@ -49,15 +50,20 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     app.state.mini_support = modifiers.command;
 
     // The left button belongs to the tools: dragging a support in the support
-    // tool moves it, any other drag draws a selection box. Alt + left orbits.
+    // tool or a hole in the hole tool moves it, any other drag draws a
+    // selection box. Alt + left orbits.
     if response.drag_started_by(PointerButton::Primary)
         && !modifiers.alt
         && app.state.select_start.is_none()
         && app.state.support_drag.is_none()
+        && app.state.hole_drag.is_none()
     {
-        let grabbed = app.state.tool == Tool::Support
-            && !shift_down
-            && start_support_drag(app, app.state.hovered_geometry);
+        let grabbed = !shift_down
+            && match app.state.tool {
+                Tool::Support => start_support_drag(app, app.state.hovered_geometry),
+                Tool::Holes => hollow::start_drag(app),
+                _ => false,
+            };
         if !grabbed {
             app.state.select_start = Some(uv);
         }
@@ -75,6 +81,7 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
             match app.state.tool {
                 Tool::Select => app.state.selected.clear(),
                 Tool::Support => app.state.selected_supports.clear(),
+                Tool::Holes => app.state.selected_holes.clear(),
                 Tool::Orient => {}
             }
         }
@@ -82,6 +89,13 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
             Tool::Support => {
                 for x in supports_in(app, &bounds) {
                     (app.state.selected_supports).select_support(x.model, x.support);
+                }
+            }
+            Tool::Holes => {
+                for hole in hollow::holes_in(app, &bounds) {
+                    if !app.state.selected_holes.contains(&hole) {
+                        app.state.selected_holes.push(hole);
+                    }
                 }
             }
             _ => pick_selection(app, bounds),
@@ -103,13 +117,14 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     if keyboard_free && ui.input(|i| i.key_pressed(Key::Escape)) {
         // Escape cancels what is under way, else clears the selection.
         let cancelled = app.state.support_drag.take().is_some()
-            || app.state.select_start.take().is_some()
-            || std::mem::take(&mut app.state.hole_placement);
+            || hollow::cancel_drag(app)
+            || app.state.select_start.take().is_some();
         if cancelled {
             app.state.support_preview = None;
         } else {
             app.state.selected.clear();
             app.state.selected_supports.clear();
+            app.state.selected_holes.clear();
         }
     }
     if keyboard_free && response.hovered() && ui.input(|i| i.key_pressed(Key::F)) {
@@ -125,7 +140,7 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     }
 
     let dragging_area = app.state.select_start.is_some();
-    let dragging_support = app.state.support_drag.is_some();
+    let dragging_support = app.state.support_drag.is_some() || app.state.hole_drag.is_some();
     let pivots = camera_pivots(app, &response, ui);
     let camera_moving = !dragging_area
         && !dragging_support
@@ -152,14 +167,17 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         islands::clear_hover(app);
     }
 
-    // Placing drain holes takes over clicks on the model from the tools.
-    if app.state.hole_placement && !is_moving {
-        hollow::track_preview(app);
+    // The hole tool: a dragged hole follows the pointer, else the pointer
+    // shows the hole under it or where a click would drill.
+    if app.state.tool == Tool::Holes && app.state.hole_drag.is_some() {
+        hollow::drag(app, !response.dragged_by(PointerButton::Primary));
+    } else if app.state.tool == Tool::Holes && !is_moving && !dragging_area {
+        hollow::track_hover(app);
     } else {
-        app.state.hole_preview = None;
+        hollow::clear_hover(app);
     }
 
-    if app.state.tool != Tool::Support || app.state.hole_placement {
+    if app.state.tool != Tool::Support {
         app.state.support_drag = None;
         app.state.support_preview = None;
     } else if dragging_support {
@@ -170,10 +188,9 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         manual_support_placement(app, false)
     }
 
-    if response.clicked() && !is_moving && app.state.hole_placement {
-        hollow::click(app);
-    } else if response.clicked() && !is_moving {
+    if response.clicked() && !is_moving {
         match app.state.tool {
+            Tool::Holes => hollow::click(app, shift_down),
             Tool::Select => match app.state.hovered_geometry {
                 Some(hover) => app.state.selected.model_clicked(hover.model, shift_down),
                 None if !shift_down => app.state.selected.clear(),
@@ -246,9 +263,11 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     painter.add(Callback::new_paint_callback(rect, callback));
 
     paint_area_selection(painter, app, &rect, px);
+    paint_hole_marks(painter, app, &rect);
     paint_notice(painter, app, &rect);
     paint_basis_vectors(painter, app, &rect);
     paint_toolbar(app, ctx, &rect);
+    paint_cut_slider(app, ctx, &rect);
 
     // Can't just use `response.contains_pointer()` since the hover overlay can
     // take focus away from the viewport.
@@ -357,7 +376,7 @@ fn pointer_hit(app: &App, (pos, dir): (Vector3<f32>, Vector3<f32>)) -> Option<f3
     let surface = (app.project.models.iter())
         .filter(|m| !m.hidden)
         .filter_map(|m| {
-            let hit = m.bvh.as_ref()?.intersect_ray(&m.mesh, pos, dir)?;
+            let hit = m.visible_hit(pos, dir, app.state.cut_height)?;
             Some((m.mesh.transform(&hit.position) - pos).norm())
         })
         .min_by(f32::total_cmp);
@@ -420,6 +439,167 @@ fn paint_area_selection(painter: &Painter, app: &mut App, rect: &Rect, px: Pos2)
         painter.rect_stroke(rect, 4.0, stroke, StrokeKind::Middle);
     }
 }
+
+/// Marks the holes on screen, so which is which reads at a glance: the
+/// selected ones with a thick accent rim, a light fill and their number, the
+/// one under the pointer (here or in the Hollowing tab's list) with a thin
+/// white rim and its number, and holes that couldn't be drilled with a red
+/// rim. Holes facing away are fainter. Shown in the hole tool, or for the
+/// list's hole.
+fn paint_hole_marks(painter: &Painter, app: &App, rect: &Rect) {
+    use crate::core::hollow::HoleRef;
+    const SIDES: usize = 32;
+    let state = &app.state;
+    if state.tool != Tool::Holes && state.listed_hole.is_none() {
+        return;
+    }
+    let view_projection = app.view_projection();
+    let project = |p: Vector3<f32>| {
+        let clip = view_projection * p.push(1.0);
+        (clip.w > 0.0).then(|| {
+            let ndc = clip.xy() / clip.w;
+            let uv = Vector2::new(ndc.x + 1.0, 1.0 - ndc.y) / 2.0;
+            rect.min + vec2(uv.x * rect.width(), uv.y * rect.height())
+        })
+    };
+    let [r, g, b] = app
+        .config
+        .ui
+        .accent_color
+        .map(|x| (x * 255.0).round() as u8);
+    let accent = Color32::from_rgb(r, g, b);
+    let [r, g, b] = app
+        .config
+        .ui
+        .warning_color
+        .map(|x| (x * 255.0).round() as u8);
+    let warning = Color32::from_rgb(r, g, b);
+    let eye = app.camera.eye();
+    let cut = state.cut_height.unwrap_or(f32::MAX);
+
+    for model in app.project.models.iter().filter(|m| !m.hidden) {
+        let Some(shell) = model.hollow.spec.shell else {
+            continue;
+        };
+        for (index, hole) in model.hollow.spec.holes.iter().enumerate() {
+            let at = HoleRef {
+                model: model.id,
+                index,
+            };
+            let selected = state.selected_holes.contains(&at);
+            let hovered = state.hovered_hole == Some(at) || state.listed_hole == Some(at);
+            let failed = model.hollow.failed(&model.mesh, index);
+            if !(selected || hovered || failed) || state.tool != Tool::Holes && !hovered {
+                continue;
+            }
+            let hole = hole.world(&model.mesh, shell);
+            if hole.point.z > cut {
+                continue;
+            }
+            let Some(d) = hole.direction.try_normalize(f32::EPSILON) else {
+                continue;
+            };
+            let side = if d.z.abs() < 0.9 {
+                Vector3::z()
+            } else {
+                Vector3::x()
+            };
+            let u = d.cross(&side).normalize();
+            let v = d.cross(&u);
+            let r = hole.diameter / 2.0;
+            let rim: Option<Vec<Pos2>> = (0..SIDES)
+                .map(|i| {
+                    let angle = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                    project(hole.point + (u * angle.cos() + v * angle.sin()) * r)
+                })
+                .collect();
+            let (Some(rim), Some(centre)) = (rim, project(hole.point)) else {
+                continue;
+            };
+            // Facing the camera: the drill goes away from it.
+            let facing = d.dot(&(hole.point - eye)) > 0.0;
+            let fade = |c: Color32| if facing { c } else { c.gamma_multiply(0.4) };
+            let (stroke, fill) = match (selected, failed, hovered) {
+                (true, true, _) => (
+                    Stroke::new(3.0_f32, fade(warning)),
+                    fade(accent).gamma_multiply(0.3),
+                ),
+                (true, false, _) => (
+                    Stroke::new(3.0_f32, fade(accent)),
+                    fade(accent).gamma_multiply(0.3),
+                ),
+                (false, _, true) => (Stroke::new(1.5_f32, fade(Color32::WHITE)), Color32::TRANSPARENT),
+                (false, true, false) => (Stroke::new(2.0_f32, fade(warning)), Color32::TRANSPARENT),
+                (false, false, false) => continue,
+            };
+            painter.add(egui::Shape::convex_polygon(
+                rim.clone(),
+                fill,
+                egui::Stroke::NONE,
+            ));
+            painter.add(egui::Shape::closed_line(rim.clone(), stroke));
+            if selected || hovered {
+                // Its number in the list, just outside the rim.
+                let right = rim.iter().map(|p| p.x).fold(centre.x, f32::max);
+                painter.text(
+                    pos2(right + 6.0, centre.y),
+                    Align2::LEFT_CENTER,
+                    format!("{}", index + 1),
+                    FontId::proportional(13.0),
+                    fade(if selected { accent } else { Color32::WHITE }),
+                );
+            }
+        }
+    }
+}
+
+/// The view's cut: a slider down the right side from the top of the models
+/// to the plate. Below the top, nothing above its height is drawn, so the
+/// models can be looked into.
+fn paint_cut_slider(app: &mut App, ctx: &Context, rect: &Rect) {
+    let top = (app.project.models.iter())
+        .filter(|m| !m.hidden)
+        .map(|m| m.bounds.max.z)
+        .fold(0.0_f32, f32::max);
+    if top <= 0.0 {
+        app.state.cut_height = None;
+        return;
+    }
+    let mut height = app.state.cut_height.unwrap_or(top).clamp(0.0, top);
+    Area::new(Id::new("cut_slider"))
+        .anchor(Align2::RIGHT_CENTER, vec2(-10.0, 0.0))
+        .constrain_to(*rect)
+        .show(ctx, |ui| {
+            Frame::new()
+                .inner_margin(Vec2::splat(8.0))
+                .corner_radius(ui.visuals().menu_corner_radius)
+                .fill(Color32::BLACK.lerp_to_gamma(Color32::TRANSPARENT, 0.25))
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let cutting = app.state.cut_height.is_some();
+                        let text = match cutting {
+                            true => format!("{height:.1} mm"),
+                            false => "Cut".to_owned(),
+                        };
+                        ui.small(text).on_hover_text(CUT_TIP);
+                        ui.spacing_mut().slider_width = (rect.height() * 0.5).max(80.0);
+                        let slider = Slider::new(&mut height, 0.0..=top)
+                            .vertical()
+                            .show_value(false)
+                            .ui(ui)
+                            .on_hover_text(CUT_TIP);
+                        if slider.double_clicked() {
+                            app.state.cut_height = None;
+                        } else if slider.changed() {
+                            // All the way up is no cut.
+                            app.state.cut_height = (height < top - 1e-3).then_some(height);
+                        }
+                    });
+                });
+        });
+}
+
+const CUT_TIP: &str = "Cut the view: nothing above this height is shown, so you can look into the models. Clicks reach what is shown. Double-click to stop.";
 
 fn paint_toolbar(app: &mut App, ctx: &Context, rect: &Rect) {
     Area::new(Id::new("toolbar"))

@@ -496,7 +496,7 @@ fn hovered(app: &App) -> Option<IslandRef> {
     let hit = (check.models.iter())
         .filter_map(|c| app.project.models.iter().find(|m| m.id == c.model))
         .filter_map(|model| {
-            let hit = model.bvh.as_ref()?.intersect_ray(&model.mesh, pos, dir)?;
+            let hit = model.visible_hit(pos, dir, app.state.cut_height)?;
             let point = model.mesh.transform(&hit.position);
             Some(((point - pos).norm(), model.id, point))
         })

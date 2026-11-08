@@ -2,7 +2,7 @@ use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use common::color::SRgb;
 use egui::Vec2;
-use egui_phosphor::regular::{CURSOR_CLICK, LINE_SEGMENT, TRIANGLE};
+use egui_phosphor::regular::{CURSOR_CLICK, DROP, LINE_SEGMENT, TRIANGLE};
 use egui_tracing::EventCollector;
 use nalgebra::{Matrix4, Vector2, Vector3};
 use slicer::geometry::mesh::{Mesh, MeshId};
@@ -12,6 +12,7 @@ use wgpu::Device;
 use crate::{
     core::{
         config::peripherals::Webhook,
+        hollow::{HoleDrag, HoleRef},
         islands::{IslandCheck, IslandSettings},
         project::model::{Model, ModelId},
         selected::{SelectedModel, SelectedPrinter, SelectedSupport, SelectedSupports},
@@ -71,13 +72,19 @@ pub struct UiState {
     pub orbit_pivot: Option<Vector3<f32>>,
     /// How new drain holes are made.
     pub hole_settings: HoleSettings,
-    /// Clicking a model drills a hole there (or removes the one clicked).
-    pub hole_placement: bool,
-    /// Where a click would drill, while placing holes (world space).
+    /// The view is cut at this height (world z): nothing above it is drawn
+    /// or hit, to see into the models.
+    pub cut_height: Option<f32>,
+    /// Where a click would drill, in the hole tool (world space).
     pub hole_preview: Option<tools::hollow::Hole>,
-    /// The hole picked out in the Hollowing tab (its model and index), to
-    /// show which one it is.
-    pub hole_highlight: Option<(ModelId, usize)>,
+    /// The holes selected in the hole tool.
+    pub selected_holes: Vec<HoleRef>,
+    /// The hole under the pointer in the hole tool.
+    pub hovered_hole: Option<HoleRef>,
+    /// The hole under the pointer in the Hollowing tab's list.
+    pub listed_hole: Option<HoleRef>,
+    /// A hole being dragged in the hole tool.
+    pub hole_drag: Option<HoleDrag>,
     pub selected_remap_point: Option<u8>,
 
     // remote send ui
@@ -149,6 +156,8 @@ pub enum Tool {
     Select,
     Support,
     Orient,
+    /// Drain holes of hollowed models: place, select, drag, remove.
+    Holes,
 }
 
 #[derive(Default)]
@@ -265,6 +274,12 @@ impl UiState {
             self.support_drag = None;
             self.support_preview = None;
         }
+        if self.tool == Tool::Holes && tool != Tool::Holes {
+            self.selected_holes.clear();
+            self.hovered_hole = None;
+            self.hole_drag = None;
+            self.hole_preview = None;
+        }
         self.tool = tool;
     }
 
@@ -286,13 +301,14 @@ impl PreviewMode {
 }
 
 impl Tool {
-    pub const ALL: [Self; 3] = [Self::Select, Self::Support, Self::Orient];
+    pub const ALL: [Self; 4] = [Self::Select, Self::Support, Self::Orient, Self::Holes];
 
     pub fn icon(&self) -> &str {
         match self {
             Tool::Select => CURSOR_CLICK,
             Tool::Support => LINE_SEGMENT,
             Tool::Orient => TRIANGLE,
+            Tool::Holes => DROP,
         }
     }
 
@@ -301,6 +317,7 @@ impl Tool {
             Tool::Select => "Select (Default)",
             Tool::Support => "Support Placement",
             Tool::Orient => "Orient to Face",
+            Tool::Holes => "Drain Holes",
         }
     }
 }

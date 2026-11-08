@@ -33,6 +33,8 @@ struct Context {
     // how many. Each is two entries, floats as bits: the point where its axis
     // meets the surface and its radius, then its direction and depth.
     holes: vec2u,
+    // Nothing above this height (world z) is drawn: the view's cut.
+    cut: f32,
 }
 
 // How far before the surface a hole starts (mm); see `HOLE_LEAD`.
@@ -65,7 +67,7 @@ fn frag(
    in: VertexOutput
 ) -> FragmentOutput {
     let state = face_state(index);
-    if (state & STATE_HIDDEN) != 0 || in_hole(in.world_position) {
+    if (state & STATE_HIDDEN) != 0 || in.world_position.z > ctx.cut || in_hole(in.world_position) {
         discard;
     }
 

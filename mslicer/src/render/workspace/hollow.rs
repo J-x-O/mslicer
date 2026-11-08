@@ -1,8 +1,13 @@
-use std::sync::Arc;
+use std::{range::Range, sync::Arc};
+
+use common::progress::Progress;
 
 use encase::{ShaderSize, ShaderType, UniformBuffer};
 use nalgebra::{Matrix4, Vector3, Vector4};
-use slicer::geometry::mesh::Mesh;
+use slicer::geometry::{
+    mesh::{Mesh, MeshId},
+    partitioning::Bvh,
+};
 use tools::hollow::{HOLE_LEAD, Hole};
 use wgpu::{
     BindGroup, BlendState, Buffer, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
@@ -14,6 +19,7 @@ use wgpu::{
 use crate::{
     core::{
         App,
+        hollow::HoleRef,
         project::{
             hollow::ModelCavity,
             model::{Model, ModelId},
@@ -27,7 +33,7 @@ use crate::{
             BASE_BIND_GROUP_LAYOUT_DESCRIPTOR, BASE_UNIFORM_DESCRIPTOR, DEPTH_STENCIL_STATE,
             bind_group,
         },
-        util::{ResizingBuffer, gpu_mesh},
+        util::{MeshBuffers, ResizingBuffer, gpu_mesh},
     },
 };
 
@@ -60,8 +66,8 @@ pub struct CavityPass {
     /// The Hollowing tab is open.
     shown: bool,
     holes: Batch,
-    /// Per hollowed model, its supports seen through it.
-    supports: Vec<(ModelId, Batch)>,
+    /// Per hollowed model, its supports inside the cavity, seen through it.
+    supports: Vec<Ghosts>,
     device: Device,
 }
 
@@ -78,13 +84,33 @@ struct CavityBatch {
     model: ModelId,
     cavity: Arc<ModelCavity>,
     batch: Batch,
+    /// Hit-testing over the cavity alone, built when first needed.
+    bvh: Option<Bvh>,
 }
+
+/// A hollowed model's supports that stand inside its cavity, seen through
+/// it: their faces in the support mesh, and what they were found for (the
+/// support mesh and the cavity).
+struct Ghosts {
+    model: ModelId,
+    batch: Batch,
+    /// The cavity by address: the `Arc` it is in is kept as long as the
+    /// cavity is shown.
+    found_for: Option<(MeshId, usize)>,
+    faces: Vec<Range<u32>>,
+}
+
+/// How close a support's tip must be to the cavity's surface to be inside
+/// it (mm).
+const INSIDE_SLACK: f32 = 0.5;
 
 #[derive(ShaderType)]
 struct HollowUniforms {
     transform: Matrix4<f32>,
+    model: Matrix4<f32>,
     camera_direction: Vector3<f32>,
     color: Vector4<f32>,
+    cut: f32,
 }
 
 const HOLE_COLOR: [f32; 4] = [0.24, 0.24, 0.26, 1.0];
@@ -96,9 +122,8 @@ const SEGMENTS: usize = 32;
 
 impl HollowPipeline {
     pub fn new(device: &Device, texture: TextureFormat) -> Self {
-        // The support preview's shader: one colour, lit, with alpha.
         let shader =
-            device.create_shader_module(include_shader!("workspace/support.wgsl", "common.wgsl"));
+            device.create_shader_module(include_shader!("workspace/hollow.wgsl", "common.wgsl"));
         let (layout, _) = Batch::new(device);
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
@@ -153,6 +178,7 @@ impl HollowPipeline {
         let accent = Vector3::from(app.config.ui.accent_color);
 
         let warning = Vector3::from(app.config.ui.warning_color);
+        let cut = app.state.cut_height.unwrap_or(f32::MAX);
         let holes = gather(app);
         // With the Hollowing tab open, the holes' insides are seen through
         // the model with the cavity instead (see `CavityPass`).
@@ -161,18 +187,42 @@ impl HollowPipeline {
             None => holes.plain,
         };
         self.holes.write(gcx, &plain.mesh());
-        (self.holes).uniform(gcx, view, camera, Vector4::from(HOLE_COLOR));
+        (self.holes).uniform(
+            gcx,
+            (view, &Matrix4::identity()),
+            camera,
+            Vector4::from(HOLE_COLOR),
+            cut,
+        );
         self.highlight.write(gcx, &holes.picked.mesh());
-        (self.highlight).uniform(gcx, view, camera, accent.push(1.0));
+        (self.highlight).uniform(
+            gcx,
+            (view, &Matrix4::identity()),
+            camera,
+            accent.push(1.0),
+            cut,
+        );
         self.failed.write(gcx, &holes.failed.mesh());
-        (self.failed).uniform(gcx, view, camera, warning.push(1.0));
+        (self.failed).uniform(
+            gcx,
+            (view, &Matrix4::identity()),
+            camera,
+            warning.push(1.0),
+            cut,
+        );
 
         let mut preview = Shape::default();
         if let Some(hole) = &app.state.hole_preview {
             ring(hole, &mut preview);
         }
         self.preview.write(gcx, &preview.mesh());
-        self.preview.uniform(gcx, view, camera, accent.push(0.8));
+        self.preview.uniform(
+            gcx,
+            (view, &Matrix4::identity()),
+            camera,
+            accent.push(0.8),
+            cut,
+        );
     }
 
     pub fn paint(&self, render_pass: &mut RenderPass) {
@@ -263,6 +313,7 @@ impl CavityPass {
         let camera = app.camera.position(1.0);
         let accent = Vector3::from(app.config.ui.accent_color);
         self.shown = app.panels.find_tab(&Tab::Hollow).is_some();
+        let cut = app.state.cut_height.unwrap_or(f32::MAX);
         let wanted: Vec<_> = (app.project.models.iter())
             .filter(|m| !m.hidden)
             .filter_map(|m| {
@@ -277,7 +328,7 @@ impl CavityPass {
             (wanted.iter()).any(|(id, cavity, ..)| *id == c.model && Arc::ptr_eq(cavity, &c.cavity))
         });
         self.supports
-            .retain(|(id, _)| wanted.iter().any(|(m, ..)| m == id));
+            .retain(|g| wanted.iter().any(|(m, ..)| *m == g.model));
         for (id, cavity, model) in wanted {
             let index = match self.cavities.iter().position(|c| c.model == id) {
                 Some(index) => index,
@@ -287,10 +338,15 @@ impl CavityPass {
                     let faces = mesh.faces().iter().map(|f| [f[0], f[2], f[1]]).collect();
                     let mut batch = Batch::new(&self.device).1;
                     batch.write(gcx, &Mesh::new(mesh.vertices().to_vec(), faces));
+                    // A new cavity: which supports stand in it is found again.
+                    (self.supports.iter_mut())
+                        .filter(|g| g.model == id)
+                        .for_each(|g| g.found_for = None);
                     self.cavities.push(CavityBatch {
                         model: id,
                         cavity: cavity.clone(),
                         batch,
+                        bvh: None,
                     });
                     self.cavities.len() - 1
                 }
@@ -303,20 +359,46 @@ impl CavityPass {
             let matrix = model.mesh.transformation_matrix();
             let local = model.mesh.inv_transform_normal(&camera).normalize();
             let color = accent.push(CAVITY_ALPHA);
-            (self.cavities[index].batch).uniform(gcx, view * matrix, local, color);
+            (self.cavities[index].batch).uniform(gcx, (view, matrix), local, color, cut);
 
-            if let Some((mesh, _)) = model.supports.mesh() {
-                let index = match self.supports.iter().position(|(m, _)| *m == id) {
-                    Some(index) => index,
+            if let Some((mesh, faces)) = model.supports.mesh() {
+                let at = match self.supports.iter().position(|g| g.model == id) {
+                    Some(at) => at,
                     None => {
-                        self.supports.push((id, Batch::new(&self.device).1));
+                        self.supports.push(Ghosts {
+                            model: id,
+                            batch: Batch::new(&self.device).1,
+                            found_for: None,
+                            faces: Vec::new(),
+                        });
                         self.supports.len() - 1
                     }
                 };
+                // Which supports stand inside: once per support mesh and
+                // cavity.
+                let key = (mesh.mesh_id(), Arc::as_ptr(&cavity) as usize);
+                if self.supports[at].found_for != Some(key) {
+                    let entry = &mut self.cavities[index];
+                    let cavity = &entry.cavity.mesh;
+                    let bvh = (entry.bvh)
+                        .get_or_insert_with(|| Bvh::build(cavity.inner(), Progress::new()));
+                    let inside = (model.supports.contacts_by_id().into_iter())
+                        .filter(|(_, contact)| {
+                            let local = model.mesh.inv_transform(contact);
+                            (bvh.closest(cavity, local)).is_some_and(|hit| {
+                                let on = model.mesh.transform(&hit.position);
+                                (on - contact).norm() < INSIDE_SLACK
+                            })
+                        })
+                        .filter_map(|(support, _)| faces.get(&support).cloned());
+                    let ghosts = &mut self.supports[at];
+                    ghosts.faces = inside.collect();
+                    ghosts.found_for = Some(key);
+                }
                 let matrix = mesh.transformation_matrix();
                 let local = mesh.inv_transform_normal(&camera).normalize();
                 let color = Vector4::from(GHOST_COLOR);
-                (self.supports[index].1).uniform(gcx, view * matrix, local, color);
+                (self.supports[at].batch).uniform(gcx, (view, matrix), local, color, cut);
             }
         }
 
@@ -325,7 +407,13 @@ impl CavityPass {
             false => Shape::default(),
         };
         self.holes.write(gcx, &holes.mesh());
-        (self.holes).uniform(gcx, view, camera, accent.push(CAVITY_ALPHA));
+        (self.holes).uniform(
+            gcx,
+            (view, &Matrix4::identity()),
+            camera,
+            accent.push(CAVITY_ALPHA),
+            cut,
+        );
     }
 
     /// With the Hollowing tab open: the hollowing seen through the models.
@@ -336,15 +424,10 @@ impl CavityPass {
         render_pass.set_pipeline(&self.pipeline);
         self.cavities.iter().for_each(|c| c.batch.draw(render_pass));
         self.holes.draw(render_pass);
-        for (id, batch) in &self.supports {
-            let model = app.project.models.iter().find(|m| m.id == *id);
-            if let Some((buffers, count)) = model.and_then(|m| m.supports.try_get_buffers()) {
-                batch.draw_with(
-                    render_pass,
-                    &buffers.vertex_buffer,
-                    &buffers.index_buffer,
-                    count,
-                );
+        for ghosts in self.supports.iter().filter(|g| !g.faces.is_empty()) {
+            let model = app.project.models.iter().find(|m| m.id == ghosts.model);
+            if let Some((buffers, _)) = model.and_then(|m| m.supports.try_get_buffers()) {
+                ghosts.batch.draw_faces(render_pass, buffers, &ghosts.faces);
             }
         }
     }
@@ -373,17 +456,29 @@ fn gather(app: &App) -> Holes {
         };
         for (index, hole) in model.hollow.spec.holes.iter().enumerate() {
             let world = hole.world(&model.mesh, shell);
-            let picked = app.state.hole_highlight == Some((model.id, index));
+            let hole_ref = HoleRef {
+                model: model.id,
+                index,
+            };
+            // Selected ones in the accent colour; the screen marks tell
+            // the rest apart (see `paint_hole_marks`).
+            let picked = app.state.selected_holes.contains(&hole_ref);
             if model.hollow.failed(&model.mesh, index) {
-                ring(&world, &mut holes.failed);
+                // Picked, it is marked like any other, to drag somewhere
+                // better.
+                ring(
+                    &world,
+                    if picked {
+                        &mut holes.picked
+                    } else {
+                        &mut holes.failed
+                    },
+                );
                 continue;
             }
             let start = surface(model, &world);
             match picked {
-                true => {
-                    wall(&world, &start, &mut holes.picked);
-                    ring(&world, &mut holes.picked);
-                }
+                true => wall(&world, &start, &mut holes.picked),
                 false => wall(&world, &start, &mut holes.plain),
             }
         }
@@ -523,17 +618,22 @@ impl Batch {
         (layout, batch)
     }
 
+    /// With `model` taking the batch's vertices into world space, and the
+    /// view's cut height.
     fn uniform(
         &self,
         gcx: &Gcx,
-        transform: Matrix4<f32>,
+        (view, model): (Matrix4<f32>, &Matrix4<f32>),
         camera_direction: Vector3<f32>,
         color: Vector4<f32>,
+        cut: f32,
     ) {
         let uniform = HollowUniforms {
-            transform,
+            transform: view * model,
+            model: *model,
             camera_direction,
             color,
+            cut,
         };
         let mut buffer = UniformBuffer::new(Vec::new());
         buffer.write(&uniform).unwrap();
@@ -551,18 +651,20 @@ impl Batch {
         self.index_buffer.write_slice(gcx, indices);
     }
 
-    /// Draws another mesh's buffers with this batch's uniforms.
-    fn draw_with(
+    /// Draws some faces of another mesh's buffers with this batch's
+    /// uniforms.
+    fn draw_faces(
         &self,
         render_pass: &mut RenderPass,
-        vertices: &Buffer,
-        indices: &Buffer,
-        count: u32,
+        buffers: &MeshBuffers,
+        faces: &[Range<u32>],
     ) {
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.set_vertex_buffer(0, vertices.slice(..));
-        render_pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        render_pass.draw_indexed(0..count, 0, 0..1);
+        render_pass.set_vertex_buffer(0, buffers.vertex_buffer.slice(..));
+        render_pass.set_index_buffer(buffers.index_buffer.slice(..), IndexFormat::Uint32);
+        for range in faces {
+            render_pass.draw_indexed(range.start * 3..range.end * 3, 0, 0..1);
+        }
     }
 
     fn draw(&self, render_pass: &mut RenderPass) {

@@ -84,6 +84,8 @@ struct Uniforms {
     overhang_color: Vector3<f32>,
     /// The model's holes in the storage buffer: start, count.
     holes: Vector2<u32>,
+    /// Nothing above this height (world z) is drawn.
+    cut: f32,
 }
 
 impl BasePass {
@@ -426,6 +428,7 @@ impl BaseResources {
         let accent = Vector3::from(app.config.ui.accent_color);
         let warning = app.config.ui.warning_color;
         let overhang_color = app.config.render.overhang_color;
+        let cut = app.state.cut_height.unwrap_or(f32::MAX);
         self.write_uniforms(gcx, app, &pass.group_layout, |app, gcx, model_id| {
             let (tool, hover) = (app.state.tool, app.state.hovered_geometry);
             let moving = [app.state.support_drag, app.state.support_settling];
@@ -455,12 +458,13 @@ impl BaseResources {
                 warning: warning.into(),
                 overhang_color: overhang_color.into(),
                 holes: Vector2::zeros(),
+                cut,
             };
 
             let mut states = Selected::default();
             selected.then(|| states.set_all(FaceState::Outlined));
             match tool {
-                Tool::Select => {
+                Tool::Select | Tool::Holes => {
                     (selected && hovered).then(|| states.set_all(FaceState::Hovered));
                 }
                 Tool::Orient => {
@@ -492,7 +496,7 @@ impl BaseResources {
                 let (mesh, support_faces) = model.supports.mesh().as_ref().unwrap();
                 let support_color = match tool {
                     // Supports move with their model, so they wear its colour.
-                    Tool::Select | Tool::Orient => {
+                    Tool::Select | Tool::Orient | Tool::Holes => {
                         if selected || hovered {
                             own
                         } else {
@@ -529,7 +533,7 @@ impl BaseResources {
                     }
                 };
                 match tool {
-                    Tool::Select => {
+                    Tool::Select | Tool::Holes => {
                         (selected && hovered).then(|| states.set_all(FaceState::Hovered));
                     }
                     Tool::Support => {
@@ -596,6 +600,7 @@ impl BaseResources {
                 warning: Vector3::zeros(),
                 overhang_color: Vector3::zeros(),
                 holes: Vector2::zeros(),
+                cut: f32::MAX,
             };
 
             let selected = Selected::default().into_inner();

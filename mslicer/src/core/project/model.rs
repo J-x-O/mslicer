@@ -10,7 +10,7 @@ use common::{
 use nalgebra::Vector3;
 use wgpu::Device;
 
-use slicer::geometry::{bounds::Bounds3D, mesh::Mesh, partitioning::Bvh};
+use slicer::geometry::{Hit, bounds::Bounds3D, mesh::Mesh, partitioning::Bvh};
 
 use crate::{
     core::{
@@ -149,6 +149,24 @@ impl Model {
     pub fn randomize_color(&mut self, warning: [f32; 3]) -> &mut Self {
         self.color = palette::random_model_color(warning);
         self
+    }
+
+    /// Where a ray (world space) first meets the model's surface where it
+    /// is shown: at or below the view's `cut` height, if there is one. Needs
+    /// the hit-testing structure.
+    pub fn visible_hit(
+        &self,
+        origin: Vector3<f32>,
+        direction: Vector3<f32>,
+        cut: Option<f32>,
+    ) -> Option<Hit> {
+        let bvh = self.bvh.as_ref()?;
+        let Some(cut) = cut else {
+            return bvh.intersect_ray(&self.mesh, origin, direction);
+        };
+        (bvh.intersect_ray_all(&self.mesh, origin, direction)
+            .into_iter())
+        .find(|hit| self.mesh.transform(&hit.position).z <= cut)
     }
 
     /// The surface supports are placed and routed on: the mesh as it
