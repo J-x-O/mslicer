@@ -17,6 +17,7 @@ use crate::{
         App,
         history::ModelAction,
         project::{model::ModelId, supports::Pose},
+        stack,
     },
     interface::panels::Tab,
     task::{BuildAccelerationStructures, DetectIslands},
@@ -275,8 +276,9 @@ pub fn update(app: &mut App) {
     let Some(mut check) = app.state.island_check.take() else {
         return;
     };
-    // The check lives in its panel: closing the panel ends it.
-    if app.panels.find_tab(&Tab::Islands).is_none() {
+    // The check lives in its panel (the Islands tab, or the Supports
+    // operation in Properties): closing it ends the check.
+    if !app.panels.is_open(Tab::Islands) && !app.panels.is_open(Tab::Properties) {
         app.state.support_preview = None;
         return;
     }
@@ -291,10 +293,12 @@ pub fn update(app: &mut App) {
 
     let mut changed = false;
     for checked in &mut check.models {
-        let model = models.iter().find(|m| m.id == checked.model).unwrap();
+        let Some(model) = models.iter().find(|m| m.id == checked.model) else {
+            continue;
+        };
         let now = Pose::of(&model.mesh);
         // Islands are found on the mesh as it prints, inner walls included.
-        let print = model.hollow.print_mesh(&model.mesh);
+        let print = model.print_mesh();
 
         if checked
             .result
@@ -469,8 +473,13 @@ fn support_many(app: &mut App, islands: &[IslandRef]) -> usize {
             check.unroutable = Some(at);
             continue;
         };
+        if !stack::supports_editable(model) {
+            continue;
+        }
         if tracked.insert(at.model) {
-            (app.history).track_model(at.model, ModelAction::Supports(model.supports.snapshot()));
+            let action = ModelAction::Supports(model.supports.snapshot());
+            let action = stack::supports_action(model, action);
+            (app.history).track_model(at.model, action);
         }
         model
             .supports

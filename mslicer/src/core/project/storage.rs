@@ -1,13 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use const_format::concatcp;
 use nalgebra::Vector3;
 
 use crate::core::project::{
     Collection, CollectionId, PostProcessing, Project, RenameState, SupportConfig,
-    hollow::HollowSpec,
+    hollow::{FrozenHollow, HollowSpec, read_mesh_inner, valid_mesh, write_mesh_inner},
     model::{MeshUnit, Model},
+    stack::Stack,
 };
 use common::{
     progress::Progress,
@@ -16,12 +17,14 @@ use common::{
     units::{Milimeter, Milimeters},
 };
 use slicer::{
-    geometry::mesh::{Mesh, MeshInner},
+    geometry::mesh::{Mesh, MeshId, MeshInner},
     post_process::{
         elephant_foot_fixer::ElephantFootFixer, variable_layer_height::VariableLayerHeight,
     },
 };
-use tools::supports::{SupportSet, auto::PlacementConfig, mesh::SupportPreset, raft::RaftConfig};
+use tools::supports::{
+    SupportId, SupportSet, auto::PlacementConfig, mesh::SupportPreset, raft::RaftConfig,
+};
 
 /// Project format version. Value should be incremented whenever the save format
 /// changes, even in development so anyone using the dev/prerelease versions
@@ -53,7 +56,16 @@ use tools::supports::{SupportSet, auto::PlacementConfig, mesh::SupportPreset, ra
 ///   settings it was built with) per model, and the project's support settings.
 /// - v18 (v0.11.0) — Store each model's hollowing: the wall kept and the drain
 ///   holes.
-const VERSION: u16 = 18;
+/// - v19 (v0.11.0) — Operation stacks: each model stores its source mesh (as
+///   imported, never repaired or flipped in place) and its operations (Mesh
+///   Repair, Flip Winding Order, Hollow, Orient, Supports) with their modes.
+///   Older projects get a stack made from what they have (see
+///   [`Stack::migrated`]); their stored mesh becomes the source.
+/// - v20 (v0.11.0) — Hollow rows store their auto-hole diameter.
+/// - v21 (v0.11.0) — Frozen results are saved: a frozen geometry row's
+///   surface, a frozen Hollow's cavity and drilled print mesh. Supports that
+///   couldn't follow their model keep their mark.
+const VERSION: u16 = 21;
 const DESCRIPTION: &str = concatcp!(
     "Saved by mslicer v",
     crate::VERSION,
@@ -77,6 +89,11 @@ struct ModelInfo {
     supports: (SupportSet, SupportSet),
     raft: RaftConfig,
     hollow: HollowSpec,
+    stack: Stack,
+    stranded: Vec<SupportId>,
+    frozen_outdated: bool,
+    frozen_surface: Option<MeshInner>,
+    frozen_hollow: Option<FrozenHollow>,
 }
 
 impl ModelInfo {
@@ -95,6 +112,14 @@ impl ModelInfo {
             supports: model.supports.world_sets(),
             raft: model.supports.raft(),
             hollow: model.hollow.spec.clone(),
+            stack: model.stack.clone(),
+            stranded: model.supports.stranded().unwrap_or_default().to_vec(),
+            frozen_outdated: model.supports.frozen_outdated(),
+            frozen_surface: model.frozen_surface().map(|m| MeshInner {
+                vertices: m.vertices.clone(),
+                faces: m.faces.clone(),
+            }),
+            frozen_hollow: FrozenHollow::of(&model.hollow),
         }
     }
 
@@ -114,7 +139,17 @@ impl ModelInfo {
             .with_unit(self.unit);
 
         (model.supports).restore(self.supports.0, self.supports.1, self.raft);
+        model
+            .supports
+            .set_marks(self.stranded, self.frozen_outdated);
         model.hollow.spec = self.hollow;
+        model.stack = self.stack;
+        if let Some(surface) = self.frozen_surface {
+            model.restore_frozen_surface(Arc::new(surface));
+        }
+        if let Some(frozen) = self.frozen_hollow {
+            frozen.restore(&mut model.hollow, &model.mesh.clone());
+        }
         model
     }
 
@@ -147,10 +182,25 @@ impl ModelInfo {
         self.supports.1.serialize(ser);
         self.raft.serialize(ser);
         self.hollow.serialize(ser);
+        self.stack.serialize(ser);
+
+        ser.write_u32_be(self.stranded.len() as u32);
+        self.stranded
+            .iter()
+            .for_each(|id| ser.write_u32_be(id.raw()));
+        ser.write_bool(self.frozen_outdated);
+        ser.write_bool(self.frozen_surface.is_some());
+        if let Some(surface) = &self.frozen_surface {
+            write_mesh_inner(ser, surface);
+        }
+        ser.write_bool(self.frozen_hollow.is_some());
+        if let Some(frozen) = &self.frozen_hollow {
+            frozen.serialize(ser);
+        }
     }
 
     pub fn deserialize<T: Deserializer>(des: &mut T, version: u16) -> Self {
-        Self {
+        let mut info = Self {
             mesh: des.read_u32_be(),
             collection: if version < 9 {
                 None
@@ -189,7 +239,37 @@ impl ModelInfo {
             } else {
                 HollowSpec::deserialize(des)
             },
+            stack: Stack::default(),
+            stranded: Vec::new(),
+            frozen_outdated: false,
+            frozen_surface: None,
+            frozen_hollow: None,
+        };
+        info.stack = if version < 19 {
+            let (auto, manual) = &info.supports;
+            Stack::migrated(
+                &info.hollow,
+                !auto.supports.is_empty(),
+                !manual.supports.is_empty(),
+            )
+        } else {
+            Stack::deserialize(des, version)
+        };
+        if version >= 21 {
+            info.stranded = des.read_list(|des| SupportId::from_raw(des.read_u32_be()));
+            info.frozen_outdated = des.read_bool();
+            info.frozen_surface = des.read_bool().then(|| read_mesh_inner(des));
+            // The cavity holds on to its source only so its key stays
+            // unique while cached; the model's own mesh does that here.
+            let placeholder = Arc::new(MeshInner {
+                vertices: Box::new([]),
+                faces: Box::new([]),
+            });
+            info.frozen_hollow = des
+                .read_bool()
+                .then(|| FrozenHollow::deserialize(des, placeholder));
         }
+        info
     }
 }
 
@@ -210,15 +290,16 @@ impl Project {
         let mut map = HashMap::new();
         let mut meshes = Vec::new();
 
+        // Each model's source, once per shared source.
         ser.write_u32_be(self.models.len() as u32);
         for model in self.models.iter() {
-            let id = model.mesh.mesh_id();
+            let id = MeshId::for_mesh_inner(&model.source);
             let mesh = match map.get(&id) {
                 Some(mesh) => *mesh,
                 None => {
                     let mesh = map.len() as u32;
-                    meshes.push(model.mesh.inner().clone());
-                    total += model.mesh.vertex_count() + model.mesh.face_count();
+                    meshes.push(model.source.clone());
+                    total += model.source.vertices.len() + model.source.faces.len();
                     map.insert(id, mesh);
                     mesh
                 }
@@ -258,10 +339,7 @@ impl Project {
         let slice_config = SliceConfig::deserialize(des, version)?;
         let post_processing = PostProcessing::deserialize(des, version);
 
-        let models = des.read_u32_be();
-        let models = (0..models)
-            .map(|_| ModelInfo::deserialize(des, version))
-            .collect::<Vec<_>>();
+        let models = des.read_list(|des| ModelInfo::deserialize(des, version));
 
         // Keep generated support ids ahead of anything already in the file.
         for info in &models {
@@ -273,21 +351,24 @@ impl Project {
         }
 
         let meshes = des.read_u32_be();
-        progress.set_total((des.size() - des.pos()) as u64);
-        let meshes = (0..meshes)
-            .map(|_| Arc::new(deserialize_mesh_inner(des, &progress)))
-            .collect::<Vec<_>>();
+        progress.set_total(des.size().saturating_sub(des.pos()) as u64);
+        let mut mesh_list = Vec::new();
+        for _ in 0..meshes {
+            if des.truncated() {
+                break;
+            }
+            mesh_list.push(Arc::new(deserialize_mesh_inner(des, &progress)));
+        }
 
         let models = (models.into_iter())
             .map(|x| {
-                let mesh = meshes[x.mesh as usize].clone();
-                x.into_model(mesh)
+                let mesh = mesh_list.get(x.mesh as usize).cloned();
+                let mesh = mesh.with_context(|| format!("model `{}` has no mesh", x.name))?;
+                Ok(x.into_model(mesh))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        let collections = (0..des.read_u32_be())
-            .map(|_| Collection::deserialize(des))
-            .collect::<Vec<_>>();
+        let collections = des.read_list(|des| Collection::deserialize(des));
 
         // kinda jank but it's whatever
         if let Some(max_id) = collections.iter().map(|x| x.id.raw()).max() {
@@ -300,6 +381,10 @@ impl Project {
             SupportConfig::deserialize(des)
         };
 
+        ensure!(
+            !des.truncated(),
+            "The project file is cut short or damaged."
+        );
         progress.set_finished();
         Ok(Self {
             path: None,
@@ -393,20 +478,50 @@ fn serialize_mesh_inner<T: Serializer>(ser: &mut T, mesh: &Arc<MeshInner>, progr
 }
 
 fn deserialize_mesh_inner<T: Deserializer>(des: &mut T, progress: &Progress) -> MeshInner {
-    let verts = des.read_u32_be();
-    let verts = (0..verts)
-        .map(|_| Vector3::<f32>::deserialize(des))
-        .inspect(|_| progress.add_complete(4 * 3))
-        .collect::<Vec<_>>();
+    let verts = des.read_list(|des| {
+        progress.add_complete(4 * 3);
+        Vector3::<f32>::deserialize(des)
+    });
+    let faces = des.read_list(|des| {
+        progress.add_complete(4 * 3);
+        [des.read_u32_be(), des.read_u32_be(), des.read_u32_be()]
+    });
+    valid_mesh(verts, faces)
+}
 
-    let faces = des.read_u32_be();
-    let faces = (0..faces)
-        .map(|_| [des.read_u32_be(), des.read_u32_be(), des.read_u32_be()])
-        .inspect(|_| progress.add_complete(4 * 3))
-        .collect::<Vec<_>>();
+#[cfg(test)]
+mod tests {
+    use std::fs;
 
-    MeshInner {
-        vertices: verts.into_boxed_slice(),
-        faces: faces.into_boxed_slice(),
+    use common::serde::SliceDeserializer;
+
+    use super::*;
+    use crate::regression::project_path;
+
+    fn load(data: &[u8]) -> Result<Project> {
+        Project::deserialize(&mut SliceDeserializer::new(data), Progress::new())
+    }
+
+    #[test]
+    fn a_cut_short_project_fails_to_load() {
+        let data = fs::read(project_path("hollowed")).unwrap();
+        assert!(load(&data).is_ok());
+        let step = (data.len() / 300).max(1);
+        for len in (0..data.len()).step_by(step) {
+            assert!(load(&data[..len]).is_err(), "cut at {len} loads");
+        }
+    }
+
+    #[test]
+    fn a_damaged_project_does_not_crash() {
+        let data = fs::read(project_path("hollowed")).unwrap();
+        let step = (data.len() / 300).max(1);
+        for at in (0..data.len()).step_by(step) {
+            let mut damaged = data.clone();
+            let end = (at + 4).min(damaged.len());
+            damaged[at..end].fill(0xff);
+            // Loads or fails; it doesn't panic or run out of memory.
+            let _ = load(&damaged);
+        }
     }
 }

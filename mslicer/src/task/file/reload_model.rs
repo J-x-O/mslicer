@@ -1,13 +1,13 @@
-use std::{fs::File, io::BufReader, mem, path::PathBuf};
+use std::{mem, path::PathBuf};
 
-use anyhow::Context;
+use anyhow::Result;
 use clone_macro::clone;
-use common::{progress::Progress, serde::ReaderDeserializer};
-use mesh_format::{Format, load_mesh};
+use common::progress::Progress;
 
 use slicer::geometry::mesh::Mesh;
 use tracing::info;
 
+use super::mesh::read_mesh;
 use crate::{
     core::project::model::ModelId,
     task::{MeshAnalysis, PollResult, Task, TaskApp, TaskStatus, thread::TaskThread},
@@ -15,7 +15,7 @@ use crate::{
 
 pub struct ReloadModel {
     progress: Progress,
-    handle: TaskThread<Mesh>,
+    handle: TaskThread<Result<Mesh>>,
 
     model: ModelId,
     path: PathBuf,
@@ -24,17 +24,11 @@ pub struct ReloadModel {
 
 impl ReloadModel {
     pub fn new(model: ModelId, name: String, path: PathBuf) -> Self {
-        let ext = (path.extension().context("Unspecified file type").unwrap()).to_string_lossy();
-        let format = Format::from_extension(&ext).unwrap();
-
-        let file = File::open(&path).unwrap();
-        let des = ReaderDeserializer::new(BufReader::new(file));
-
         let progress = Progress::new();
         Self {
-            handle: TaskThread::spawn(clone!([progress], move || {
-                let mesh = load_mesh(des, format, &progress).unwrap();
-                Mesh::new_boxed_centered(mesh.verts, mesh.faces)
+            handle: TaskThread::spawn(clone!([progress, path], move || {
+                let ext = path.extension().unwrap_or_default().to_string_lossy();
+                read_mesh(&path, &ext, &progress)
             })),
             progress,
 
@@ -47,7 +41,7 @@ impl ReloadModel {
 
 impl Task for ReloadModel {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
-        (self.handle.poll(app, "Failed to Load Model")).into_poll_result(|mesh| {
+        (self.handle.poll_result(app, "Failed to Load Model")).into_poll_result(|mesh| {
             info!(
                 "Reloaded model `{}` with {} faces",
                 self.name,

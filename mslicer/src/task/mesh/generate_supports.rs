@@ -16,6 +16,7 @@ use crate::{
         model::{Model, ModelId},
         supports::Pose,
     },
+    engine::CancelToken,
     task::{PollResult, Task, TaskApp, TaskStatus, store_bvh, thread::TaskThread},
 };
 
@@ -112,13 +113,16 @@ impl GenerateSupports {
         model: &mut Model,
     ) -> Self {
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-        model.supports.begin_generation(token);
+        let cancel = CancelToken::new();
+        model.supports.begin_generation(token, cancel.clone());
         let generator = AutoPlacement::new(placement, support.clone(), platform);
+        let mut progress = Stages::default();
+        progress.generation.cancel = cancel.shared();
         Self {
             model: model.id,
             token,
             preset: support,
-            progress: Stages::default(),
+            progress,
             state: State::Waiting(Some(generator)),
             hollowing: false,
         }
@@ -138,7 +142,7 @@ impl Task for GenerateSupports {
 
                 // A hollowed model is supported as it prints, inside too:
                 // once its cavity and holes are done.
-                if !model.hollow.ready(&model.mesh) {
+                if !model.ready() {
                     self.hollowing = true;
                     return PollResult::pending();
                 }
@@ -154,11 +158,17 @@ impl Task for GenerateSupports {
 
                 let at = Pose::of(&model.mesh);
                 let inner = mesh.inner().clone();
-                let generator = generator.take().unwrap();
+                let Some(generator) = generator.take() else {
+                    return PollResult::complete();
+                };
                 let generate = move |bvh: Arc<Bvh>, progress: Stages| {
                     let generated = generator.generate_supports(&mesh, &bvh, &progress.generation);
                     progress.bracing.set_total(1);
-                    let network = generator.generate_braces(&mesh, &bvh, &generated);
+                    // Cancelled: the result is dropped anyway.
+                    let network = match progress.generation.is_cancelled() {
+                        true => BraceNetwork::default(),
+                        false => generator.generate_braces(&mesh, &bvh, &generated),
+                    };
                     progress.bracing.set_finished();
                     RoutedWithBraces {
                         mesh: Box::new(mesh),
@@ -190,6 +200,15 @@ impl Task for GenerateSupports {
                 PollResult::pending()
             }
             State::Running { at, handle } => {
+                // Lifting the model for the generation sends the hand-placed
+                // supports to be routed again: the new auto supports join them
+                // once they have.
+                let rerouting = (app.project.models.iter())
+                    .find(|x| x.id == self.model)
+                    .is_some_and(|m| m.supports.needs_reroute());
+                if rerouting {
+                    return PollResult::pending();
+                }
                 let at = *at;
                 let result = handle.poll(app, "Failed to Generate Supports");
                 let (model_id, token) = (self.model, self.token);
@@ -204,9 +223,10 @@ impl Task for GenerateSupports {
                             app.state.preparing.remove(&mesh_id);
                         }
                         (Some(_), false) => {
-                            let model = app.project.model(model_id).unwrap();
-                            let print = (out.mesh.mesh_id(), out.bvh.clone());
-                            model.hollow.print_bvh = Some(print);
+                            if let Some(model) = app.project.model(model_id) {
+                                let print = (out.mesh.mesh_id(), out.bvh.clone());
+                                model.hollow.print_bvh = Some(print);
+                            }
                         }
                         (None, _) => {}
                     }

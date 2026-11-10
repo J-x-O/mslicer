@@ -1,3 +1,5 @@
+use anyhow::Context as _;
+use std::io::BufReader;
 use std::{fs::File, mem, sync::Arc};
 
 use common::{misc::separate_thousands, slice::format::RasterFormat};
@@ -136,13 +138,20 @@ fn source_ui(app: &mut PopupApp, ui: &mut Ui, id: SourceId) {
             app.tasks.add(FileDialog::pick_file(
                 ("Sliced", &["goo", "ctb", "nanodlp"]),
                 move |app, path, _tasks| {
-                    let file = File::open(path).unwrap();
-                    let ext = path.extension().unwrap().to_string_lossy();
-                    let format = RasterFormat::from_extension(&ext).unwrap();
-
+                    let file = (|| -> anyhow::Result<_> {
+                        let ext = path.extension().unwrap_or_default().to_string_lossy();
+                        let format = RasterFormat::from_extension(&ext)
+                            .context("Not a sliced file format mslicer reads")?;
+                        let file = BufReader::new(File::open(path)?);
+                        util::load_sliced(&format, file)
+                    })()
+                    .with_context(|| format!("Couldn't read `{}`", path.display()));
+                    let Some(file) = app.popup.report("Failed to Load Sliced File", file) else {
+                        return;
+                    };
                     *app.state.tools.sliced_diff.source_mut(id) = Source::File {
                         path: path.to_path_buf(),
-                        file: Arc::new(util::load_sliced(&format, file).unwrap()),
+                        file: Arc::new(file),
                     };
                 },
             ));
@@ -153,7 +162,7 @@ fn source_ui(app: &mut PopupApp, ui: &mut Ui, id: SourceId) {
                 ui.label("Unspecified");
             }
             Source::File { path, file } => {
-                let name = path.file_name().unwrap().to_string_lossy();
+                let name = crate::task::file_name(path);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.label(RichText::new(name).underline())

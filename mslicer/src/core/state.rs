@@ -12,11 +12,16 @@ use wgpu::Device;
 use crate::{
     core::{
         config::peripherals::Webhook,
+        focus::FocusState,
         hollow::{HoleDrag, HoleRef},
         islands::{IslandCheck, IslandSettings},
-        project::model::{Model, ModelId},
+        project::{
+            model::{Model, ModelId},
+            stack::OperationId,
+        },
         selected::{SelectedModel, SelectedPrinter, SelectedSupport, SelectedSupports},
     },
+    engine::layer::LayerPreview,
     interface::tools::Tools,
     render::util::MeshBuffers,
     util::misc::DefaultNum,
@@ -38,6 +43,10 @@ pub struct UiState {
     // selections
     pub select_start: Option<Vec2>,
     pub selected: SelectedModel,
+    /// What the Properties panel shows.
+    pub focus: FocusState,
+    /// "Show result up to here": the viewport leaves out what comes after this operation.
+    pub show_up_to: Option<(ModelId, OperationId)>,
     pub selected_printer: SelectedPrinter,
     pub selected_supports: SelectedSupports,
     pub support_preview: Option<Mesh>,
@@ -75,6 +84,14 @@ pub struct UiState {
     /// The view is cut at this height (world z): nothing above it is drawn
     /// or hit, to see into the models.
     pub cut_height: Option<f32>,
+    /// The top of the models when the cut was set: when it changes (the
+    /// models are turned, lifted onto supports, …) the cut keeps its place
+    /// relative to it.
+    pub cut_top: f32,
+    /// The layer at the cut, sliced on its own.
+    pub layer_preview: LayerPreview,
+    /// The preview image of the layer shown, keyed by the layer's address.
+    pub layer_texture: Option<(usize, egui::TextureHandle)>,
     /// Where a click would drill, in the hole tool (world space).
     pub hole_preview: Option<tools::hollow::Hole>,
     /// The holes selected in the hole tool.

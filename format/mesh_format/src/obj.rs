@@ -70,7 +70,8 @@ fn next_face<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<[u32; 3]> {
     fn next_idx<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<u32> {
         let str = parts.next()?;
         let number = str.split_once('/').map(|x| x.0).unwrap_or(str);
-        Some(number.parse::<u32>().ok()? - 1)
+        // OBJ counts from 1.
+        number.parse::<u32>().ok()?.checked_sub(1)
     }
 
     Some([

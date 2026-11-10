@@ -4,7 +4,7 @@ use crate::{
 };
 
 pub struct Webhook {
-    handle: TaskThread<()>,
+    handle: TaskThread<anyhow::Result<()>>,
 }
 
 impl Webhook {
@@ -15,7 +15,8 @@ impl Webhook {
 
         Self {
             handle: TaskThread::spawn(move || {
-                request.send(body).unwrap();
+                request.send(body)?;
+                Ok(())
             }),
         }
     }
@@ -24,7 +25,7 @@ impl Webhook {
 impl Task for Webhook {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
         self.handle
-            .poll(app, "Failed to Send Webhook")
+            .poll_result(app, "Failed to Send Webhook")
             .into_poll_result(|_| PollResult::complete())
     }
 }

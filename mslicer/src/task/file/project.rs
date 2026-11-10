@@ -1,17 +1,20 @@
 use std::{
     collections::HashSet,
     fs::File,
-    io::{BufReader, BufWriter},
+    io::BufReader,
     path::{Path, PathBuf},
 };
 
+use anyhow::{Context, Result};
 use clone_macro::clone;
 use common::{
+    fs::write_atomic,
     progress::Progress,
     serde::{ReaderDeserializer, WriterSerializer},
 };
 use tracing::info;
 
+use super::file_name;
 use crate::{
     core::project::Project,
     task::{MeshAnalysis, PollResult, Task, TaskApp, TaskStatus, thread::TaskThread},
@@ -22,14 +25,14 @@ type Callback = Box<dyn FnOnce(&mut TaskApp) -> Vec<Box<dyn Task>>>;
 pub struct ProjectLoad {
     progress: Progress,
     path: PathBuf,
-    handle: TaskThread<Project>,
+    handle: TaskThread<Result<Project>>,
 }
 
 pub struct ProjectSave {
     progress: Progress,
     path: PathBuf,
 
-    handle: TaskThread<()>,
+    handle: TaskThread<Result<()>>,
     callback: Option<Callback>,
 }
 
@@ -38,13 +41,7 @@ impl ProjectLoad {
         let progress = Progress::new();
 
         info!("Loading project from `{}`", path.display());
-        let handle = TaskThread::spawn(clone!([progress, path], move || {
-            let file = File::open(&path).unwrap();
-            let mut des = ReaderDeserializer::new(BufReader::new(file));
-            Project::deserialize(&mut des, progress)
-                .unwrap()
-                .with_path(path)
-        }));
+        let handle = TaskThread::spawn(clone!([progress, path], move || { load(&path, progress) }));
 
         Self {
             progress,
@@ -60,9 +57,7 @@ impl ProjectSave {
 
         info!("Saving project to `{}`", path.display());
         let handle = TaskThread::spawn(clone!([progress, path], move || {
-            let file = File::create(path).unwrap();
-            let mut ser = WriterSerializer::new(BufWriter::new(file));
-            project.serialize(&mut ser, progress);
+            save(&project, &path, progress)
         }));
 
         Self {
@@ -87,7 +82,7 @@ impl ProjectSave {
 
 impl Task for ProjectLoad {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
-        (self.handle.poll(app, "Failed to Load Project")).into_poll_result(|project| {
+        (self.handle.poll_result(app, "Failed to Load Project")).into_poll_result(|project| {
             app.config.add_recent_project(self.path.to_path_buf());
             *app.project = project;
             app.history.clear();
@@ -127,7 +122,7 @@ impl Task for ProjectLoad {
 
 impl Task for ProjectSave {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
-        (self.handle.poll(app, "Failed to Save Project")).into_poll_result(|_| {
+        (self.handle.poll_result(app, "Failed to Save Project")).into_poll_result(|_| {
             app.config.add_recent_project(self.path.to_path_buf());
             if let Some(callback) = self.callback.take() {
                 PollResult::complete().with_tasks(callback(app))
@@ -146,6 +141,23 @@ impl Task for ProjectSave {
     }
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name().unwrap().to_string_lossy().into_owned()
+fn load(path: &Path, progress: Progress) -> Result<Project> {
+    let file = File::open(path).with_context(|| format!("Couldn't open `{}`", path.display()))?;
+    let mut des = ReaderDeserializer::new(BufReader::new(file));
+    let project = Project::deserialize(&mut des, progress);
+    if let Some(error) = des.error() {
+        anyhow::bail!("Couldn't read `{}`: {error}", path.display());
+    }
+    Ok(project?.with_path(path.to_path_buf()))
+}
+
+/// Writes the project next to `path` and renames it over: a failed save
+/// leaves the old file.
+fn save(project: &Project, path: &Path, progress: Progress) -> Result<()> {
+    write_atomic(path, |out| {
+        let mut ser = WriterSerializer::new(out);
+        project.serialize(&mut ser, progress);
+        ser.finish().map(drop)
+    })
+    .with_context(|| format!("Couldn't save `{}`", path.display()))
 }

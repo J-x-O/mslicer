@@ -7,7 +7,7 @@ use crate::{
     core::{App, project::Project, state::Tool},
     include_asset,
     interface::{panels::supports::delete_selected, popup::confirm_unsaved},
-    task::{AutoLayout, FileDialog, LoadSliced, MeshLoad, MultiFileDialog},
+    task::{AutoLayout, FileDialog, LoadSliced, MeshLoad, MultiFileDialog, file_name},
 };
 
 const COMMAND_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
@@ -116,11 +116,11 @@ fn import_model(app: &mut App, _ctx: &Context) {
         ("Mesh", &["stl", "obj"]),
         |_app, paths, tasks| {
             for path in paths {
-                let name = path.file_name().unwrap().to_str().unwrap().to_string();
+                let name = file_name(path);
                 let ext = path.extension();
                 let format = ext.unwrap_or_default().to_string_lossy();
 
-                let task = MeshLoad::file(path.to_path_buf(), name, format.into()).unwrap();
+                let task = MeshLoad::file(path.to_path_buf(), name, format.into());
                 tasks.push(Box::new(task));
             }
         },

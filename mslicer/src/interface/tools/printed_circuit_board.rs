@@ -1,4 +1,7 @@
-use std::{fs::File, io::Write};
+use anyhow::Context as _;
+use std::io::Write;
+
+use common::fs::write_atomic;
 
 use common::units::Micrometer;
 use egui::{Align, Button, ComboBox, DragValue, Layout, Ui, Widget, vec2};
@@ -45,11 +48,11 @@ pub fn interface(app: &mut PopupApp, ui: &mut Ui) -> bool {
                 let svg = tool.svg();
                 app.tasks.add(FileDialog::save_file(
                     ("SVG", &["svg"]),
-                    move |_app, path, _tasks| {
-                        File::create(path.with_extension("svg"))
-                            .unwrap()
-                            .write_all(svg.as_bytes())
-                            .unwrap();
+                    move |app, path, _tasks| {
+                        let path = path.with_extension("svg");
+                        let result = write_atomic(&path, |out| out.write_all(svg.as_bytes()))
+                            .with_context(|| format!("Couldn't save `{}`", path.display()));
+                        app.popup.report("Failed to Export SVG", result);
                     },
                 ));
             }

@@ -16,7 +16,9 @@ pub fn icon() -> IconData {
 
 #[cfg(not(target_os = "macos"))]
 pub fn icon() -> IconData {
-    let icon = image::load_from_memory(include_dist!("icon.png")).unwrap();
+    let Ok(icon) = image::load_from_memory(include_dist!("icon.png")) else {
+        return IconData::default();
+    };
     IconData {
         rgba: icon.to_rgba8().to_vec(),
         width: icon.width(),

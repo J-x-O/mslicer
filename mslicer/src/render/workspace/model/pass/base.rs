@@ -474,7 +474,12 @@ impl BaseResources {
                 }
                 Tool::Support => {}
             }
-            let holes = hole_words(model);
+            let hidden = crate::core::focus::hidden(app.state.show_up_to, model);
+            let holes = if hidden.hollow {
+                Vec::new()
+            } else {
+                hole_words(model)
+            };
             let mut out = vec![(
                 Draw::Model,
                 base.clone(),
@@ -490,7 +495,11 @@ impl BaseResources {
                 out.push((Draw::Cavity, cavity, Vec::new(), holes));
             }
 
-            if model.supports.get_buffers(&gcx.device).is_some() {
+            // A bypassed Supports row hides them.
+            if model.stack.supports_active()
+                && !hidden.supports
+                && model.supports.get_buffers(&gcx.device).is_some()
+            {
                 let hovered_support = (hover.filter(|hit| hit.support && hit.model == model_id))
                     .and_then(|hit| model.supports.support_for_face(hit.face));
                 let (mesh, support_faces) = model.supports.mesh().as_ref().unwrap();
@@ -624,7 +633,7 @@ impl BaseResources {
 /// base.wgsl), in world space.
 fn hole_words(model: &Model) -> Vec<[u32; 4]> {
     // Holes drain a cavity: only a hollowed model has them.
-    let Some(shell) = model.hollow.spec.shell else {
+    let Some(shell) = model.hollow_shell() else {
         return Vec::new();
     };
     (model.hollow.spec.holes.iter().enumerate())

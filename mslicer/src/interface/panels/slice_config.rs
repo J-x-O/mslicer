@@ -44,6 +44,14 @@ const ANTI_ALIAS_TIP: &str = "Uses supersampling anti-aliasing (SSAA) to pick gr
 const TRANSITION_LAYER_TIP: &str = "Transition layers interpolate between the first exposure settings and the normal exposure settings.";
 
 pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
+    profile(app, ui);
+    ui.add_space(8.0);
+    ui.heading("Post Processors");
+    layer_ops(app, ui);
+}
+
+/// The printer, slice mode and exposure settings: the Print node's Profile.
+pub fn profile(app: &mut App, ui: &mut Ui) {
     ui.add_enabled_ui(
         app.project.slice_config != app.config.default_slice_config,
         |ui| {
@@ -291,10 +299,11 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
             }),
         );
     });
+}
 
-    ui.add_space(8.0);
-    ui.heading("Post Processors");
-
+/// The post processors working on the sliced layers: the Print node's Layer ops.
+pub fn layer_ops(app: &mut App, ui: &mut Ui) {
+    let slice_config = &mut app.project.slice_config;
     ui.collapsing("Exposure Remapping", |ui| {
         exposure_remapping(
             &mut slice_config.exposure_remap,
@@ -631,7 +640,7 @@ fn exposure_remapping(
                     1 => remap.control[0] = pointer - Vector2::new(0.0, remap.start),
                     2 => remap.control[1] = pointer - Vector2::new(1.0, remap.end),
                     3 => remap.end = pointer.y,
-                    _ => unreachable!(),
+                    _ => {}
                 }
             }
 

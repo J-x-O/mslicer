@@ -889,9 +889,7 @@ impl Support {
         let id = SupportId::from_raw(des.read_u32_be());
         let point = SupportPoint::deserialize(des);
         let foot = Foot::deserialize(des);
-        let parts = (0..des.read_u32_be())
-            .map(|_| Part::deserialize(des))
-            .collect();
+        let parts = des.read_list(|des| Part::deserialize(des));
         let group = des.read_u32_be();
         let preset = SupportPreset::deserialize(des);
         Self {
@@ -931,13 +929,9 @@ impl SupportSet {
     pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
         let lift = des.read_f32_be();
 
-        let supports = (0..des.read_u32_be())
-            .map(|_| Support::deserialize(des))
-            .collect();
+        let supports = des.read_list(|des| Support::deserialize(des));
 
-        let braces = (0..des.read_u32_be())
-            .map(|_| Part::deserialize(des))
-            .collect();
+        let braces = des.read_list(|des| Part::deserialize(des));
 
         let raft = des.read_bool().then(|| Raft::deserialize(des));
 

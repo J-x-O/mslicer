@@ -105,11 +105,12 @@ impl GenericSliceData {
         config: &SliceConfig,
         preview_image: &RgbaImage,
         format: Format,
-    ) -> DynSlicedFile {
-        match &self {
+    ) -> anyhow::Result<DynSlicedFile> {
+        Ok(match &self {
             GenericSliceData::Raster { data, voxels } => {
                 progress.set_total(data.len() as u64);
-                let format = format.as_raster().unwrap();
+                let format = (format.as_raster())
+                    .ok_or_else(|| anyhow::anyhow!("{} can't hold raster layers", format.name()))?;
                 let mut file =
                     util::export_raster(progress, config, data.par_iter(), *voxels, format);
                 file.set_preview(preview_image);
@@ -124,7 +125,7 @@ impl GenericSliceData {
                 let file = SvgFile::new(platform, data.clone());
                 Box::new(file)
             }
-        }
+        })
     }
 }
 

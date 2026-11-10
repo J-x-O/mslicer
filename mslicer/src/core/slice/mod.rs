@@ -19,11 +19,14 @@ use crate::{
         },
         state::PreviewModel,
     },
+    engine::{CancelToken, InputHash},
     render::camera::Camera,
     util::management::LazyTextureId,
 };
 
 pub mod annotations;
+pub mod estimate;
+pub mod key;
 pub mod result;
 pub mod runner;
 
@@ -34,6 +37,11 @@ pub struct SliceOperation {
 
 pub struct SliceOperationInner {
     start_time: Instant,
+    /// What was sliced, if it was the project ([`key::slice_key`]): the
+    /// result is current while the project's key is the same.
+    pub key: Option<InputHash>,
+    /// Stops the slice once it is superseded.
+    pub cancel: CancelToken,
     pub progress: Progress,
     pub post_processing_progress: CombinedProgress<2>,
     pub result: Mutex<Option<SliceResult>>,
@@ -61,6 +69,8 @@ impl SliceOperation {
         Self {
             inner: Arc::new(SliceOperationInner {
                 start_time: Instant::now(),
+                key: None,
+                cancel: CancelToken::new(),
                 progress: slice,
                 post_processing_progress: post_process,
                 result: Mutex::new(None),
@@ -68,6 +78,21 @@ impl SliceOperation {
                 previews: Mutex::new(Default::default()),
                 interactive_previews,
             }),
+        }
+    }
+}
+
+impl SliceOperation {
+    /// Records which project inputs this slice is of.
+    pub fn with_key(self, key: InputHash) -> Self {
+        // A shared operation keeps no key, so it never counts as current.
+        let mut inner = match Arc::try_unwrap(self.inner) {
+            Ok(inner) => inner,
+            Err(inner) => return Self { inner },
+        };
+        inner.key = Some(key);
+        Self {
+            inner: Arc::new(inner),
         }
     }
 }
@@ -84,8 +109,9 @@ impl SliceOperationInner {
         });
     }
 
-    pub fn preview(&self) -> Arc<RgbaImage> {
-        self.previews.lock().as_ref().unwrap().image.clone()
+    /// The preview image, once the slice has made one.
+    pub fn preview(&self) -> Option<Arc<RgbaImage>> {
+        Some(self.previews.lock().as_ref()?.image.clone())
     }
 
     pub fn add_raster_result(
@@ -160,7 +186,9 @@ impl SliceOperationInner {
     }
 
     pub fn set_loaded(&self) {
-        self.result().as_mut().unwrap().sliced = false;
+        if let Some(result) = self.result().as_mut() {
+            result.sliced = false;
+        }
     }
 
     pub fn result(&self) -> MutexGuard<'_, Option<SliceResult>> {

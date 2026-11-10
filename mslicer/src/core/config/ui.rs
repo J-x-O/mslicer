@@ -13,12 +13,17 @@ pub const B_PER_MIB: usize = 0x100000;
 pub struct UiConfig {
     pub theme: Theme,
     pub panels: Option<Tree<Tab>>,
+    /// The version of the default layout `panels` was made from; an older
+    /// or unknown one is replaced by the current default once.
+    pub layout_version: u32,
     pub about: bool,
     pub tasks: bool,
     pub history_max_mesh_size: u32, // in MiB
     pub quick_layout_spacing: Milimeters,
     pub hover_overlay: bool,
     pub hover_overlay_detail: bool,
+    /// Show the layer at the cut while scrubbing.
+    pub layer_preview: bool,
     /// Build every model's acceleration structures as soon as it is loaded.
     pub auto_prepare: bool,
     /// The colour of the selection box and the Orient tool's face highlight,
@@ -82,12 +87,14 @@ impl Default for UiConfig {
         Self {
             theme: Theme::Dark,
             panels: None,
+            layout_version: 0,
             about: true,
             tasks: true,
             history_max_mesh_size: 20,
             quick_layout_spacing: Milimeters::new(2.0),
             hover_overlay: true,
             hover_overlay_detail: false,
+            layer_preview: true,
             auto_prepare: true,
             accent_color: [0.2, 0.5, 1.0],
             warning_color: [1.0, 0.1, 0.1],

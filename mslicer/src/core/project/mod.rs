@@ -15,8 +15,11 @@ use slicer::post_process::{
 };
 use tools::supports::{auto::PlacementConfig, mesh::SupportPreset};
 
+pub mod geometry;
 pub mod hollow;
 pub mod model;
+pub mod reroute;
+pub mod stack;
 pub mod storage;
 pub mod supports;
 

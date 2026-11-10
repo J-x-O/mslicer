@@ -2,8 +2,7 @@ use std::collections::HashSet;
 
 use egui::{
     Align2, Area, Button, Color32, Context, FontId, Frame, Id, Key, Order, Painter, PointerButton,
-    Pos2, Rect, Response, RichText, Sense, Slider, Stroke, StrokeKind, Theme, Ui, Vec2, Widget,
-    pos2, vec2,
+    Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind, Theme, Ui, Vec2, Widget, pos2, vec2,
 };
 use egui_phosphor::regular::{INFO, MAGNIFYING_GLASS};
 use egui_wgpu::Callback;
@@ -13,7 +12,7 @@ use tools::supports::PartKind;
 
 use crate::{
     core::{
-        App,
+        App, focus,
         history::ModelAction,
         hollow, islands,
         project::model::Model,
@@ -22,6 +21,7 @@ use crate::{
     },
     interface::{
         components::grid,
+        panels::scrubber,
         panels::supports::{drag_support, manual_support_placement, start_support_drag},
     },
     render::{
@@ -241,10 +241,10 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
                     );
                     app.history.track_model(model.id, undo);
 
-                    let center = model.bounds.center();
+                    let (center, floor) = (model.bounds.center(), model.floor());
                     model.set_rotation(&platform, rotation);
                     model.set_bounds_center(&platform, center);
-                    model.align_to_bed();
+                    model.set_down(&platform, floor);
                 }
             }
         }
@@ -267,7 +267,7 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
     paint_notice(painter, app, &rect);
     paint_basis_vectors(painter, app, &rect);
     paint_toolbar(app, ctx, &rect);
-    paint_cut_slider(app, ctx, &rect);
+    scrubber::paint(app, ctx, &rect);
 
     // Can't just use `response.contains_pointer()` since the hover overlay can
     // take focus away from the viewport.
@@ -478,10 +478,10 @@ fn paint_hole_marks(painter: &Painter, app: &App, rect: &Rect) {
     let cut = state.cut_height.unwrap_or(f32::MAX);
 
     for model in app.project.models.iter().filter(|m| !m.hidden) {
-        let Some(shell) = model.hollow.spec.shell else {
+        let Some(shell) = model.hollow_shell() else {
             continue;
         };
-        for (index, hole) in model.hollow.spec.holes.iter().enumerate() {
+        for (index, hole) in model.hollow.all_holes(&model.mesh).iter().enumerate() {
             let at = HoleRef {
                 model: model.id,
                 index,
@@ -528,7 +528,10 @@ fn paint_hole_marks(painter: &Painter, app: &App, rect: &Rect) {
                     Stroke::new(3.0_f32, fade(accent)),
                     fade(accent).gamma_multiply(0.3),
                 ),
-                (false, _, true) => (Stroke::new(1.5_f32, fade(Color32::WHITE)), Color32::TRANSPARENT),
+                (false, _, true) => (
+                    Stroke::new(1.5_f32, fade(Color32::WHITE)),
+                    Color32::TRANSPARENT,
+                ),
                 (false, true, false) => (Stroke::new(2.0_f32, fade(warning)), Color32::TRANSPARENT),
                 (false, false, false) => continue,
             };
@@ -553,54 +556,6 @@ fn paint_hole_marks(painter: &Painter, app: &App, rect: &Rect) {
     }
 }
 
-/// The view's cut: a slider down the right side from the top of the models
-/// to the plate. Below the top, nothing above its height is drawn, so the
-/// models can be looked into.
-fn paint_cut_slider(app: &mut App, ctx: &Context, rect: &Rect) {
-    let top = (app.project.models.iter())
-        .filter(|m| !m.hidden)
-        .map(|m| m.bounds.max.z)
-        .fold(0.0_f32, f32::max);
-    if top <= 0.0 {
-        app.state.cut_height = None;
-        return;
-    }
-    let mut height = app.state.cut_height.unwrap_or(top).clamp(0.0, top);
-    Area::new(Id::new("cut_slider"))
-        .anchor(Align2::RIGHT_CENTER, vec2(-10.0, 0.0))
-        .constrain_to(*rect)
-        .show(ctx, |ui| {
-            Frame::new()
-                .inner_margin(Vec2::splat(8.0))
-                .corner_radius(ui.visuals().menu_corner_radius)
-                .fill(Color32::BLACK.lerp_to_gamma(Color32::TRANSPARENT, 0.25))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        let cutting = app.state.cut_height.is_some();
-                        let text = match cutting {
-                            true => format!("{height:.1} mm"),
-                            false => "Cut".to_owned(),
-                        };
-                        ui.small(text).on_hover_text(CUT_TIP);
-                        ui.spacing_mut().slider_width = (rect.height() * 0.5).max(80.0);
-                        let slider = Slider::new(&mut height, 0.0..=top)
-                            .vertical()
-                            .show_value(false)
-                            .ui(ui)
-                            .on_hover_text(CUT_TIP);
-                        if slider.double_clicked() {
-                            app.state.cut_height = None;
-                        } else if slider.changed() {
-                            // All the way up is no cut.
-                            app.state.cut_height = (height < top - 1e-3).then_some(height);
-                        }
-                    });
-                });
-        });
-}
-
-const CUT_TIP: &str = "Cut the view: nothing above this height is shown, so you can look into the models. Clicks reach what is shown. Double-click to stop.";
-
 fn paint_toolbar(app: &mut App, ctx: &Context, rect: &Rect) {
     Area::new(Id::new("toolbar"))
         .anchor(Align2::LEFT_TOP, Vec2::splat(10.0))
@@ -621,7 +576,7 @@ fn paint_toolbar(app: &mut App, ctx: &Context, rect: &Rect) {
 
                         let shortcut = ui.input(|x| x.key_pressed(NUMBER_KEYS[i + 1]))
                             && !ui.ctx().wants_keyboard_input();
-                        (button.clicked() || shortcut).then(|| app.state.set_tool(tool));
+                        (button.clicked() || shortcut).then(|| focus::pick_tool(app, tool));
                     }
 
                     ui.separator();

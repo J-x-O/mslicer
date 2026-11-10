@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::{fs::File, io::BufReader, sync::Arc};
 
 use common::units::Milimeters;
@@ -30,18 +31,22 @@ pub fn interface(app: &mut PopupApp, ui: &mut Ui) -> bool {
             app.tasks.add(FileDialog::pick_file(
                 ("Image", IMAGE_FORMATS),
                 |app, path, _tasks| {
-                    let format = ImageFormat::from_path(path).unwrap();
-                    let file = BufReader::new(File::open(path).unwrap());
-                    let image = image::load(file, format).unwrap().to_luma8();
-
-                    app.state.tools.image.data = Some(Arc::new((image, path.to_path_buf())));
+                    let image = (|| -> anyhow::Result<_> {
+                        let format = ImageFormat::from_path(path)?;
+                        let file = BufReader::new(File::open(path)?);
+                        Ok(image::load(file, format)?.to_luma8())
+                    })()
+                    .with_context(|| format!("Couldn't read `{}`", path.display()));
+                    if let Some(image) = app.popup.report("Failed to Load Image", image) {
+                        app.state.tools.image.data = Some(Arc::new((image, path.to_path_buf())));
+                    }
                 },
             ));
         }
 
         // todo: make this a component, i think its also used in height map and phonograph record
         if let Some(path) = tool.data.as_ref().map(|x| &x.1) {
-            let name = path.file_name().unwrap().to_string_lossy();
+            let name = crate::task::file_name(path);
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;

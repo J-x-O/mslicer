@@ -1,5 +1,6 @@
 use std::{fs, net::Ipv4Addr, str::FromStr, sync::Arc, time::Duration};
 
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use clone_macro::clone;
 use common::{misc::human_duration, slice::format::RasterFormat, units::Miliseconds};
@@ -52,14 +53,16 @@ pub(crate) fn initialize(app: &mut App) {
         move |client: &Client| {
             let print_info = &client.print_info;
             if completion.alert {
-                Notification::new()
+                let shown = Notification::new()
                     .summary("Print Complete")
                     .body(&format!(
                         "Printer `{}` has finished printing `{}`.",
                         client.name, print_info.filename
                     ))
-                    .show()
-                    .unwrap();
+                    .show();
+                if let Err(e) = shown {
+                    warn!("Couldn't show the print-complete notification: {e}");
+                }
             }
 
             let webhook = &completion.webhook;
@@ -68,13 +71,21 @@ pub(crate) fn initialize(app: &mut App) {
                     .replace("%file%", &print_info.filename)
                     .replace("%printer%", &client.name);
                 let task = Webhook::new(&webhook.url, body, webhook.content_type);
-                sender.send(Box::new(task)).unwrap();
+                if sender.send(Box::new(task)).is_err() {
+                    warn!("Couldn't queue the print-complete webhook");
+                }
             }
         }
     );
 
-    app.remote_print.init(ports, timeout, callback).unwrap();
-    app.remote_print.http.set_proxy_enabled(status_proxy);
+    let result = app.remote_print.init(ports, timeout, callback);
+    if app
+        .popup
+        .report("Couldn't Start Remote Print", result)
+        .is_some()
+    {
+        app.remote_print.http.set_proxy_enabled(status_proxy);
+    }
 }
 
 pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
@@ -123,7 +134,8 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
                         Align::Min,
                     );
 
-                let last_update = DateTime::from_timestamp(client.last_update, 0).unwrap();
+                let last_update =
+                    DateTime::from_timestamp(client.last_update, 0).unwrap_or_default();
                 if (Utc::now() - last_update).num_seconds() > TIMEOUT_S {
                     RichText::new(concatcp!("  ", PLUGS)).strong().append_to(
                         &mut job,
@@ -148,9 +160,10 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
                         } else {
                             ui.horizontal(|ui| {
                                 if can_print && ui.button(concatcp!(PRINTER, " Print")).clicked() {
-                                    app.remote_print
-                                        .print(&client.mainboard, &file_transfer.filename)
-                                        .unwrap();
+                                    let result = app
+                                        .remote_print
+                                        .print(&client.mainboard, &file_transfer.filename);
+                                    app.popup.report("Couldn't Start the Print", result);
                                 }
 
                                 if paused {
@@ -434,7 +447,8 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
 
         if app.remote_print.is_initialized() && last_timeout != config.timeout {
             let duration = Duration::from_secs_f32(config.timeout);
-            app.remote_print.set_timeout(duration).unwrap();
+            let result = app.remote_print.set_timeout(duration);
+            app.popup.report("Couldn't Change the Timeout", result);
         }
     });
 }
@@ -458,12 +472,15 @@ fn upload_file(app: &mut App, mainboard_id: String) {
         };
 
         info!("Uploading local file {file:?} to printer `{mainboard_id}`");
-        let data = Arc::new(fs::read(&file).unwrap());
+        let data = fs::read(&file).with_context(|| format!("Couldn't read `{}`", file.display()));
+        let Some(data) = app.popup.report("Couldn't Upload", data) else {
+            return;
+        };
 
-        let file_name = file.file_name().unwrap().to_string_lossy();
+        let file_name = crate::task::file_name(&file);
         let file_name = file_name.rsplit_once('.').map(|x| x.0).unwrap_or_default();
-        app.remote_print
-            .upload(&mainboard_id, data, file_name.to_owned(), format)
-            .unwrap();
+        let result =
+            (app.remote_print).upload(&mainboard_id, Arc::new(data), file_name.to_owned(), format);
+        app.popup.report("Couldn't Upload", result);
     }
 }

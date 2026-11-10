@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::{
     core::App,
     interface::popup::confirm_unsaved,
-    task::{LoadSliced, MeshLoad, ProjectLoad},
+    task::{LoadSliced, MeshLoad, ProjectLoad, file_name},
 };
 
 pub struct Args {
@@ -68,8 +68,8 @@ impl OpenInto {
         }
 
         for (ext, path) in self.models {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            app.tasks.add(MeshLoad::file(path, name, ext).unwrap());
+            let name = file_name(&path);
+            app.tasks.add(MeshLoad::file(path, name, ext));
         }
     }
 }

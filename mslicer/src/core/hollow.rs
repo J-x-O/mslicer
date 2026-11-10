@@ -2,10 +2,7 @@
 //! mesh up to date, edits a model's hollowing with undo, and the hole tool:
 //! placing, selecting, dragging and removing drain holes in the viewport.
 
-use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::Instant,
-};
+use std::time::Instant;
 
 use nalgebra::{Vector2, Vector3};
 use slicer::geometry::bounds::Bounds2D;
@@ -46,7 +43,7 @@ pub struct HoleDrag {
 /// that are gone.
 pub fn update(app: &mut App) {
     let exists = |models: &[Model], h: &HoleRef| {
-        (models.iter()).any(|m| m.id == h.model && h.index < m.hollow.spec.holes.len())
+        (models.iter()).any(|m| m.id == h.model && h.index < m.hollow.all_holes(&m.mesh).len())
     };
     let models = &app.project.models;
     app.state.selected_holes.retain(|h| exists(models, h));
@@ -62,19 +59,18 @@ pub fn update(app: &mut App) {
     let now = Instant::now();
     let mut tasks: Vec<Box<dyn Task>> = Vec::new();
     for model in app.project.models.iter_mut() {
-        if let Some(key) = model.hollow.poll(&model.mesh, now) {
-            let cancel = Arc::new(AtomicBool::new(false));
-            model.hollow.pending = Some((key, cancel.clone()));
-            tasks.push(Box::new(HollowModel::new(model, key, cancel, diameter)));
+        // A bypassed Hollow row computes nothing, and stops what runs.
+        if !model.stack.hollow_active() {
+            model.hollow.cavity.withdraw();
+            model.hollow.drilled.withdraw();
+            continue;
         }
-        let hollow = &mut model.hollow;
-        if !hollow.drilling
-            && dragged != Some(model.id)
-            && hollow.wants_drilling(&model.mesh)
-            && let Some(input) = hollow.drill_input(&model.mesh)
-        {
-            hollow.drilling = true;
-            tasks.push(Box::new(DrillHoles::new(model.id, input)));
+        if let Some(ticket) = model.hollow.poll(&model.mesh, now) {
+            tasks.push(Box::new(HollowModel::new(model, ticket, diameter)));
+        }
+        let hold = dragged == Some(model.id);
+        if let Some((ticket, input)) = model.hollow.poll_drilling(&model.mesh, hold) {
+            tasks.push(Box::new(DrillHoles::new(model.id, ticket, input)));
         }
     }
     tasks.into_iter().for_each(|task| app.tasks.add_boxed(task));
@@ -131,7 +127,7 @@ pub fn focus(app: &mut App, id: ModelId, index: usize) {
     let Some(hole) = model.hollow.spec.holes.get(index) else {
         return;
     };
-    let Some(shell) = model.hollow.spec.shell else {
+    let Some(shell) = model.hollow_shell() else {
         return;
     };
     let hole = hole.world(&model.mesh, shell);
@@ -181,8 +177,9 @@ pub fn clear_hover(app: &mut App) {
 /// pointer is) falls within.
 fn hole_at(app: &App, id: ModelId, world: &tools::hollow::Hole) -> Option<HoleRef> {
     let model = app.project.models.iter().find(|m| m.id == id)?;
-    let shell = model.hollow.spec.shell?;
-    let (index, _) = (model.hollow.spec.holes.iter().enumerate())
+    let shell = model.hollow_shell()?;
+    // Manual holes first, then the auto holes (pinned when grabbed).
+    let (index, _) = (model.hollow.all_holes(&model.mesh).iter().enumerate())
         .map(|(index, h)| (index, h.world(&model.mesh, shell)))
         .filter(|(_, h)| (h.point - world.point).norm() < h.diameter / 2.0 + GRAB_SLACK)
         .min_by(|a, b| {
@@ -208,6 +205,7 @@ fn prepare_hovered(app: &mut App) {
 /// with nothing under the pointer clears the selection.
 pub fn click(app: &mut App, shift: bool) {
     if let Some(hole) = app.state.hovered_hole {
+        let hole = pin(app, hole);
         let selected = &mut app.state.selected_holes;
         match (shift, selected.iter().position(|h| *h == hole)) {
             (true, Some(at)) => {
@@ -245,6 +243,7 @@ pub fn start_drag(app: &mut App) -> bool {
     let Some(hole) = app.state.hovered_hole else {
         return false;
     };
+    let hole = pin(app, hole);
     let Some(model) = app.project.models.iter().find(|m| m.id == hole.model) else {
         return false;
     };
@@ -298,6 +297,26 @@ pub fn cancel_drag(app: &mut App) -> bool {
     true
 }
 
+/// Makes an auto hole a manual one where it is now, so it stays put in model
+/// space from here on (one undo step). Returns where it is now; a manual
+/// hole is returned as it is.
+pub fn pin(app: &mut App, hole: HoleRef) -> HoleRef {
+    let Some(model) = app.project.models.iter().find(|m| m.id == hole.model) else {
+        return hole;
+    };
+    let manual = model.hollow.spec.holes.len();
+    let Some(auto) = (hole.index.checked_sub(manual))
+        .and_then(|i| model.hollow.auto_holes(&model.mesh).get(i).copied())
+    else {
+        return hole;
+    };
+    edit(app, hole.model, true, |spec| spec.holes.push(auto));
+    HoleRef {
+        model: hole.model,
+        index: manual,
+    }
+}
+
 /// Removes the selected holes, each model's in one undo step.
 pub fn delete_selected(app: &mut App) {
     let selected = std::mem::take(&mut app.state.selected_holes);
@@ -332,7 +351,7 @@ pub fn holes_in(app: &App, area: &Bounds2D<f32>) -> Vec<HoleRef> {
     };
     let mut out = Vec::new();
     for model in app.project.models.iter().filter(|m| !m.hidden) {
-        let Some(shell) = model.hollow.spec.shell else {
+        let Some(shell) = model.hollow_shell() else {
             continue;
         };
         for (index, hole) in model.hollow.spec.holes.iter().enumerate() {
@@ -350,7 +369,7 @@ pub fn holes_in(app: &App, area: &Bounds2D<f32>) -> Vec<HoleRef> {
 /// Selects every hole of every hollowed model.
 pub fn select_all(app: &mut App) {
     app.state.selected_holes = (app.project.models.iter())
-        .filter(|m| m.hollow.spec.shell.is_some())
+        .filter(|m| m.is_hollowed())
         .flat_map(|m| {
             (0..m.hollow.spec.holes.len()).map(move |index| HoleRef { model: m.id, index })
         })
@@ -372,7 +391,7 @@ fn pointer_hole(app: &App) -> Option<(ModelId, Hole, tools::hollow::Hole)> {
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))?;
 
-    let shell = model.hollow.spec.shell?;
+    let shell = model.hollow_shell()?;
     let normal = model.mesh.normal(hit.face).try_normalize(f32::EPSILON)?;
     let hole = Hole {
         point: hit.position,

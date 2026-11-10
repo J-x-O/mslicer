@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{BufReader, Write},
+    io::BufReader,
     mem,
     sync::Arc,
     time::{Duration, Instant},
@@ -155,13 +155,20 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
                                         Align::LEFT,
                                     );
 
-                                    if ui.button(layout_job).clicked() {
+                                    if ui.button(layout_job).clicked()
+                                        && let Some(preview) = slice_operation.preview()
+                                    {
                                         let file = result.slice_data().file(
                                             &Progress::new(),
                                             &result.config,
-                                            &slice_operation.preview(),
+                                            &preview,
                                             RasterFormat::Ctb(CtbFormat::Encrypted).into(),
                                         );
+                                        let Some(file) =
+                                            app.popup.report("Couldn't Build the File", file)
+                                        else {
+                                            return;
+                                        };
 
                                         let mut serializer = DynamicSerializer::new();
                                         file.serialize(&mut serializer, &Progress::new());
@@ -191,10 +198,12 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
                                     response = response.on_hover_text(tip);
                                 }
 
-                                if response.clicked() {
+                                if response.clicked()
+                                    && let Some(preview) = slice_operation.preview()
+                                {
                                     app.tasks.add(save_file(
                                         result.config.clone(),
-                                        slice_operation.preview(),
+                                        preview,
                                         format,
                                         result.slice_data(),
                                     ));
@@ -514,6 +523,7 @@ fn layer_slider(state: &mut UiState, ui: &mut egui::Ui, result: &mut RasterSlice
 }
 
 fn name_popup(mainboard_id: String, data: Arc<Vec<u8>>) -> Popup {
+    let mut error = None;
     Popup::new("Remote Send", move |app, ui| {
         ui.horizontal(|ui| {
             ui.label("File Name:");
@@ -537,21 +547,28 @@ fn name_popup(mainboard_id: String, data: Arc<Vec<u8>>) -> Popup {
                 .show(ui, |ui| {
                     close = ui.add(Button::new("Close").min_size(min_size)).clicked();
                     if ui.add(Button::new("Send").min_size(min_size)).clicked() {
-                        close = true;
-                        let name = mem::take(&mut app.state.working_filename)
+                        let name = (app.state.working_filename)
                             .replace([' ', '/'], "_")
                             .replace("..", "");
-                        app.remote_print
-                            .upload(
-                                &mainboard_id,
-                                data.clone(),
-                                name,
-                                RasterFormat::Ctb(CtbFormat::Encrypted),
-                            )
-                            .unwrap();
+                        let sent = app.remote_print.upload(
+                            &mainboard_id,
+                            data.clone(),
+                            name,
+                            RasterFormat::Ctb(CtbFormat::Encrypted),
+                        );
+                        match sent {
+                            Ok(()) => {
+                                app.state.working_filename.clear();
+                                close = true;
+                            }
+                            Err(e) => error = Some(format!("Couldn't send: {e:#}")),
+                        }
                     }
                 });
         });
+        if let Some(error) = &error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
 
         close
     })
@@ -567,13 +584,9 @@ fn save_file(
         (format.name(), &[format.extension()]),
         move |_app, path, tasks| {
             let path = path.with_extension(format.extension());
-            let file_name = path.file_name().unwrap().to_string_lossy();
-            let mut out = File::create(&path).unwrap();
-
             tasks.push(Box::new(SaveSliced::new(
                 (format, data.clone(), config, preview),
-                file_name.into_owned(),
-                move |bytes| out.write_all(&bytes).unwrap(),
+                path,
             )));
         },
     )
@@ -620,7 +633,10 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
         .default_open(true)
         .show(ui, |ui| {
             let mut previews = operation.previews.lock();
-            let preview = previews.as_mut().unwrap();
+            let Some(preview) = previews.as_mut() else {
+                ui.weak("No preview yet.");
+                return;
+            };
             let mut reset_preview = false;
 
             ui.add_space(4.0);
@@ -630,14 +646,26 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
                     let task = FileDialog::pick_file(
                         ("Image", &IMAGE_FORMATS),
                         move |app, path, _tasks| {
-                            let format = ImageFormat::from_path(path).unwrap();
-                            let file = BufReader::new(File::open(path).unwrap());
-
-                            let image = image::load(file, format).unwrap().resize(
-                                preview_size.x,
-                                preview_size.y,
-                                FilterType::Triangle,
-                            );
+                            let image = (|| -> anyhow::Result<_> {
+                                let format = ImageFormat::from_path(path)?;
+                                let file = BufReader::new(File::open(path)?);
+                                Ok(image::load(file, format)?)
+                            })();
+                            let image = match image {
+                                Ok(image) => image,
+                                Err(e) => {
+                                    let body = format!("`{}`: {e:#}", path.display());
+                                    let popup = Popup::simple(
+                                        "Failed to Load Image",
+                                        PopupIcon::Error,
+                                        body,
+                                    );
+                                    app.popup.open(popup);
+                                    return;
+                                }
+                            };
+                            let image =
+                                image.resize(preview_size.x, preview_size.y, FilterType::Triangle);
 
                             if let Some(operation) = app.slice_operation.as_mut() {
                                 operation.add_preview(image.to_rgba8());
@@ -669,10 +697,10 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
                             if ui.button("Composite").clicked() {
                                 if let Some(slice_operation) = app.slice_operation.as_mut()
                                     && let Some(image) = slice_operation.previews.lock().as_mut()
-                                {
                                     // todo: dont keep re-parsing
-                                    let font =
-                                        ab_glyph::FontRef::try_from_slice(UBUNTU_LIGHT).unwrap();
+                                    && let Ok(font) =
+                                        ab_glyph::FontRef::try_from_slice(UBUNTU_LIGHT)
+                                {
                                     let size = image.image.height() as f32 * size / 100.0;
                                     let color = Rgba([255, 255, 255, 255]);
                                     let new = imageproc::drawing::draw_text(
@@ -872,7 +900,10 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
         exposure_changed |= exposure_config(ui, &mut result.config.first_exposure_config);
     });
 
-    let raster = result.inner.as_raster_mut().unwrap();
+    // The rest is about raster layers.
+    let Some(raster) = result.inner.as_raster_mut() else {
+        return;
+    };
     if exposure_changed {
         for (i, layer) in raster
             .layers
@@ -1019,7 +1050,10 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
             .view_aspect(3.0)
             .show(ui, |plot| {
                 let px_area = result.config.pixel_area();
-                let layers = &result.inner.as_raster().unwrap().layers;
+                let Some(raster) = result.inner.as_raster() else {
+                    return;
+                };
+                let layers = &raster.layers;
                 let series = layers
                     .iter()
                     .enumerate()
@@ -1038,7 +1072,10 @@ fn sidebar(operation: &SliceOperation, result: &mut SliceResult, app: SidebarApp
     });
 
     ui.collapsing("Defects", |ui| {
-        let layers = &result.inner.as_raster().unwrap().layers;
+        let Some(raster) = result.inner.as_raster() else {
+            return;
+        };
+        let layers = &raster.layers;
         let mut has_defects = false;
 
         let defects = (layers.iter())

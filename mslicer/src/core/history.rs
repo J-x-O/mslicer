@@ -23,9 +23,10 @@ use crate::{
         App,
         config::ui::B_PER_MIB,
         project::{
-            Collection, CollectionId,
+            Collection, CollectionId, Project,
             hollow::HollowSpec,
             model::{Model, ModelId},
+            stack::Stack,
             supports::SupportsSnapshot,
         },
     },
@@ -107,6 +108,37 @@ pub enum ModelAction {
     RelativeExposure(u8),
     Collection(Option<CollectionId>),
     Move(usize, Option<CollectionId>),
+    /// A change to the operation stack, with the payloads its rows own.
+    Stack(Box<StackState>, &'static str),
+    /// Several changes made as one step, in order.
+    Batch(Vec<ModelAction>),
+}
+
+/// A model's stack and the payloads its rows own, at one point in time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StackState {
+    pub stack: Stack,
+    pub hollow: HollowSpec,
+    pub supports: SupportsSnapshot,
+}
+
+impl StackState {
+    pub fn of(model: &Model) -> Self {
+        Self {
+            stack: model.stack.clone(),
+            hollow: model.hollow.spec.clone(),
+            supports: model.supports.snapshot(),
+        }
+    }
+
+    /// Puts this state back, returning the one it replaces.
+    fn restore(self, model: &mut Model) -> Self {
+        let old = Self::of(model);
+        model.stack = self.stack;
+        model.hollow.spec = self.hollow;
+        model.supports.restore_snapshot(self.supports);
+        old
+    }
 }
 
 impl History {
@@ -178,20 +210,47 @@ impl History {
     }
 }
 
-impl<'a> HistoryRef<'a> {
-    pub fn undo(&mut self) {
-        if let Some(redo) = (self.history.pop_back()).and_then(|action| action.undo(self.app)) {
+impl History {
+    /// Undoes the last action on `project`. Returns whether there was one.
+    pub fn undo_on(&mut self, project: &mut Project) -> bool {
+        let Some(action) = self.history.pop_back() else {
+            return false;
+        };
+        if let Some(redo) = action.undo(project) {
             self.constrain_size();
             self.future.push_back(redo);
         }
+        true
+    }
+
+    /// Redoes the last undone action on `project`. Returns whether there
+    /// was one.
+    pub fn redo_on(&mut self, project: &mut Project) -> bool {
+        let Some(action) = self.future.pop_back() else {
+            return false;
+        };
+        if let Some(undo) = action.undo(project) {
+            self.constrain_size();
+            self.history.push_back(undo);
+        }
+        true
+    }
+}
+
+impl<'a> HistoryRef<'a> {
+    pub fn undo(&mut self) {
+        let App {
+            history, project, ..
+        } = &mut *self.app;
+        history.undo_on(project);
         self.prune_selection();
     }
 
     pub fn redo(&mut self) {
-        if let Some(redo) = (self.future.pop_back()).and_then(|action| action.undo(self.app)) {
-            self.constrain_size();
-            self.history.push_back(redo);
-        }
+        let App {
+            history, project, ..
+        } = &mut *self.app;
+        history.redo_on(project);
         self.prune_selection();
     }
 
@@ -248,34 +307,34 @@ impl Action {
         }
     }
 
-    pub fn undo(self, app: &mut App) -> Option<Action> {
+    pub fn undo(self, project: &mut Project) -> Option<Action> {
         match self {
             Self::Model { id, action } => action
-                .undo(app, id)
+                .undo(project, id)
                 .map(|action| Self::Model { id, action }),
             Self::ModelAdded { id } => {
-                let index = app.project.models.iter().position(|x| x.id == id)?;
-                let model = Box::new(app.project.models.remove(index));
+                let index = project.models.iter().position(|x| x.id == id)?;
+                let model = Box::new(project.models.remove(index));
                 Some(Self::ModelRemoved { index, model })
             }
             Self::ModelRemoved { index, model } => {
                 let id = model.id;
-                let index = index.min(app.project.models.len());
-                app.project.models.insert(index, *model);
+                let index = index.min(project.models.len());
+                project.models.insert(index, *model);
                 Some(Self::ModelAdded { id })
             }
             Self::CollectionAdded { id } => {
-                let index = app.project.collections.iter().position(|x| x.id == id)?;
-                let collection = app.project.collections.remove(index);
+                let index = project.collections.iter().position(|x| x.id == id)?;
+                let collection = project.collections.remove(index);
                 Some(Self::CollectionRemoved { index, collection })
             }
             Self::CollectionRemoved { index, collection } => {
                 let id = collection.id;
-                let index = index.min(app.project.collections.len());
-                app.project.collections.insert(index, collection);
+                let index = index.min(project.collections.len());
+                project.collections.insert(index, collection);
                 Some(Self::CollectionAdded { id })
             }
-            Self::SliceConfig(action) => action.undo(app).map(Action::SliceConfig),
+            Self::SliceConfig(action) => action.undo(project).map(Action::SliceConfig),
         }
     }
 }
@@ -298,9 +357,9 @@ impl SliceConfigAction {
         }
     }
 
-    pub fn undo(self, app: &mut App) -> Option<SliceConfigAction> {
-        let slice_config = &mut app.project.slice_config;
-        let post_processing = &mut app.project.post_processing;
+    pub fn undo(self, project: &mut Project) -> Option<SliceConfigAction> {
+        let slice_config = &mut project.slice_config;
+        let post_processing = &mut project.post_processing;
 
         Some(match self {
             Self::Mode(mode) => Self::Mode(mem::replace(&mut slice_config.mode, mode)),
@@ -363,14 +422,26 @@ impl ModelAction {
             Self::RelativeExposure(_) => ActionDescription::new("Changed Model Exposure"),
             Self::Collection(_) => ActionDescription::new("Changed Model Collection"),
             Self::Move(..) => ActionDescription::new("Moved Model"),
+            Self::Stack(_, label) => ActionDescription::new(label),
+            Self::Batch(actions) => {
+                (actions.last()).map_or(ActionDescription::new("Edited Model"), |a| a.description())
+            }
         }
     }
 
     /// Undoes the model action on the specified model, returning an action to
     /// revert the undo (redo) if the model was found.
-    pub fn undo(self, app: &mut App, model_id: ModelId) -> Option<ModelAction> {
-        let model = app.project.models.iter_mut().find(|x| x.id == model_id)?;
-        let platform_size = &app.project.slice_config.platform_size;
+    pub fn undo(self, project: &mut Project, model_id: ModelId) -> Option<ModelAction> {
+        if let Self::Batch(actions) = self {
+            // Undone last first; the redo runs them forwards again.
+            let mut redo: Vec<_> = (actions.into_iter().rev())
+                .filter_map(|a| a.undo(project, model_id))
+                .collect();
+            redo.reverse();
+            return Some(Self::Batch(redo));
+        }
+        let model = project.models.iter_mut().find(|x| x.id == model_id)?;
+        let platform_size = &project.slice_config.platform_size;
 
         Some(match self {
             Self::Name(name) => Self::Name(mem::replace(&mut model.name, name)),
@@ -423,12 +494,15 @@ impl ModelAction {
             Self::Collection(collection) => {
                 Self::Collection(mem::replace(&mut model.collection, collection))
             }
+            Self::Stack(state, label) => Self::Stack(Box::new(state.restore(model)), label),
+            // Handled above.
+            Self::Batch(actions) => Self::Batch(actions),
             Self::Move(index, collection) => {
-                let current_index = app.project.models.iter().position(|x| x.id == model_id)?;
-                let mut model = app.project.models.remove(current_index);
+                let current_index = project.models.iter().position(|x| x.id == model_id)?;
+                let mut model = project.models.remove(current_index);
                 let old_collection = mem::replace(&mut model.collection, collection);
-                let index = index.min(app.project.models.len());
-                app.project.models.insert(index, model);
+                let index = index.min(project.models.len());
+                project.models.insert(index, model);
                 return Some(Self::Move(current_index, old_collection));
             }
         })
@@ -445,6 +519,7 @@ impl ModelAction {
             | Self::Orientation(_, _, s)
             | Self::GeneratedSupports(_, s)
             | Self::Supports(s) => Some(s),
+            Self::Stack(state, _) => Some(&state.supports),
             _ => None,
         }
     }

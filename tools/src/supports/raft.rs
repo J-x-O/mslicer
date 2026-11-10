@@ -432,17 +432,9 @@ impl Raft {
 
     pub fn deserialize<T: Deserializer>(des: &mut T) -> Self {
         let config = RaftConfig::deserialize(des);
-        let islands = (0..des.read_u32_be())
-            .map(|_| {
-                (0..des.read_u32_be())
-                    .map(|_| {
-                        (0..des.read_u32_be())
-                            .map(|_| [des.read_f32_be(), des.read_f32_be()])
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
+        let islands = des.read_list(|des| {
+            des.read_list(|des| des.read_list(|des| [des.read_f32_be(), des.read_f32_be()]))
+        });
         Self { config, islands }
     }
 }

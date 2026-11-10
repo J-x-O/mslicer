@@ -7,7 +7,7 @@ use std::{
 use chrono::Utc;
 use egui::{Grid, RichText};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     VERSION,
@@ -43,14 +43,22 @@ impl UpdateCheck {
         let ignore = app.config.ui.ignore_update.clone();
 
         let handle = TaskThread::spawn(move || {
-            let response = ureq::get(VERSION_MANIFEST)
-                .header("Version", VERSION)
-                .header("Check-Freq", check_freq)
-                .header("Operating-System", format!("{OS} {ARCH}"))
-                .call()
-                .unwrap();
-            let manifest =
-                serde_json::from_reader::<_, Manifest>(response.into_body().into_reader()).unwrap();
+            let manifest = || -> anyhow::Result<Manifest> {
+                let response = ureq::get(VERSION_MANIFEST)
+                    .header("Version", VERSION)
+                    .header("Check-Freq", check_freq)
+                    .header("Operating-System", format!("{OS} {ARCH}"))
+                    .call()?;
+                Ok(serde_json::from_reader(response.into_body().into_reader())?)
+            };
+            // An update check that fails says nothing; it runs again later.
+            let manifest = match manifest() {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    warn!("Update check failed: {e:#}");
+                    return CheckResult::UpToDate;
+                }
+            };
 
             if semver_cmp(VERSION, &manifest.version) == Some(Ordering::Less) {
                 if let Some(ignore) = ignore
@@ -122,7 +130,7 @@ pub fn update_check_if_scheduled(app: &mut App) {
     let scheduled = match app.config.ui.update_check {
         UpdateCheckFrequency::Never => false,
         freq => match app.config.ui.last_update_check {
-            Some(last) => last + freq.as_duration().unwrap() < Utc::now(),
+            Some(last) => (freq.as_duration()).is_some_and(|every| last + every < Utc::now()),
             None => true,
         },
     };

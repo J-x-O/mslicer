@@ -15,6 +15,8 @@ pub struct TaskThread<T> {
 enum Handle<T> {
     Thread(Option<JoinHandle<T>>),
     Dummy(Option<T>),
+    /// The thread couldn't be started.
+    Failed(Option<String>),
 }
 
 pub enum TaskResult<T> {
@@ -27,12 +29,12 @@ pub enum TaskResult<T> {
 
 impl<T: Send + 'static> TaskThread<T> {
     pub fn spawn(f: impl FnOnce() -> T + Send + 'static) -> Self {
-        let handle = thread::Builder::new()
-            .name("task_thread".into())
-            .spawn(f)
-            .unwrap();
+        let handle = thread::Builder::new().name("task_thread".into()).spawn(f);
         Self {
-            handle: Handle::Thread(Some(handle)),
+            handle: match handle {
+                Ok(handle) => Handle::Thread(Some(handle)),
+                Err(e) => Handle::Failed(Some(format!("Couldn't start a thread: {e}"))),
+            },
         }
     }
 
@@ -81,6 +83,24 @@ impl<T: Send + 'static> TaskThread<T> {
     }
 }
 
+impl<T: Send + 'static> TaskThread<anyhow::Result<T>> {
+    /// Like [`TaskThread::poll`], also showing an error the task returned.
+    pub fn poll_result(&mut self, app: &mut TaskApp, failure: &str) -> TaskResult<T> {
+        match self.poll(app, failure) {
+            TaskResult::Completed(Ok(value)) => TaskResult::Completed(value),
+            TaskResult::Completed(Err(err)) => {
+                let body = format!("{err:#}");
+                app.popup
+                    .open(Popup::simple(failure, PopupIcon::Error, body));
+                TaskResult::Failed
+            }
+            TaskResult::Empty => TaskResult::Empty,
+            TaskResult::Failed => TaskResult::Failed,
+            TaskResult::Pending => TaskResult::Pending,
+        }
+    }
+}
+
 impl<T> Handle<T> {
     pub fn is_finished(&self) -> bool {
         match self {
@@ -93,6 +113,9 @@ impl<T> Handle<T> {
         match self {
             Handle::Thread(handle) => handle.take().map(|h| h.join()),
             Handle::Dummy(value) => value.take().map(Ok),
+            Handle::Failed(error) => {
+                (error.take()).map(|e| Err(Box::new(e) as Box<dyn Any + Send + 'static>))
+            }
         }
     }
 }

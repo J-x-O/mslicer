@@ -14,6 +14,7 @@ use slicer::geometry::bounds::Bounds3D;
 use tracing::error;
 
 use crate::{
+    core::slice::{estimate::Estimate, key::slice_key},
     core::{
         App,
         config::{
@@ -22,6 +23,7 @@ use crate::{
         },
         state::PreviewMode,
     },
+    engine::Status,
     interface::components::{
         BeingEditedExt,
         chart::PieChart,
@@ -319,6 +321,13 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
 
     ui.add_space(8.0);
     ui.heading("Miscellaneous");
+    ui.collapsing("New models", |ui| {
+        ui.label("The operations an imported model starts with. Each model's stack is its own: changing this leaves models already in a project alone.");
+        let stack = &mut app.config.default_stack;
+        ui.checkbox(&mut stack.repair, "Repair");
+        ui.checkbox(&mut stack.hollow, "Hollow (with auto holes)");
+        ui.checkbox(&mut stack.supports, "Supports (empty, ready for the support tool)");
+    });
     ui.collapsing("Interface", |ui| {
         grid("interface").show(ui, |ui| {
             ui.label("Theme");
@@ -467,6 +476,32 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
 
     ui.add_space(8.0);
     ui.heading("Stats");
+
+    ui.collapsing("Evaluation", |ui| {
+        let status = Status::of(&app.project);
+        let estimate = Estimate::of(&app.project);
+        let sliced = (app.slice_operation.as_ref()).and_then(|op| op.key);
+        let slice = match sliced {
+            None => "None",
+            Some(key) if key == slice_key(&app.project) => "Up to date",
+            Some(_) => "Outdated",
+        };
+        grid("stats_evaluation").show(ui, |ui| {
+            for (label, value) in [
+                ("Computing", status.computing.to_string()),
+                ("Waiting", status.stale.to_string()),
+                ("Full slice", slice.to_owned()),
+                ("Layers (estimate)", estimate.layers.to_string()),
+            ] {
+                ui.label(label);
+                ui.horizontal(|ui| {
+                    ui.label(value);
+                    ui.take_available_width();
+                });
+                ui.end_row();
+            }
+        });
+    });
 
     ui.collapsing("Rendering", |ui| {
         let avg_time = app.config.render.stats_average_time;

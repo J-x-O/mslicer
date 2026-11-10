@@ -1,12 +1,13 @@
 use const_format::concatcp;
 use egui::{Button, ComboBox, Context, DragValue, Response, Ui, Widget};
-use egui_phosphor::regular::{DROP, MAGIC_WAND, TRASH, WARNING, X};
+use egui_phosphor::regular::{DROP, MAGIC_WAND, SNOWFLAKE, TRASH, WARNING, X};
 
 use crate::{
     core::{
         App,
         hollow::{self, HoleRef, edit},
-        project::{hollow::Shell, model::ModelId},
+        project::{model::ModelId, stack::Op},
+        stack,
         state::Tool,
     },
     interface::{components::grid, panels::supports::targets},
@@ -17,6 +18,7 @@ const FAILED_HELP: &str = "This hole couldn't be drilled here, so it is left out
 const WALL_HELP: &str = "How thick the kept wall is. Thinner walls save more resin but are weaker.";
 const DETAIL_HELP: &str =
     "How finely the cavity follows the model. Finer takes longer on large models.";
+const AUTO_HELP: &str = "Drills a hole straight up into the lowest point of each void, for the way the model is oriented now. Turning the model moves these holes with the resin line; holes you placed yourself stay where they are.";
 const PLACE_HELP: &str = "In the hole tool: click a hollowed model to drill a hole straight in there, click a hole to select it (Shift adds), drag a hole to move it, Delete removes the selected ones.";
 
 /// Sample spacings offered for the cavity (mm).
@@ -30,26 +32,34 @@ pub fn ui(app: &mut App, ui: &mut Ui, _ctx: &Context) {
         ui.label("Select a model to hollow it.");
         return;
     };
-    let name = app
-        .project
-        .models
-        .iter()
-        .find(|m| m.id == id)
-        .unwrap()
-        .name
-        .clone();
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
+    let name = model.name.clone();
     ui.strong(format!("`{name}`"));
     ui.add_space(4.0);
 
-    shell(app, ui, id);
-    // Holes drain a cavity: only a hollowed model has them.
-    let hollowed = (app.project.models.iter()).any(|m| m.id == id && m.hollow.spec.shell.is_some());
-    if !hollowed {
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
         return;
+    };
+    let frozen = stack::is_frozen(model, |op| matches!(op, Op::Hollow(_)));
+    if frozen {
+        ui.label(concatcp!(
+            SNOWFLAKE,
+            " The Hollow operation is frozen: thaw it in the model's operations to edit it."
+        ));
     }
-    ui.add_space(8.0);
-    ui.separator();
-    holes(app, ui, id);
+    ui.add_enabled_ui(!frozen, |ui| {
+        shell(app, ui, id);
+        // Holes drain a cavity: only a hollowed model has them.
+        let hollowed = (app.project.models.iter()).any(|m| m.id == id && m.is_hollowed());
+        if !hollowed {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        holes(app, ui, id);
+    });
 }
 
 /// The model being worked on: the selected one, or the only one.
@@ -61,16 +71,18 @@ fn target(app: &App) -> Option<ModelId> {
 }
 
 fn shell(app: &mut App, ui: &mut Ui, id: ModelId) {
-    let model = app.project.models.iter().find(|m| m.id == id).unwrap();
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
     let spec = model.hollow.spec.clone();
 
-    let mut hollow = spec.shell.is_some();
+    // The checkbox adds the Hollow operation, or bypasses it (its holes are
+    // kept for when it is back).
+    let mut hollow = model.is_hollowed();
     if ui.checkbox(&mut hollow, "Hollow").changed() {
-        edit(app, id, true, |spec| {
-            spec.shell = hollow.then(Shell::default)
-        });
+        stack::set_hollowed(stack::of(app), id, hollow);
     }
-    let Some(mut shell) = spec.shell else {
+    let Some(mut shell) = spec.shell.filter(|_| hollow) else {
         return;
     };
 
@@ -104,7 +116,9 @@ fn shell(app: &mut App, ui: &mut Ui, id: ModelId) {
         edit(app, id, tracked, |spec| spec.shell = Some(shell));
     }
 
-    let model = app.project.models.iter().find(|m| m.id == id).unwrap();
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
     let hollow = &model.hollow;
     match hollow.cavity(&model.mesh) {
         None => {
@@ -131,7 +145,9 @@ fn shell(app: &mut App, ui: &mut Ui, id: ModelId) {
 
 fn holes(app: &mut App, ui: &mut Ui, id: ModelId) {
     ui.strong("Drain Holes");
-    let model = app.project.models.iter().find(|m| m.id == id).unwrap();
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
     let drains = (model.hollow.cavity(&model.mesh)).is_some_and(|c| !c.drains.is_empty());
     let sealed = model.hollow.sealed_parts(&model.mesh);
 
@@ -145,6 +161,42 @@ fn holes(app: &mut App, ui: &mut Ui, id: ModelId) {
             .ui(ui);
         ui.end_row();
     });
+
+    // The auto-hole rule: one hole at each void's lowest point, wherever
+    // that is in the current orientation.
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
+    let rule = model.stack.hollow().map(|(op, h)| (op.id, *h));
+    let autos = model.hollow.auto_holes(&model.mesh).len();
+    if let Some((op, mut rule)) = rule {
+        let before = rule;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut rule.auto_holes, "Vent each void automatically")
+                .on_hover_text(AUTO_HELP);
+            if rule.auto_holes {
+                DragValue::new(&mut rule.diameter)
+                    .prefix("Ø ")
+                    .suffix(" mm")
+                    .speed(0.05)
+                    .range(0.5..=10.0)
+                    .ui(ui);
+            }
+        });
+        if rule.auto_holes && autos > 0 {
+            ui.weak(format!(
+                "{autos} auto hole{} at the lowest points. Click one with the hole tool to pin it where it is.",
+                if autos == 1 { "" } else { "s" }
+            ));
+        }
+        if rule != before {
+            stack::edit_merged(stack::of(app), id, "Changed Auto Holes", |model| {
+                if let Some(operation) = model.stack.get_mut(op) {
+                    operation.op = Op::Hollow(rule);
+                }
+            });
+        }
+    }
 
     ui.horizontal_wrapped(|ui| {
         let active = app.state.tool == Tool::Holes;
@@ -180,7 +232,9 @@ fn holes(app: &mut App, ui: &mut Ui, id: ModelId) {
         ));
     }
 
-    let model = app.project.models.iter().find(|m| m.id == id).unwrap();
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
     let rows: Vec<(String, bool)> = (model.hollow.spec.holes.iter().enumerate())
         .map(|(index, h)| {
             let text = format!("Hole {}: Ø {:.1} mm", index + 1, h.diameter);

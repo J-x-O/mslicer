@@ -1,6 +1,11 @@
 //! Automatic supports: contact point placement, routing to the plate or onto
 //! the model, and the brace network between the pillars.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use common::{
     progress::Progress,
     units::{Milimeter, Milimeters},
@@ -55,11 +60,22 @@ pub enum Routed {
     Model(Landing),
 }
 
-/// How far [`AutoPlacement::generate_supports`] is, per stage.
+/// How far [`AutoPlacement::generate_supports`] is, per stage, and whether
+/// it should give up.
 #[derive(Clone, Default)]
 pub struct GenerationProgress {
     pub placing: Progress,
     pub routing: Progress,
+    /// Once set, generation stops early: between placing and routing, and
+    /// before each support is routed. What it returns then is incomplete
+    /// and meant to be dropped.
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl GenerationProgress {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 pub struct AutoPlacement {
@@ -100,7 +116,10 @@ impl AutoPlacement {
     ) -> Generated {
         let points = self.place(mesh, bvh, &[], &progress.placing);
         info!("Placed {} supports", points.len());
-        let generated = self.route_all(mesh, bvh, points, &progress.routing);
+        if progress.is_cancelled() {
+            return Generated::default();
+        }
+        let generated = self.route_all(mesh, bvh, points, &progress.routing, &progress.cancel);
         info!(
             "Routed {} supports to the plate and {} onto the model",
             generated.plate.len(),
@@ -129,7 +148,7 @@ impl AutoPlacement {
             "Region support: {} candidates inside the region",
             points.len()
         );
-        self.route_all(mesh, bvh, points, progress)
+        self.route_all(mesh, bvh, points, progress, &AtomicBool::new(false))
     }
 
     /// Contact point placement and edge re-seat ([`placement`]), with
@@ -159,10 +178,14 @@ impl AutoPlacement {
         bvh: &Bvh,
         points: Vec<PlacedPoint>,
         progress: &Progress,
+        cancel: &AtomicBool,
     ) -> Generated {
         progress.set_total(points.len() as u64);
         let routed: Vec<Routed> = (points.into_par_iter())
             .filter_map(|x| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let routed = route_point(mesh, bvh, &self.support, x.point, x.normal);
                 progress.add_complete(1);
                 routed

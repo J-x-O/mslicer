@@ -32,7 +32,7 @@ pub fn interface(app: &mut PopupApp, ui: &mut Ui) -> bool {
         }
 
         if audio_loaded {
-            let name = tool.audio.file_name().unwrap().to_string_lossy();
+            let name = crate::task::file_name(&tool.audio);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.label("Loaded ");

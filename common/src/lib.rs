@@ -1,5 +1,6 @@
 pub mod color;
 pub mod container;
+pub mod fs;
 pub mod geometry;
 pub mod misc;
 pub mod progress;

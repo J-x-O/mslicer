@@ -1,14 +1,15 @@
 use std::{
     fs::File,
-    io::{BufReader, BufWriter},
+    io::BufReader,
     mem,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clone_macro::clone;
 use common::{
+    fs::write_atomic,
     progress::Progress,
     serde::{ReaderDeserializer, SliceDeserializer, WriterSerializer},
 };
@@ -24,40 +25,33 @@ use crate::{
 
 pub struct MeshLoad {
     progress: Progress,
-    handle: TaskThread<Mesh>,
+    handle: TaskThread<Result<Mesh>>,
 
     name: String,
     file: Option<PathBuf>,
 }
 
 impl MeshLoad {
-    pub fn file(path: PathBuf, name: String, format: String) -> Result<Self> {
-        let file = File::open(&path)?;
-        let format = Format::from_extension(&format).unwrap();
-        let des = ReaderDeserializer::new(BufReader::new(file));
+    pub fn file(path: PathBuf, name: String, format: String) -> Self {
         let progress = Progress::new();
-
-        Ok(Self {
-            handle: TaskThread::spawn(clone!([progress], move || {
-                let mesh = load_mesh(des, format, &progress).unwrap();
-                Mesh::new_boxed_centered(mesh.verts, mesh.faces)
+        Self {
+            handle: TaskThread::spawn(clone!([progress, path], move || {
+                read_mesh(&path, &format, &progress)
             })),
             progress,
 
             name,
             file: Some(path),
-        })
+        }
     }
 
     pub fn buffer(buffer: &'static [u8], name: String, format: String) -> Self {
-        let format = Format::from_extension(&format).unwrap();
-        let des = SliceDeserializer::new(buffer);
         let progress = Progress::new();
-
         Self {
             handle: TaskThread::spawn(clone!([progress], move || {
-                let mesh = load_mesh(des, format, &progress).unwrap();
-                Mesh::new_boxed_centered(mesh.verts, mesh.faces)
+                let format = Format::from_extension(&format).context("Unknown mesh format")?;
+                let mesh = load_mesh(SliceDeserializer::new(buffer), format, &progress)?;
+                Ok(Mesh::new_boxed_centered(mesh.verts, mesh.faces))
             })),
             progress,
 
@@ -69,7 +63,7 @@ impl MeshLoad {
     pub fn complete(name: String, mesh: Mesh) -> Self {
         Self {
             progress: Progress::already_complete(),
-            handle: TaskThread::complete(mesh),
+            handle: TaskThread::complete(Ok(mesh)),
 
             name,
             file: None,
@@ -79,7 +73,7 @@ impl MeshLoad {
 
 impl Task for MeshLoad {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
-        (self.handle.poll(app, "Failed to Load Model")).into_poll_result(|mesh| {
+        (self.handle.poll_result(app, "Failed to Load Model")).into_poll_result(|mesh| {
             info!(
                 "Loaded model `{}` with {} faces",
                 self.name,
@@ -90,6 +84,7 @@ impl Task for MeshLoad {
                 .with_name(mem::take(&mut self.name))
                 .width_file(self.file.take())
                 .with_random_color(app.config.ui.warning_color);
+            app.config.default_stack.apply(&mut model);
             model.update_oob(&app.project.slice_config.platform_size);
             let result = PollResult::complete().with_task(MeshAnalysis::new(&model));
             app.history.track(Action::ModelAdded { id: model.id });
@@ -109,7 +104,7 @@ impl Task for MeshLoad {
 
 pub struct MeshSave {
     progress: Progress,
-    handle: TaskThread<()>,
+    handle: TaskThread<Result<()>>,
 }
 
 impl MeshSave {
@@ -119,9 +114,12 @@ impl MeshSave {
         let progress = Progress::new();
 
         let handle = TaskThread::spawn(clone!([progress], move || {
-            let file = File::create(path).unwrap();
-            let mut ser = WriterSerializer::new(BufWriter::new(file));
-            save_mesh(&mut ser, format, &progress, &mesh);
+            write_atomic(&path, |out| {
+                let mut ser = WriterSerializer::new(out);
+                save_mesh(&mut ser, format, &progress, &mesh);
+                ser.finish().map(drop)
+            })
+            .with_context(|| format!("Couldn't save `{}`", path.display()))
         }));
 
         Self { progress, handle }
@@ -131,7 +129,7 @@ impl MeshSave {
 impl Task for MeshSave {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
         self.handle
-            .poll(app, "Failed to Save Mesh")
+            .poll_result(app, "Failed to Save Mesh")
             .into_poll_result(|_| PollResult::complete())
     }
 
@@ -142,4 +140,15 @@ impl Task for MeshSave {
             progress: self.progress.progress(),
         })
     }
+}
+
+/// Reads a mesh file, centered. `format` is its extension.
+pub fn read_mesh(path: &Path, format: &str, progress: &Progress) -> Result<Mesh> {
+    let format = Format::from_extension(format)
+        .with_context(|| format!("`{}` isn't a mesh format mslicer reads", path.display()))?;
+    let file = File::open(path).with_context(|| format!("Couldn't open `{}`", path.display()))?;
+    let des = ReaderDeserializer::new(BufReader::new(file));
+    let mesh = load_mesh(des, format, progress)
+        .with_context(|| format!("Couldn't read `{}`", path.display()))?;
+    Ok(Mesh::new_boxed_centered(mesh.verts, mesh.faces))
 }

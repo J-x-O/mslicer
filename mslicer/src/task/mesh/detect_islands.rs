@@ -62,7 +62,7 @@ impl Task for DetectIslands {
                 .models
                 .iter()
                 .find(|m| m.id == id)
-                .map(|m| (Pose::of(&m.mesh), m.hollow.print_mesh(&m.mesh).mesh_id()));
+                .map(|m| (Pose::of(&m.mesh), m.print_mesh().mesh_id()));
             if let (Some(check), Some(now)) = (&mut app.state.island_check, now) {
                 check.finished(id, (pose, source), detection, now, spacing);
             }

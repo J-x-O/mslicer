@@ -26,7 +26,7 @@ pub struct SelectedSupports {
     last: Option<SelectedSupport>,
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SelectedSupport {
     pub model: ModelId,
     pub support: SupportId,

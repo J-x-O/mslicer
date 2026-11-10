@@ -3,20 +3,31 @@ use std::{
     fmt, mem,
     sync::Arc,
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
-use common::{color::SRgb, units::Milimeter};
+use common::{color::SRgb, serde::DynamicSerializer, units::Milimeter};
 use nalgebra::{Isometry3, Rotation3, Vector3};
-use slicer::geometry::{mesh::Mesh, partitioning::Bvh};
+use slicer::geometry::{
+    mesh::{Mesh, MeshId},
+    partitioning::Bvh,
+};
 use tools::supports::{
     Support, SupportId, SupportSet,
-    auto::{BraceNetwork, Generated, Routed, brace_support},
+    auto::{AutoPlacement, BraceNetwork, Generated, Routed, brace_support},
     mesh::{FaceMap, SupportPreset, Transform, build_supports},
     raft::{Raft, RaftConfig},
 };
 use wgpu::Device;
 
-use crate::{core::state::PreviewModel, render::util::MeshBuffers};
+use crate::{
+    core::{
+        project::reroute::{RerouteInput, RerouteKey, Rerouted},
+        state::PreviewModel,
+    },
+    engine::{CancelToken, Debounce, InputHasher, Slot, SlotState, Ticket},
+    render::util::MeshBuffers,
+};
 
 /// A model's supports.
 ///
@@ -43,26 +54,68 @@ pub struct Supports {
     pose: Pose,
     /// The generation the model is waiting on, if any. Anything that replaces
     /// the supports in the meantime cancels it.
-    pending: Option<u64>,
+    pending: Option<(u64, CancelToken)>,
 
     resolution: u32,
+    /// The shown mesh. It may lag the supports by a background build.
     mesh: Option<(Mesh, FaceMap)>,
     /// The raft in the shown mesh.
     mesh_raft: Option<Raft>,
     /// The pose the shown mesh was built in.
     mesh_frame: Pose,
     buffers: Option<MeshBuffers>,
-    /// The supports changed since the last build started.
-    stale: bool,
+    /// The support mesh's evaluation node: what the shown mesh was built
+    /// from, and the build running. The mesh itself is kept above, as it is
+    /// moved along with the model.
+    built: Slot<MeshKey, ()>,
     building: Option<Build>,
-    /// A move removed the supports, and nobody was told yet.
-    removed_by_move: bool,
+    /// Supports that couldn't follow the model to a new orientation, scale
+    /// or surface: they keep their old route and are marked.
+    stranded: Vec<SupportId>,
+    /// The supports are frozen and the model was turned, lifted or scaled
+    /// since: they don't fit any more.
+    frozen_outdated: bool,
+    /// The Supports row is frozen: nothing is re-routed or regenerated.
+    pub frozen: bool,
+    /// Re-routing to the model's new pose: what it is for and the job.
+    pub reroute: Slot<RerouteKey, ()>,
+    /// Waits for the pose to settle before re-routing, so dragging a
+    /// rotation re-routes once.
+    settle: Debounce<Pose>,
+    /// The surface the supports were routed on, and the model's surface now
+    /// (by identity). A different surface (a repair, a new cavity, a
+    /// replaced mesh) calls for a re-route too. Unknown after loading: the
+    /// first surface seen is taken as theirs.
+    routed_on: Option<MeshId>,
+    surface: Option<MeshId>,
 }
 
 /// A mesh being built in the background, for supports stored in `frame`.
 struct Build {
     handle: JoinHandle<Built>,
+    key: MeshKey,
     frame: Pose,
+}
+
+/// What the support mesh is built from: the support sets (by identity), the
+/// raft, the resolution and the pose the sets are stored for.
+#[derive(Clone)]
+struct MeshKey {
+    auto: Arc<SupportSet>,
+    manual: Arc<SupportSet>,
+    raft: RaftConfig,
+    resolution: u32,
+    frame: Pose,
+}
+
+impl PartialEq for MeshKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.auto, &other.auto)
+            && Arc::ptr_eq(&self.manual, &other.manual)
+            && self.raft == other.raft
+            && self.resolution == other.resolution
+            && self.frame == other.frame
+    }
 }
 
 struct Built {
@@ -117,67 +170,111 @@ impl Pose {
 
 impl Supports {
     pub fn set_resolution(&mut self, resolution: u32) {
-        if self.resolution != resolution {
-            self.resolution = resolution;
-            self.invalidate_cache();
+        self.resolution = resolution;
+    }
+
+    /// What the support mesh has to be built from now.
+    fn mesh_key(&self) -> MeshKey {
+        MeshKey {
+            auto: self.auto.clone(),
+            manual: self.manual.clone(),
+            raft: self.raft,
+            resolution: self.resolution,
+            frame: self.frame,
         }
     }
 
-    /// Marks the mesh for a rebuild. The current one stays shown meanwhile.
-    pub fn invalidate_cache(&mut self) {
-        self.stale = true;
-    }
-
     /// Takes in a finished background build and starts the next one if the
-    /// supports changed. Runs once a frame.
+    /// supports changed. Runs once a frame (the viewport, the consumer of
+    /// the mesh, always wants it).
+    ///
+    /// A build that finishes after the supports changed again is still
+    /// shown, as the newest mesh there is, but doesn't count as current.
     pub fn update(&mut self) {
         if self
             .building
             .as_ref()
             .is_some_and(|b| b.handle.is_finished())
         {
-            let build = self.building.take().unwrap();
+            let Some(build) = self.building.take() else {
+                return;
+            };
+            self.built.finish(&build.key, None);
             if let Ok(built) = build.handle.join() {
+                self.built.insert(build.key, Arc::new(()));
                 self.show(built, build.frame);
             }
         }
-        if self.stale && self.building.is_none() {
-            self.stale = false;
-            if self.is_empty() {
-                self.show(
-                    Built {
-                        mesh: None,
-                        raft: None,
-                    },
-                    self.frame,
-                );
-                return;
+        let key = self.mesh_key();
+        if self.is_empty() {
+            self.built.supersede(key.clone());
+            if self.built.get(&key).is_none() && self.building.is_none() {
+                self.built.insert(key, Arc::new(()));
+                let empty = Built {
+                    mesh: None,
+                    raft: None,
+                };
+                self.show(empty, self.frame);
             }
+            return;
+        }
+        if self.building.is_none()
+            && let Some(ticket) = self.built.request(key)
+        {
             let (auto, manual) = (self.auto.clone(), self.manual.clone());
             let (raft, resolution) = (self.raft, self.resolution);
             self.building = Some(Build {
                 handle: thread::spawn(move || build(&auto, &manual, &raft, resolution)),
+                key: ticket.key,
                 frame: self.frame,
             });
         }
     }
 
+    /// Feeds what the support mesh is built from, and where it is placed,
+    /// into `hash`.
+    pub fn hash_inputs(&self, hash: &mut InputHasher) {
+        let mut raft = DynamicSerializer::new();
+        self.raft.serialize(&mut raft);
+        hash.arc(&self.auto)
+            .arc(&self.manual)
+            .hash(&raft.into_inner())
+            .u64(self.resolution as u64);
+        for pose in [self.frame, self.pose] {
+            hash.vector(&pose.position)
+                .vector(&pose.scale)
+                .vector(&pose.rotation);
+        }
+    }
+
     /// Whether the shown mesh is of the current supports.
     pub fn is_current(&self) -> bool {
-        !self.stale && self.building.is_none()
+        self.built.get(&self.mesh_key()).is_some()
+    }
+
+    /// The state of the support mesh node.
+    pub fn slot_state(&self) -> SlotState {
+        match self.is_current() {
+            true => SlotState::Fresh,
+            false if self.building.is_some() => SlotState::Computing,
+            false => SlotState::Stale,
+        }
     }
 
     /// The mesh of the current supports, waiting for it if need be. For
     /// slicing, which must not use a stale mesh.
     pub fn finished_mesh(&mut self) -> &Option<(Mesh, FaceMap)> {
-        if let Some(build) = self.building.take()
-            && let Ok(built) = build.handle.join()
-        {
-            self.show(built, build.frame);
+        if let Some(build) = self.building.take() {
+            self.built.finish(&build.key, None);
+            if let Ok(built) = build.handle.join() {
+                self.built.insert(build.key, Arc::new(()));
+                self.show(built, build.frame);
+            }
         }
-        if self.stale {
-            self.stale = false;
+        if !self.is_current() {
+            let key = self.mesh_key();
             let built = build(&self.auto, &self.manual, &self.raft, self.resolution);
+            self.built.insert(key, Arc::new(()));
             self.show(built, self.frame);
         }
         &self.mesh
@@ -197,14 +294,40 @@ impl Supports {
     }
 
     pub fn set_raft(&mut self, raft: RaftConfig) {
-        if self.raft != raft {
-            self.raft = raft;
-            self.invalidate_cache();
-        }
+        self.raft = raft;
+    }
+
+    /// The supports that kept their old route, if any are marked.
+    pub fn stranded(&self) -> Option<&[SupportId]> {
+        (!self.stranded.is_empty()).then_some(&self.stranded[..])
+    }
+
+    pub fn frozen_outdated(&self) -> bool {
+        self.frozen_outdated
+    }
+
+    /// Puts back the marks saved with the project.
+    pub fn set_marks(&mut self, stranded: Vec<SupportId>, frozen_outdated: bool) {
+        self.stranded = stranded;
+        self.frozen_outdated = frozen_outdated;
+    }
+
+    /// Whether there are hand-placed supports.
+    pub fn has_manual(&self) -> bool {
+        !self.manual.supports.is_empty()
     }
 
     pub fn is_empty(&self) -> bool {
         self.auto.supports.is_empty() && self.manual.supports.is_empty()
+    }
+
+    /// Removes the auto supports (and the braces to them), keeping the
+    /// hand-placed ones, for a generation about to replace them.
+    pub fn clear_auto(&mut self) {
+        let old = std::mem::take(Arc::make_mut(&mut self.auto));
+        if !self.manual.supports.is_empty() {
+            Arc::make_mut(&mut self.manual).remove_braces_on(&old.supports);
+        }
     }
 
     /// Removes every support and cancels a running generation.
@@ -212,9 +335,10 @@ impl Supports {
         self.auto = Arc::default();
         self.manual = Arc::default();
         self.frame = self.pose;
-        self.pending = None;
-        self.stale = false;
+        self.cancel_generation();
         self.building = None;
+        self.built.clear();
+        self.built.insert(self.mesh_key(), Arc::new(()));
         self.show(
             Built {
                 mesh: None,
@@ -226,22 +350,102 @@ impl Supports {
 
     /// Follows the model to `pose`, clearing the supports if they can't
     /// follow.
+    /// Follows the model to `pose`. Moving across the plate and turning
+    /// about z carry the supports along as they are; any other change
+    /// (lifting, tilting, scaling) leaves them stored for the old pose until
+    /// they are re-routed ([`Supports::needs_reroute`]), or, frozen, marks
+    /// them as no longer fitting. A generation running for the old pose is
+    /// cancelled.
     pub fn set_pose(&mut self, pose: Pose) {
         self.pose = pose;
         if self.frame.motion_to(&pose).is_none() {
-            if !self.is_empty() || self.pending.is_some() {
-                self.removed_by_move |= !self.is_empty();
-                self.clear();
+            self.cancel_generation();
+            if self.is_empty() {
+                self.frame = pose;
+                self.mesh_frame = pose;
+            } else if self.frozen {
+                self.frozen_outdated = true;
             }
-            self.frame = pose;
-            self.mesh_frame = pose;
+        } else {
+            self.frozen_outdated = false;
         }
         self.place_mesh();
     }
 
-    /// Whether a move removed the supports since the last call.
-    pub fn take_removed_by_move(&mut self) -> bool {
-        std::mem::take(&mut self.removed_by_move)
+    /// Whether the supports wait to be routed again for the model's pose.
+    pub fn needs_reroute(&self) -> bool {
+        let moved = self.frame.motion_to(&self.pose).is_none();
+        let resurfaced = self.routed_on.is_some() && self.routed_on != self.surface;
+        !self.frozen && !self.is_empty() && (moved || resurfaced)
+    }
+
+    /// What a re-route has to start from now, once the pose has settled, and
+    /// the ticket to start it with.
+    pub fn poll_reroute(&mut self, surface: MeshId, now: Instant) -> Option<Ticket<RerouteKey>> {
+        self.surface = Some(surface);
+        self.routed_on.get_or_insert(surface);
+        if !self.needs_reroute() {
+            self.reroute.withdraw();
+            self.settle.reset();
+            return None;
+        }
+        let key = RerouteKey {
+            from: self.frame,
+            to: self.pose,
+            surface,
+        };
+        // Not moved, only resurfaced: settled already.
+        if self.frame.motion_to(&self.pose).is_some() {
+            self.reroute.supersede(key);
+            return self.reroute.request(key);
+        }
+        self.reroute.supersede(key);
+        match self.settle.settled(self.pose, now) {
+            true => self.reroute.request(key),
+            false => None,
+        }
+    }
+
+    /// The input of the re-route for `key`.
+    pub fn reroute_input(
+        &self,
+        key: RerouteKey,
+        surface: Mesh,
+        bvh: Option<Arc<Bvh>>,
+        generator: Option<AutoPlacement>,
+    ) -> RerouteInput {
+        RerouteInput {
+            auto: self.auto.clone(),
+            manual: self.manual.clone(),
+            key,
+            surface,
+            bvh,
+            generator,
+        }
+    }
+
+    /// Takes in a re-route, unless the supports or the pose changed since it
+    /// started. Returns whether it was taken.
+    pub fn finish_reroute(&mut self, key: &RerouteKey, rerouted: Option<Rerouted>) -> bool {
+        let current =
+            key.from == self.frame && key.to == self.pose && Some(key.surface) == self.surface;
+        let kept = self.reroute.finish(key, Some(())) && current;
+        let Some(rerouted) = rerouted.filter(|_| kept) else {
+            return false;
+        };
+        self.auto = Arc::new(rerouted.auto);
+        self.manual = Arc::new(rerouted.manual);
+        self.frame = self.pose;
+        self.routed_on = Some(key.surface);
+        self.stranded = rerouted.stranded;
+        true
+    }
+
+    /// The model's surface was replaced by something unrelated (Replace,
+    /// Reload): every support is checked against it again.
+    pub fn surface_replaced(&mut self) {
+        // Anything but the new surface's id makes it differ.
+        self.routed_on = self.routed_on.or(self.surface);
     }
 
     /// Brings the stored coordinates to the current pose.
@@ -279,17 +483,14 @@ impl Supports {
     /// Puts back a snapshot taken at the current pose, cancelling a running
     /// generation.
     pub fn restore_snapshot(&mut self, snapshot: SupportsSnapshot) {
-        // An undo moving the model back first is no news.
-        self.removed_by_move = false;
         self.auto = snapshot.auto;
         self.manual = snapshot.manual;
         self.raft = snapshot.raft;
         self.frame = snapshot.frame;
-        self.pending = None;
-        self.invalidate_cache();
-        if self.frame.motion_to(&self.pose).is_none() {
-            self.clear();
-        }
+        self.cancel_generation();
+        self.stranded.retain(|id| {
+            (self.auto.supports.iter().chain(self.manual.supports.iter())).any(|s| s.id == *id)
+        });
     }
 
     /// Replaces the stored support sets and raft, for deserialization. The
@@ -299,7 +500,6 @@ impl Supports {
         self.manual = Arc::new(manual);
         self.raft = raft;
         self.frame = self.pose;
-        self.invalidate_cache();
     }
 
     /// Both sets in world space, for saving.
@@ -377,14 +577,23 @@ impl Supports {
     }
 
     /// Marks the model as waiting on generation `token` and returns the pose
-    /// the generation runs in.
-    pub fn begin_generation(&mut self, token: u64) -> Pose {
-        self.pending = Some(token);
+    /// the generation runs in. A generation still running is cancelled; so
+    /// is this one once anything else replaces the supports. The generation
+    /// checks `cancel` as it goes.
+    pub fn begin_generation(&mut self, token: u64, cancel: CancelToken) -> Pose {
+        self.cancel_generation();
+        self.pending = Some((token, cancel));
         self.pose
     }
 
     pub fn is_pending(&self, token: u64) -> bool {
-        self.pending == Some(token)
+        self.pending.as_ref().is_some_and(|(t, _)| *t == token)
+    }
+
+    fn cancel_generation(&mut self) {
+        if let Some((_, cancel)) = self.pending.take() {
+            cancel.cancel();
+        }
     }
 
     /// Replaces the auto supports with the result of generation `token`, run
@@ -406,7 +615,7 @@ impl Supports {
         mesh: &Mesh,
         bvh: &Bvh,
     ) -> bool {
-        if self.pending != Some(token) {
+        if !self.is_pending(token) {
             return false;
         }
         self.pending = None;
@@ -414,27 +623,9 @@ impl Supports {
             return false;
         };
 
-        let (tip_radius, radius, depth) = (
-            config.tip_radius.get::<Milimeter>(),
-            config.radius.get::<Milimeter>(),
-            config.contact_depth.get::<Milimeter>(),
-        );
-        let mut set = SupportSet::default();
-        for points in generated.plate {
-            set.add_routed(SupportId::new(), tip_radius, radius, depth, points);
-        }
-        for landing in &generated.landings {
-            set.add_landing(SupportId::new(), tip_radius, radius, landing);
-        }
-        for leg in network.legs {
-            set.add_routed(SupportId::new(), tip_radius, radius, depth, leg);
-        }
-        set.braces = network.braces;
-        for (index, bottom_z) in network.fork_bottoms {
-            set.truncate_pillar(index, bottom_z);
-        }
-        set.set_preset(config);
+        let mut set = auto_set(config, generated, network);
         set.transform(&motion);
+        self.routed_on = Some(mesh.mesh_id());
 
         self.bake();
         let old = mem::replace(&mut self.auto, Arc::new(set));
@@ -450,7 +641,6 @@ impl Supports {
                 manual.braces.extend(braces);
             }
         }
-        self.invalidate_cache();
         true
     }
 
@@ -458,13 +648,14 @@ impl Supports {
     /// onto the model below), and braces it to its nearest neighbours.
     pub fn add_manual(&mut self, config: &SupportPreset, routed: &Routed, mesh: &Mesh, bvh: &Bvh) {
         self.bake();
-        let support = single(config, routed);
+        let Some(support) = single(config, routed) else {
+            return;
+        };
         let (auto, manual) = (
             Arc::make_mut(&mut self.auto),
             Arc::make_mut(&mut self.manual),
         );
         insert(auto, manual, false, support, mesh, bvh);
-        self.invalidate_cache();
     }
 
     /// Removes the given supports and every brace that ends on them, in
@@ -476,7 +667,7 @@ impl Supports {
             Arc::make_mut(&mut self.manual),
         );
         remove(auto, manual, ids);
-        self.invalidate_cache();
+        self.stranded.retain(|id| !ids.contains(id));
     }
 
     /// Re-routes support `id` from a new contact, keeping its id and set, and
@@ -495,7 +686,6 @@ impl Supports {
             Arc::make_mut(&mut self.manual),
         );
         replace(auto, manual, id, config, routed, mesh, bvh);
-        self.invalidate_cache();
     }
 
     /// The current sets at the current pose, for an edit made on another
@@ -518,7 +708,6 @@ impl Supports {
         if unchanged {
             self.auto = Arc::new(auto);
             self.manual = Arc::new(manual);
-            self.invalidate_cache();
         }
         unchanged
     }
@@ -533,7 +722,7 @@ impl Supports {
             .as_ref()
             .filter(|_| self.mesh_frame == self.frame);
         let set = SupportSet {
-            supports: vec![single(config, routed)],
+            supports: single(config, routed).into_iter().collect(),
             ..SupportSet::default()
         }
         .with_feet(raft);
@@ -547,7 +736,13 @@ impl Supports {
 
     /// The shown mesh, which may lag the supports by a background build.
     pub fn mesh(&self) -> &Option<(Mesh, FaceMap)> {
-        &self.mesh
+        // Waiting to be routed again, the mesh shows the supports where they
+        // were: hidden instead.
+        static NONE: Option<(Mesh, FaceMap)> = None;
+        match self.needs_reroute() {
+            true => &NONE,
+            false => &self.mesh,
+        }
     }
 
     pub fn support_for_face(&mut self, face: u32) -> Option<SupportId> {
@@ -555,7 +750,13 @@ impl Supports {
         (map.iter().find(|(_, r)| r.contains(&face))).map(|(id, _)| *id)
     }
 
+    /// The support mesh's GPU buffers; none while waiting to be routed
+    /// again, like [`Self::mesh`].
     pub fn get_buffers(&mut self, device: &Device) -> &Option<MeshBuffers> {
+        static NONE: Option<MeshBuffers> = None;
+        if self.needs_reroute() {
+            return &NONE;
+        }
         if self.buffers.is_none()
             && let Some((mesh, _)) = self.mesh()
         {
@@ -566,10 +767,11 @@ impl Supports {
     }
 
     pub fn try_get_buffers(&self) -> Option<(&MeshBuffers, u32)> {
-        self.buffers.as_ref().map(|x| {
-            let face_count = self.mesh.as_ref().unwrap().0.face_count() as u32 * 3;
-            (x, face_count)
-        })
+        if self.needs_reroute() {
+            return None;
+        }
+        let (buffers, mesh) = (self.buffers.as_ref()?, self.mesh.as_ref()?);
+        Some((buffers, mesh.0.face_count() as u32 * 3))
     }
 
     pub fn preview(&mut self, device: &Device, color: SRgb<f32>) -> Option<PreviewModel> {
@@ -597,14 +799,41 @@ impl Supports {
             frame: self.frame,
             pose: self.pose,
             resolution: self.resolution,
-            stale: true,
             ..Self::default()
         }
     }
 }
 
+/// The auto support set of a generation run: the plate supports, the
+/// model-landing supports and the stabilising legs (after the plate
+/// supports, which keeps the network's support indices valid), tied
+/// together by the network's braces.
+pub fn auto_set(config: &SupportPreset, generated: Generated, network: BraceNetwork) -> SupportSet {
+    let (tip_radius, radius, depth) = (
+        config.tip_radius.get::<Milimeter>(),
+        config.radius.get::<Milimeter>(),
+        config.contact_depth.get::<Milimeter>(),
+    );
+    let mut set = SupportSet::default();
+    for points in generated.plate {
+        set.add_routed(SupportId::new(), tip_radius, radius, depth, points);
+    }
+    for landing in &generated.landings {
+        set.add_landing(SupportId::new(), tip_radius, radius, landing);
+    }
+    for leg in network.legs {
+        set.add_routed(SupportId::new(), tip_radius, radius, depth, leg);
+    }
+    set.braces = network.braces;
+    for (index, bottom_z) in network.fork_bottoms {
+        set.truncate_pillar(index, bottom_z);
+    }
+    set.set_preset(config);
+    set
+}
+
 /// A support routed as `routed`, built with `config`.
-fn single(config: &SupportPreset, routed: &Routed) -> Support {
+pub fn single(config: &SupportPreset, routed: &Routed) -> Option<Support> {
     let (tip_radius, radius) = (
         config.tip_radius.get::<Milimeter>(),
         config.radius.get::<Milimeter>(),
@@ -621,7 +850,7 @@ fn single(config: &SupportPreset, routed: &Routed) -> Support {
         Routed::Model(landing) => set.add_landing(SupportId::new(), tip_radius, radius, landing),
     }
     set.set_preset(config);
-    set.supports.pop().unwrap()
+    set.supports.pop()
 }
 
 /// Removes the given supports from either set, and every brace in either set
@@ -664,7 +893,9 @@ pub fn replace(
     if !into_auto && !manual.supports.iter().any(|s| s.id == id) {
         return;
     }
-    let mut support = single(config, routed);
+    let Some(mut support) = single(config, routed) else {
+        return;
+    };
     support.id = id;
     remove(auto, manual, &HashSet::from([id]));
     insert(auto, manual, into_auto, support, mesh, bvh);
@@ -779,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn lifting_tilting_or_scaling_clears_supports() {
+    fn lifting_tilting_or_scaling_keeps_supports_for_re_routing() {
         let at = pose([0.0, 0.0, 5.0], [0.0; 3]);
         let changes = [
             pose([0.0, 0.0, 6.0], [0.0; 3]),
@@ -792,26 +1023,30 @@ mod tests {
         for change in changes {
             let mut supports = supported(at);
             supports.set_pose(change);
-            assert!(supports.is_empty());
-            assert!(supports.take_removed_by_move());
-            assert!(!supports.take_removed_by_move());
+            assert!(!supports.is_empty(), "nothing is deleted");
+            assert!(supports.needs_reroute());
+            assert!(supports.mesh().is_none(), "hidden until re-routed");
         }
+        // Frozen, they stay, and are marked as no longer fitting.
+        let mut supports = supported(at);
+        supports.frozen = true;
+        supports.set_pose(changes[1]);
+        assert!(!supports.needs_reroute() && supports.frozen_outdated());
     }
 
     #[test]
-    fn snapshot_brings_back_cleared_supports() {
+    fn undoing_a_tilt_needs_no_re_route() {
         let at = pose([0.0, 0.0, 5.0], [0.0; 3]);
         let mut supports = supported(at);
         let snapshot = supports.snapshot();
 
-        supports.set_pose(pose([0.0, 0.0, 9.0], [0.0; 3]));
-        assert!(supports.is_empty());
+        supports.set_pose(pose([0.0, 0.0, 9.0], [0.3, 0.0, 0.0]));
+        assert!(supports.needs_reroute());
 
-        // Undo: the model goes back first, then the snapshot. That is no
-        // news to report.
+        // Undo: the model goes back first, then the snapshot.
         supports.set_pose(at);
         supports.restore_snapshot(snapshot);
-        assert!(!supports.take_removed_by_move());
+        assert!(!supports.needs_reroute());
         assert!((contact(&supports) - Vector3::new(2.0, 0.0, 11.0)).magnitude() < 1e-5);
     }
 
@@ -842,9 +1077,14 @@ mod tests {
     fn cancelled_generation_is_dropped() {
         let at = pose([0.0, 0.0, 5.0], [0.0; 3]);
         let mut supports = supported(at);
-        supports.begin_generation(1);
+        let cancel = CancelToken::new();
+        supports.begin_generation(1, cancel.clone());
         let snapshot = supports.snapshot();
         supports.restore_snapshot(snapshot);
         assert!(!supports.is_pending(1));
+        assert!(
+            cancel.is_cancelled(),
+            "the running generation is told to stop"
+        );
     }
 }

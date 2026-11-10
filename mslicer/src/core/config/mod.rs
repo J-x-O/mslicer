@@ -15,6 +15,7 @@ use crate::core::config::{
     printers::Printer,
     render::RenderConfig,
     sliced::SlicedConfig,
+    stack::DefaultStack,
     ui::UiConfig,
 };
 
@@ -22,6 +23,7 @@ pub mod peripherals;
 pub mod printers;
 pub mod render;
 pub mod sliced;
+pub mod stack;
 pub mod ui;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -33,6 +35,8 @@ pub struct Config {
     pub spacenav: SpacenavConfig,
     pub remote_print: RemotePrintConfig,
     pub default_slice_config: SliceConfig,
+    /// The operations a newly imported model starts with.
+    pub default_stack: DefaultStack,
 
     pub recent_projects: Vec<PathBuf>,
     pub printers: Vec<Printer>,
@@ -95,6 +99,7 @@ impl Default for Config {
             spacenav: Default::default(),
             remote_print: Default::default(),
             default_slice_config: Default::default(),
+            default_stack: Default::default(),
 
             recent_projects: Vec::new(),
             printers: vec![Printer::new(

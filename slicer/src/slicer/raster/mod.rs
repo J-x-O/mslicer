@@ -30,64 +30,97 @@ pub struct Segment {
 impl Slicer {
     /// Actually runs the slicing operation, it is multithreaded.
     pub fn slice_raster(&self) -> Vec<Layer> {
+        self.slice_raster_until(&|| false).expect("never cancelled")
+    }
+
+    /// [`Slicer::slice_raster`], giving up (`None`) once `cancelled` returns
+    /// true. It is checked before each layer (each supersampled sub-layer).
+    pub fn slice_raster_until(&self, cancelled: &(dyn Fn() -> bool + Sync)) -> Option<Vec<Layer>> {
         let supersample = self.slice_config.supersample;
-        let remap = self.slice_config.exposure_remap.table();
-
-        let real_platform = self.slice_config.platform_resolution;
-        let platform = real_platform * supersample.xy as u32;
-        let pixels = platform.x as u64 * platform.y as u64;
-
-        // A segment contains a reference to all of the triangles it contains. By
-        // splitting the mesh into segments, not all triangles need to be tested
-        // to find all intersections. This massively speeds up the slicing
-        // operation and actually makes it faster than most other slicers. :p
-        let segments = (self.models.iter())
-            .map(|model| Segments1D::from_mesh(&model.mesh, &model.bounds, SEGMENT_LAYERS))
-            .collect::<Vec<_>>();
+        let segments = self.segments();
 
         (0..self.layers * supersample.z as u32)
             .into_par_iter()
-            .map(|i| {
-                let height = i as f32 / supersample.z as f32
-                    * self.slice_config.slice_height.get::<Milimeter>();
-
-                // Gets all the intersections between the slice plane and the
-                // model. Because all the faces are triangles, every triangle
-                // intersection will return two points. These can then be
-                // interpreted as line segments making up a polygon.
-                let segments = self.models.iter().enumerate().flat_map(|(idx, model)| {
-                    let intersections = segments[idx].intersect_plane(&model.mesh, height);
-                    intersections.into_iter().map(|(pos, dir)| Segment {
-                        endpoints: pos.map(|x| x * supersample.xy as f32),
-                        entering: dir,
-                        priority: model.exposure,
-                        exposure: model.exposure,
-                    })
-                });
-
-                layer(supersample.xy, real_platform, segments)
-            })
+            .map(|i| (!cancelled()).then(|| self.sample(&segments, i)))
             .chunks(supersample.z as usize)
             .enumerate()
-            .map(|(i, mut chunk)| {
-                let (mut data, errors) = if supersample.z > 1 {
-                    let data = downsample_to_vec(&chunk, pixels);
-                    let errors = chunk.iter().map(|x| x.1).sum();
-                    (data, errors)
-                } else {
-                    chunk.pop().unwrap()
-                };
-
-                data.iter_mut()
-                    .filter(|x| x.value > 0)
-                    .for_each(|x| x.value = remap[x.value as usize]);
-
-                let exposure = self.slice_config.exposure_config(i as u32).into_owned();
-                let height = (i + 1) as f32 * self.slice_config.slice_height;
-                Layer::new(data, height, exposure).with_defects(errors)
+            .map(|(i, chunk)| {
+                let chunk = chunk.into_iter().collect::<Option<Vec<_>>>()?;
+                Some(self.finish_layer(i as u32, chunk))
             })
             .inspect(|_| self.progress.add_complete(1))
+            .collect::<Option<Vec<_>>>()
+    }
+
+    /// One layer (0 is the first), sliced on its own, exactly as
+    /// [`Slicer::slice_raster`] slices it. Post-processing (which works on
+    /// the whole stack of layers) is not applied.
+    pub fn slice_raster_layer(&self, index: u32) -> Layer {
+        let z = self.slice_config.supersample.z as u32;
+        let segments = self.segments();
+        let chunk = (index * z..(index + 1) * z)
+            .into_par_iter()
+            .map(|i| self.sample(&segments, i))
+            .collect::<Vec<_>>();
+        self.finish_layer(index, chunk)
+    }
+
+    // A segment contains a reference to all of the triangles it contains. By
+    // splitting the mesh into segments, not all triangles need to be tested
+    // to find all intersections. This massively speeds up the slicing
+    // operation and actually makes it faster than most other slicers. :p
+    fn segments(&self) -> Vec<Segments1D> {
+        (self.models.iter())
+            .map(|model| Segments1D::from_mesh(&model.mesh, &model.bounds, SEGMENT_LAYERS))
             .collect::<Vec<_>>()
+    }
+
+    /// Rasterizes supersampled sub-layer `i`.
+    fn sample(&self, segments: &[Segments1D], i: u32) -> (Vec<Run>, u64) {
+        let supersample = self.slice_config.supersample;
+        let real_platform = self.slice_config.platform_resolution;
+        let height =
+            i as f32 / supersample.z as f32 * self.slice_config.slice_height.get::<Milimeter>();
+
+        // Gets all the intersections between the slice plane and the
+        // model. Because all the faces are triangles, every triangle
+        // intersection will return two points. These can then be
+        // interpreted as line segments making up a polygon.
+        let segments = self.models.iter().enumerate().flat_map(|(idx, model)| {
+            let intersections = segments[idx].intersect_plane(&model.mesh, height);
+            intersections.into_iter().map(|(pos, dir)| Segment {
+                endpoints: pos.map(|x| x * supersample.xy as f32),
+                entering: dir,
+                priority: model.exposure,
+                exposure: model.exposure,
+            })
+        });
+
+        layer(supersample.xy, real_platform, segments)
+    }
+
+    /// Combines the sub-layers of layer `i` into the layer.
+    fn finish_layer(&self, i: u32, mut chunk: Vec<(Vec<Run>, u64)>) -> Layer {
+        let supersample = self.slice_config.supersample;
+        let remap = self.slice_config.exposure_remap.table();
+        let platform = self.slice_config.platform_resolution * supersample.xy as u32;
+        let pixels = platform.x as u64 * platform.y as u64;
+
+        let (mut data, errors) = if supersample.z > 1 {
+            let data = downsample_to_vec(&chunk, pixels);
+            let errors = chunk.iter().map(|x| x.1).sum();
+            (data, errors)
+        } else {
+            chunk.pop().unwrap()
+        };
+
+        data.iter_mut()
+            .filter(|x| x.value > 0)
+            .for_each(|x| x.value = remap[x.value as usize]);
+
+        let exposure = self.slice_config.exposure_config(i).into_owned();
+        let height = (i + 1) as f32 * self.slice_config.slice_height;
+        Layer::new(data, height, exposure).with_defects(errors)
     }
 }
 

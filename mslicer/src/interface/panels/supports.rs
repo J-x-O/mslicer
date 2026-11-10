@@ -17,6 +17,7 @@ use crate::{
         App,
         history::ModelAction,
         project::model::ModelId,
+        stack,
         state::{EditedSupport, GeometryHit, SupportDrag, SupportEdit},
     },
     interface::components::grid,
@@ -496,9 +497,20 @@ fn generate_support(app: &mut App, model: usize) {
     let default_lift = app.project.support_config.default_lift.get::<Milimeter>();
 
     let model = &mut app.project.models[model];
-    (app.history).track_model(
-        model.id,
-        ModelAction::GeneratedSupports(model.mesh.position(), model.supports.snapshot()),
+    // A frozen Supports operation isn't regenerated.
+    if !stack::supports_editable(model) {
+        return;
+    }
+    let action = ModelAction::GeneratedSupports(model.mesh.position(), model.supports.snapshot());
+    let action = stack::supports_action(model, action);
+    (app.history).track_model(model.id, action);
+    // Regenerated from scratch; hand-placed supports stay (and follow the
+    // lift below).
+    model.supports.clear_auto();
+    stack::record_support_auto(
+        model,
+        &app.project.support_config.preset,
+        &app.project.support_config.auto_placement,
     );
 
     // Lift so the model's *lowest point* sits at `default_lift`, mirroring
@@ -605,9 +617,14 @@ pub fn manual_support_placement(app: &mut App, clicked: bool) {
     let Some(model) = app.project.models.iter_mut().find(|x| x.id == id) else {
         return;
     };
+    if !stack::supports_editable(model) {
+        return;
+    }
     app.state.support_preview = model.supports.preview_manual(config, &routed);
     if clicked {
-        (app.history).track_model(id, ModelAction::Supports(model.supports.snapshot()));
+        let action = ModelAction::Supports(model.supports.snapshot());
+        let action = stack::supports_action(model, action);
+        (app.history).track_model(id, action);
         if let Some(bvh) = model.bvh.clone() {
             model
                 .supports
@@ -652,12 +669,10 @@ pub fn drag_support(app: &mut App, released: bool) {
     };
     let config = &config;
     let routed = route_under_pointer(app, config, Some(drag.model));
-    let model = app
-        .project
-        .models
-        .iter_mut()
-        .find(|x| x.id == drag.model)
-        .unwrap();
+    let Some(model) = app.project.models.iter_mut().find(|x| x.id == drag.model) else {
+        app.state.support_drag = None;
+        return;
+    };
 
     app.state.support_preview = None;
     if let Some((_, routed)) = routed {

@@ -14,8 +14,9 @@ pub fn tokenize<T: Deserializer>(
     let mut carry = String::new();
 
     while complete < size {
-        let next = des.read_bytes(8 * 1024);
-        if next.is_empty() && carry.is_empty() {
+        // Up to the end: asking for more would mark the input truncated.
+        let next = des.read_bytes((size - complete).min(8 * 1024));
+        if next.is_empty() {
             break;
         }
 
@@ -31,6 +32,8 @@ pub fn tokenize<T: Deserializer>(
         }
     }
 
-    (!carry.is_empty()).then(|| callback(&carry));
+    if !carry.is_empty() {
+        callback(&carry)?;
+    }
     Ok(())
 }

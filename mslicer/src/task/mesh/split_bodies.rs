@@ -2,12 +2,15 @@ use std::{collections::HashMap, mem};
 
 use clone_macro::clone;
 use common::{container::ArrayCluster, progress::Progress};
+use nalgebra::Vector3;
 use slicer::geometry::mesh::Mesh;
 
 use crate::{
     core::project::{
         Collection,
-        model::{Model, ModelId},
+        hollow::HollowSpec,
+        model::{MeshUnit, Model, ModelId},
+        stack::Stack,
     },
     task::{MeshAnalysis, PollResult, Task, TaskApp, TaskStatus, thread::TaskThread},
 };
@@ -15,15 +18,41 @@ use crate::{
 pub struct SplitBodies {
     parent: ModelId,
     collection: Collection,
+    /// What each body takes over from the model: its placement, stack and
+    /// hollowing.
+    template: Template,
 
     progress: Progress,
     handle: TaskThread<Vec<Mesh>>,
 }
 
+struct Template {
+    position: Vector3<f32>,
+    scale: Vector3<f32>,
+    rotation: Vector3<f32>,
+    stack: Stack,
+    hollow: HollowSpec,
+    exposure: u8,
+    unit: MeshUnit,
+}
+
 impl SplitBodies {
+    /// Splits the model's source into its bodies. Each becomes a model of
+    /// its own, placed like the model and with a copy of its stack, so the
+    /// operations run on each body. (Hand-placed and generated supports
+    /// belong to the whole and aren't copied.)
     pub fn new(model: &mut Model) -> Self {
         let collection = Collection::new(model.name.to_owned());
-        let mesh = model.mesh.clone();
+        let mesh = Mesh::from_inner(model.source.clone());
+        let template = Template {
+            position: model.mesh.position(),
+            scale: model.mesh.scale(),
+            rotation: model.mesh.rotation(),
+            stack: model.stack.clone(),
+            hollow: model.hollow.spec.clone(),
+            exposure: model.exposure,
+            unit: model.unit,
+        };
 
         let progress = Progress::new();
         Self {
@@ -67,6 +96,7 @@ impl SplitBodies {
                 out
             })),
             collection,
+            template,
             progress,
         }
     }
@@ -80,11 +110,20 @@ impl Task for SplitBodies {
                 let mut result = PollResult::complete();
 
                 let collection = mem::take(&mut self.collection);
-                for (i, mesh) in meshes.into_iter().enumerate() {
+                let template = &self.template;
+                for (i, mut mesh) in meshes.into_iter().enumerate() {
+                    mesh.set_position_unchecked(template.position);
+                    mesh.set_scale_unchecked(template.scale);
+                    mesh.set_rotation_unchecked(template.rotation);
+                    mesh.update_transformation_matrix();
                     let mut model = Model::from_mesh(mesh)
                         .with_name(format!("Body {i}"))
                         .with_collection(Some(collection.id))
+                        .with_exposure(template.exposure)
+                        .with_unit(template.unit)
                         .with_random_color(app.config.ui.warning_color);
+                    model.stack = template.stack.copied();
+                    model.hollow.spec = template.hollow.clone();
                     model.update_oob(&app.project.slice_config.platform_size);
                     result = result.with_task(MeshAnalysis::new(&model));
                     app.project.models.push(model);

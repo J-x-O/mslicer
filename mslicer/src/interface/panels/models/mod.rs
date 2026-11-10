@@ -11,17 +11,22 @@ use crate::{
     core::{
         App,
         history::{Action, ModelAction},
-        project::Collection,
+        project::{Collection, stack::Op},
+        stack,
     },
     interface::panels::models::{
         collection::{collection, collection_entry, collection_properties},
-        model::model_properties,
+        model::{model_properties, operations},
     },
     task::BuildAccelerationStructures,
 };
 
 mod collection;
 mod model;
+
+pub use model::{
+    add_operation, add_operation_menu, apply as apply_operation, model_entry, operation_buttons,
+};
 
 const DELETE_SHORTCUT: Key = Key::D;
 const COLLECT_SHORTCUT: Key = Key::G;
@@ -36,6 +41,7 @@ enum UiAction {
     None,
     Remove(usize),
     Duplicate(usize),
+    AddOperation(usize, Op),
 }
 
 struct DraggedModel {
@@ -56,36 +62,10 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         .frame(Frame::new().inner_margin(2.0))
         .default_height(f32::MAX);
 
-    if let Some(id) = app.state.selected.single_model()
-        && let Some(model) = app.project.models.iter_mut().position(|x| x.id == id)
-    {
-        let mut action = UiAction::None;
+    if app.state.selected.has_any() {
         pannel.show_inside(ui, |ui| {
             ui.add_space(4.0);
-            model_properties(app, ui, ctx, &mut action, model)
-        });
-
-        match action {
-            UiAction::Remove(i) => {
-                let model = Box::new(app.project.models.remove(i));
-                app.history.track(Action::ModelRemoved { index: i, model });
-            }
-            UiAction::Duplicate(i) => {
-                let model = app.project.models[i].clone();
-                app.history.track(Action::ModelAdded { id: model.id });
-                app.project.models.push(model);
-            }
-            UiAction::None => {}
-        }
-    } else if app.state.selected.has_models() {
-        pannel.show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            selection_properties(app, ui);
-        });
-    } else if let Some(id) = app.state.selected.single_collection() {
-        pannel.show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            collection_properties(app, ui, id);
+            selection(app, ui, ctx);
         });
     }
 
@@ -178,6 +158,39 @@ pub fn ui(app: &mut App, ui: &mut Ui, ctx: &Context) {
         let resp = ui.interact(fill, ui.id().with("deselect"), Sense::click());
         resp.clicked().then(|| app.state.selected.clear());
     });
+}
+
+/// The properties of the selected models or collection, and with one model
+/// its operations.
+pub fn selection(app: &mut App, ui: &mut Ui, ctx: &Context) {
+    if let Some(id) = app.state.selected.single_model()
+        && let Some(model) = app.project.models.iter_mut().position(|x| x.id == id)
+    {
+        let mut action = UiAction::None;
+        model_properties(app, ui, ctx, &mut action, model);
+        operations(app, ui, id);
+
+        match action {
+            UiAction::Remove(i) => {
+                let model = Box::new(app.project.models.remove(i));
+                app.history.track(Action::ModelRemoved { index: i, model });
+            }
+            UiAction::Duplicate(i) => {
+                let model = app.project.models[i].clone();
+                app.history.track(Action::ModelAdded { id: model.id });
+                app.project.models.push(model);
+            }
+            UiAction::AddOperation(i, op) => {
+                let id = app.project.models[i].id;
+                stack::add(stack::of(app), id, op);
+            }
+            UiAction::None => {}
+        }
+    } else if app.state.selected.has_models() {
+        selection_properties(app, ui);
+    } else if let Some(id) = app.state.selected.single_collection() {
+        collection_properties(app, ui, id);
+    }
 }
 
 fn shortcut(response: Response, key: Key) -> bool {

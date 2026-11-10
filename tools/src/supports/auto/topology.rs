@@ -166,6 +166,7 @@ pub fn plate_floor(base_height: f32, boss_height: f32) -> f32 {
 
 /// The complete brace network: 45° spanning-tree braces plus inverted-V fork
 /// links, and the pillar truncations the forks impose.
+#[derive(Default)]
 pub struct BraceNetwork {
     pub braces: Vec<Part>,
     /// `(support_index, bottom_z)`: the vertical pillar of support

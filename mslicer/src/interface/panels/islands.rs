@@ -107,7 +107,9 @@ fn running(app: &mut App, ui: &mut Ui) {
     ui.add_space(4.0);
 
     let settings = app.state.island_settings;
-    let check = app.state.island_check.as_ref().unwrap();
+    let Some(check) = app.state.island_check.as_ref() else {
+        return;
+    };
     let left = check.walk(&settings).len();
     ui.horizontal_wrapped(|ui| {
         let fix_all = Button::new(concatcp!(PLUS, " Fix All"));
@@ -157,7 +159,9 @@ fn strip(app: &mut App, ui: &mut Ui) {
     }
 
     let settings = app.state.island_settings;
-    let check = app.state.island_check.as_ref().unwrap();
+    let Some(check) = app.state.island_check.as_ref() else {
+        return;
+    };
     let warning = app
         .config
         .ui
@@ -237,7 +241,9 @@ fn strip(app: &mut App, ui: &mut Ui) {
 /// Every island, bottom up per model.
 fn list(app: &mut App, ui: &mut Ui) {
     let settings = app.state.island_settings;
-    let check = app.state.island_check.as_ref().unwrap();
+    let Some(check) = app.state.island_check.as_ref() else {
+        return;
+    };
     let current = check.current(&settings).map(|(.., at)| at);
     let several = check.models.len() > 1;
     let rows: Vec<(IslandRef, String, Cover, bool)> = (check.listed(&settings).into_iter())

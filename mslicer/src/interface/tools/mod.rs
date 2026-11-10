@@ -39,6 +39,13 @@ pub struct Tools {
     brep_slicer: experimental::brep::BrepSlicer,
 }
 
+impl Tools {
+    /// Sliced Diff has two files to compare whose layer resolutions differ.
+    pub fn sliced_diff_mismatch(&self) -> bool {
+        self.sliced_diff.sources_specified() && !self.sliced_diff.matching_sources()
+    }
+}
+
 // i couldn't get lifetimes working to do this with a function... so
 #[macro_export]
 macro_rules! generator_tool {

@@ -19,7 +19,10 @@ use wgpu::{DeviceDescriptor, Features, Limits};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod core;
+mod engine;
 mod interface;
+#[cfg(test)]
+mod regression;
 mod render;
 mod system;
 mod task;
@@ -45,7 +48,9 @@ fn main() -> Result<()> {
     let format = tracing_subscriber::fmt::layer();
     let collector = egui_tracing::EventCollector::new();
 
-    let config_dir = dirs::config_dir().unwrap().join("mslicer");
+    let config_dir = (dirs::config_dir())
+        .context("Finding the config dir")?
+        .join("mslicer");
     fs::create_dir_all(&config_dir).context("Creating config dir")?;
 
     let log_file = File::create(config_dir.join("latest.log")).context("Opening log file")?;
@@ -127,7 +132,7 @@ fn main() -> Result<()> {
             Ok(Box::new(app))
         }),
     )
-    .unwrap();
+    .map_err(|e| anyhow::anyhow!("Couldn't open the window: {e}"))?;
 
     Ok(())
 }

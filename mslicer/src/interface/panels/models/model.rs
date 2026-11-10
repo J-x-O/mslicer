@@ -5,12 +5,12 @@ use common::{
 use const_format::concatcp;
 use egui::{
     Align, Button, CollapsingHeader, Color32, ComboBox, Context, DragValue, Label, Layout, Popup,
-    Response, Sense, TextEdit, Ui, UiBuilder, Widget, text::CCursorRange, vec2,
+    Response, RichText, Sense, TextEdit, Ui, UiBuilder, Widget, text::CCursorRange, vec2,
 };
 use egui_phosphor::regular::{
-    ARROW_LINE_DOWN, ARROWS_COUNTER_CLOCKWISE, BANDAIDS, COPY, CUBE, CURSOR_TEXT, DICE_THREE, EYE,
-    EYE_SLASH, FLOPPY_DISK_BACK, FOLDER_DASHED, INFO, LINE_SEGMENT, LINK_BREAK, LINK_SIMPLE,
-    SUBTRACT_SQUARE, SWAP, TRASH, VECTOR_THREE, WARNING,
+    ARROW_DOWN, ARROW_LINE_DOWN, ARROW_UP, ARROWS_COUNTER_CLOCKWISE, BANDAIDS, COPY, CUBE,
+    CURSOR_TEXT, DICE_THREE, EYE, EYE_SLASH, FLOPPY_DISK_BACK, FOLDER_DASHED, INFO, LINE_SEGMENT,
+    LINK_BREAK, LINK_SIMPLE, PLUS, SNOWFLAKE, SUBTRACT_SQUARE, SWAP, TRASH, VECTOR_THREE, WARNING,
 };
 use nalgebra::Vector3;
 
@@ -21,9 +21,10 @@ use crate::{
         history::ModelAction,
         project::{
             Collection, RenameState,
-            model::{MeshUnit, MeshWarnings},
+            model::{MeshUnit, MeshWarnings, Model, ModelId},
+            stack::{Mode, Op, Operation, OperationId, Repair, Section, Stack},
         },
-        state::Tool,
+        stack,
     },
     interface::{
         components::{being_edited, dragger, grid, history_tracked_model},
@@ -32,7 +33,7 @@ use crate::{
             SPLIT_SHORTCUT, UiAction, shortcut,
         },
     },
-    task::{FileDialog, FlipWinding, MeshRepair, MeshSave, ReloadModel, SplitBodies},
+    task::{FileDialog, MeshSave, ReloadModel, SplitBodies},
 };
 
 const WARN_DEFECTIVE: &str = "This mesh is defective, it may produce unexpected results when sliced.\nConsider running it through a mesh repair tool.";
@@ -124,7 +125,7 @@ pub fn model_entry(
                         let desc = match warning {
                             MeshWarnings::Defective => WARN_DEFECTIVE,
                             MeshWarnings::OutOfBounds => WARN_OUT_OF_BOUNDS,
-                            _ => unreachable!(),
+                            _ => continue,
                         };
                         warn = warn.on_hover_text(desc);
                     }
@@ -140,8 +141,6 @@ pub fn model_entry(
     response
 }
 
-const LOCKED_TIP: &str = "This would remove the supports. Switch to the select tool to change it.";
-
 pub fn model_properties(
     app: &mut App,
     ui: &mut Ui,
@@ -153,8 +152,8 @@ pub fn model_properties(
 
     let platform = &app.project.slice_config.platform_size;
     let id = model.id;
-    // In the support tool, changes that would remove the supports are locked.
-    let locked = app.state.tool == Tool::Support && !model.supports.is_empty();
+    // Nothing is locked: turning, lifting or scaling a supported model
+    // re-routes its supports (see `core::reroute`).
     let warning = app.config.ui.warning_color;
 
     ui.horizontal_wrapped(|ui| {
@@ -183,11 +182,8 @@ pub fn model_properties(
             app.project.collections.push(collection);
         }
 
-        let align = ui.add_enabled(
-            !locked,
-            Button::new(concatcp!(ARROW_LINE_DOWN, " Align to Bed")),
-        );
-        if shortcut(align.on_disabled_hover_text(LOCKED_TIP), ALIGN_SHORTCUT) && !locked {
+        let align = ui.button(concatcp!(ARROW_LINE_DOWN, " Align to Bed"));
+        if shortcut(align, ALIGN_SHORTCUT) {
             let old_pos = model.mesh.position();
             app.history.track_model(
                 id,
@@ -226,15 +222,16 @@ pub fn model_properties(
                 app.tasks.add(SplitBodies::new(model));
             }
 
+            // Both are operations now: they leave the imported mesh alone.
             if ui
                 .button(concatcp!(VECTOR_THREE, " Flip Winding Order"))
                 .clicked()
             {
-                app.tasks.add(FlipWinding::new(model));
+                *action = UiAction::AddOperation(i, Op::FlipWinding);
             }
 
             if ui.button(concatcp!(BANDAIDS, " Repair")).clicked() {
-                app.tasks.add(MeshRepair::new(model));
+                *action = UiAction::AddOperation(i, Op::Repair(Repair::default()));
             }
 
             ui.menu_button(concatcp!(FLOPPY_DISK_BACK, " Export"), |ui| {
@@ -244,7 +241,7 @@ pub fn model_properties(
                         .clicked()
                     {
                         // As it prints: hollowed, if it is.
-                        let mesh = model.hollow.print_mesh(&model.mesh).inner().clone();
+                        let mesh = model.print_mesh().inner().clone();
                         app.tasks.add(FileDialog::save_file(
                             ("Mesh", &[format.extension()]),
                             move |_app, path, tasks| {
@@ -265,9 +262,7 @@ pub fn model_properties(
                 ui.label("Position");
                 ui.horizontal(|ui| {
                     let mut position = model.mesh.position();
-                    let editable = [true, true, !locked];
-                    let editing =
-                        dragger::vec3_partial(ui, position.as_mut(), |x| x, editable, LOCKED_TIP);
+                    let editing = dragger::vec3(ui, position.as_mut(), |x| x);
                     history_tracked_model(
                         (editing, ui, &mut app.history),
                         (id, || {
@@ -282,7 +277,7 @@ pub fn model_properties(
 
                 ui.label("Scale");
 
-                ui.add_enabled_ui(!locked, |ui| {
+                {
                     ui.horizontal(|ui| {
                         let factor = model.unit.conversion();
                         let mut scale = model.mesh.scale() / factor;
@@ -310,31 +305,27 @@ pub fn model_properties(
                         model.ui.locked_scale ^= ui
                             .button([LINK_BREAK, LINK_SIMPLE][model.ui.locked_scale as usize])
                             .clicked();
-                    })
-                })
-                .response
-                .on_disabled_hover_text(LOCKED_TIP);
+                    });
+                }
                 ui.end_row();
 
                 ui.label("Rotation");
                 let mut rotation = rad_to_deg(model.mesh.rotation());
-                let editing = dragger::vec3_partial(
-                    ui,
-                    rotation.as_mut(),
-                    |x| x.suffix("°"),
-                    [!locked, !locked, true],
-                    LOCKED_TIP,
-                );
+                let editing = dragger::vec3(ui, rotation.as_mut(), |x| x.suffix("°"));
                 history_tracked_model(
                     (editing, ui, &mut app.history),
                     (id, || {
-                        ModelAction::Rotation(model.mesh.rotation(), model.supports.snapshot())
+                        ModelAction::Orientation(
+                            model.mesh.rotation(),
+                            model.mesh.position(),
+                            model.supports.snapshot(),
+                        )
                     }),
                 );
 
                 if editing {
                     let rad = deg_to_rad(rotation);
-                    (model.mesh.rotation() != rad).then(|| model.set_rotation(platform, rad));
+                    (model.mesh.rotation() != rad).then(|| model.rotate_resting(platform, rad));
                 }
 
                 ui.end_row();
@@ -426,6 +417,173 @@ pub fn model_properties(
             }
         });
     });
+}
+
+/// What a click in the operations list asks for.
+pub enum OperationAction {
+    Add(Op),
+    Remove(OperationId),
+    Move(OperationId, isize),
+    Bypass(OperationId, bool),
+    Freeze(OperationId, bool),
+}
+
+const BYPASS_TIP: &str = "Bypass: skip this operation but keep its settings.";
+const FREEZE_TIP: &str = "Freeze: keep the result as it is. It is no longer recomputed when something it depends on changes, and can't be edited until thawed.";
+const MODE_TIP: &str = "Auto: computed from its settings, recomputed when its inputs change.\nEdited: the auto result with your edits on top (placed supports, drilled holes).\nFrozen: kept as it is.";
+
+/// The model's operation stack: one row per operation, in evaluation order,
+/// with its mode, a bypass toggle, reordering within the geometry section,
+/// freezing and removal, and adding operations.
+pub fn operations(app: &mut App, ui: &mut Ui, id: ModelId) {
+    let Some(model) = app.project.models.iter().find(|m| m.id == id) else {
+        return;
+    };
+    let mut action = None;
+    CollapsingHeader::new("Operations")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label("Source: imported mesh").on_hover_text(
+                "The mesh as imported. Operations never change it: they are applied on top, in order.",
+            );
+            operation_rows(ui, model, &mut action);
+            ui.add_space(4.0);
+            if let Some(op) = add_operation_menu(ui, &model.stack) {
+                action = Some(OperationAction::Add(op));
+            }
+        });
+    apply(app, id, action);
+}
+
+fn operation_rows(ui: &mut Ui, model: &Model, action: &mut Option<OperationAction>) {
+    let stack = &model.stack;
+    let mut section = None;
+    for operation in stack.ops() {
+        if section != Some(operation.op.section()) {
+            section = Some(operation.op.section());
+            let heading = match operation.op.section() {
+                Section::Geometry => "Geometry (model space, reorderable)",
+                Section::Orientation => "Orientation",
+                Section::PrintPrep => "Print preparation (on the bed)",
+            };
+            ui.add_space(4.0);
+            ui.weak(heading);
+        }
+        ui.horizontal(|ui| {
+            let name = RichText::new(operation.op.name());
+            let name = match operation.bypassed {
+                true => name.strikethrough().weak(),
+                false => name,
+            };
+            let nodes: Vec<_> = (operation.op.nodes().iter())
+                .map(|n| match n.section() {
+                    Section::Geometry => format!("{} (model space)", n.name()),
+                    Section::Orientation => n.name().to_owned(),
+                    Section::PrintPrep => format!("{} (on the bed)", n.name()),
+                })
+                .collect();
+            ui.label(name)
+                .on_hover_text(format!("Evaluated as: {}.", nodes.join(", then ")));
+            let badge = match (&operation.op, operation.mode) {
+                (Op::Orient(_), Mode::Edited) => "Manual",
+                (_, mode) => mode.name(),
+            };
+            ui.small(format!("[{badge}]")).on_hover_text(MODE_TIP);
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                operation_buttons(ui, stack, operation, true, action);
+            });
+        });
+        if let Some(stats) = model.repair_stats(operation.id)
+            && operation.active()
+        {
+            let found: Vec<_> = (stats.rows().into_iter())
+                .filter(|(_, n)| *n > 0)
+                .map(|(name, n)| format!("{n} {}", name.to_lowercase()))
+                .collect();
+            match found.is_empty() {
+                true => ui.weak("  No defects found."),
+                false => ui.weak(format!("  Repaired {}.", found.join(", "))),
+            };
+        }
+    }
+}
+
+/// The buttons of an operation row, right to left: remove, freeze, bypass,
+/// and (with `reorder`) the arrows.
+pub fn operation_buttons(
+    ui: &mut Ui,
+    stack: &Stack,
+    operation: &Operation,
+    reorder: bool,
+    action: &mut Option<OperationAction>,
+) {
+    let op = operation.id;
+    if operation.op.can_remove() && ui.small_button(TRASH).on_hover_text("Remove").clicked() {
+        *action = Some(OperationAction::Remove(op));
+    }
+    let frozen = operation.mode == Mode::Frozen;
+    if ui
+        .selectable_label(frozen, SNOWFLAKE)
+        .on_hover_text(FREEZE_TIP)
+        .clicked()
+    {
+        *action = Some(OperationAction::Freeze(op, !frozen));
+    }
+    if operation.op.can_bypass() {
+        let label = if operation.bypassed { EYE_SLASH } else { EYE };
+        if ui.small_button(label).on_hover_text(BYPASS_TIP).clicked() {
+            *action = Some(OperationAction::Bypass(op, !operation.bypassed));
+        }
+    }
+    if reorder && stack.can_move(op, 1) && ui.small_button(ARROW_DOWN).clicked() {
+        *action = Some(OperationAction::Move(op, 1));
+    }
+    if reorder && stack.can_move(op, -1) && ui.small_button(ARROW_UP).clicked() {
+        *action = Some(OperationAction::Move(op, -1));
+    }
+}
+
+/// The "Add Operation" menu: the operation picked, if any.
+pub fn add_operation_menu(ui: &mut Ui, stack: &Stack) -> Option<Op> {
+    let mut picked = None;
+    ui.menu_button(concatcp!(PLUS, " Add Operation"), |ui| {
+        let options = [
+            (Op::Repair(Repair::default()), "Repairs the mesh: welds vertices, removes bad faces, closes holes, fixes the winding."),
+            (Op::FlipWinding, "Turns every face inside out."),
+            (Op::Hollow(Default::default()), "Hollows the model (see the Hollowing panel)."),
+            (Op::Supports(Default::default()), "Supports (see the Supports panel)."),
+        ];
+        for (op, tip) in options {
+            let exists = op.is_singleton()
+                && (stack.ops().iter()).any(|o| o.op.name() == op.name());
+            let button = ui.add_enabled(!exists, Button::new(op.name()));
+            if button.on_hover_text(tip).clicked() {
+                picked = Some(op);
+                ui.close();
+            }
+        }
+    });
+    picked
+}
+
+/// Adds an operation picked from [`add_operation_menu`].
+pub fn add_operation(app: &mut App, id: ModelId, op: Op) {
+    apply(app, id, Some(OperationAction::Add(op)));
+}
+
+pub fn apply(app: &mut App, id: ModelId, action: Option<OperationAction>) {
+    match action {
+        Some(OperationAction::Add(Op::Hollow(_))) => stack::set_hollowed(stack::of(app), id, true),
+        Some(OperationAction::Add(op)) => {
+            stack::add(stack::of(app), id, op);
+        }
+        Some(OperationAction::Remove(op)) => stack::remove(stack::of(app), id, op),
+        Some(OperationAction::Move(op, by)) => stack::move_by(stack::of(app), id, op, by),
+        Some(OperationAction::Bypass(op, on)) => stack::set_bypassed(stack::of(app), id, op, on),
+        Some(OperationAction::Freeze(op, on)) => stack::set_frozen(stack::of(app), id, op, on),
+        None => {}
+    }
 }
 
 fn rad_to_deg(pos: Vector3<f32>) -> Vector3<f32> {

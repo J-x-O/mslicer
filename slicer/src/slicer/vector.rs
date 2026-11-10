@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 
 use common::{
     progress::Progress,
@@ -56,10 +56,15 @@ impl Slicer {
 // i'm doing.
 fn join_segments(segments_raw: &[Vector2<f32>]) -> Vec<Vec<Vector2<f32>>> {
     const DISTANCE_CUTOFF: f32 = 0.5;
+    type Point = [OrderedFloat<f32>; 2];
+    let key = |v: &Vector2<f32>| -> Point { [OrderedFloat(v.x), OrderedFloat(v.y)] };
+    let point = |p: &Point| Vector2::new(*p[0], *p[1]);
 
-    let mut segments = HashSet::new();
+    // Ordered, so the result doesn't depend on hashing: the same layer
+    // always gives the same polygons.
+    let mut segments = BTreeSet::new();
     for segment in segments_raw.chunks_exact(2) {
-        segments.insert((segment[0].map(OrderedFloat), segment[1].map(OrderedFloat)));
+        segments.insert((key(&segment[0]), key(&segment[1])));
     }
 
     let mut polygons = Vec::new();
@@ -67,21 +72,30 @@ fn join_segments(segments_raw: &[Vector2<f32>]) -> Vec<Vec<Vector2<f32>>> {
         let idx = polygons.len();
         polygons.push(Vec::new());
 
-        let mut last = start.1;
+        let mut last = point(&start.1);
         while let Some((x @ (a, b), [a_dist, b_dist])) = segments
             .iter()
-            .map(|x @ (a, b)| (x, [a, b].map(|x| (last - x).map(|x| *x).magnitude())))
+            .map(|x @ (a, b)| (x, [a, b].map(|p| (last - point(p)).magnitude())))
             .min_by_key(|(_, [a, b])| OrderedFloat(a.min(*b)))
         {
             let next = if a_dist < b_dist { b } else { a };
-            if *next == start.1 || (a_dist > DISTANCE_CUTOFF && b_dist > DISTANCE_CUTOFF) {
-                segments.remove(&{ *x });
+            let x = *x;
+            if *next == start.1 {
+                // Back where the walk started: that point closes the
+                // polygon, and belongs to it.
+                polygons[idx].push(point(next));
+                segments.remove(&x);
+                break;
+            }
+            if a_dist > DISTANCE_CUTOFF && b_dist > DISTANCE_CUTOFF {
+                segments.remove(&x);
                 break;
             }
 
-            polygons[idx].push(next.map(|x| *x));
-            last = *next;
-            segments.remove(&{ *x });
+            let next = point(next);
+            polygons[idx].push(next);
+            last = next;
+            segments.remove(&x);
         }
     }
 
@@ -163,5 +177,36 @@ impl SlicedFile for SvgFile {
 
     fn previews(&self) -> Vec<image::RgbaImage> {
         vec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nalgebra::Vector2;
+
+    use super::join_segments;
+
+    #[test]
+    fn a_square_keeps_all_four_corners_whatever_the_order() {
+        let v = |x: f32, y: f32| Vector2::new(x, y);
+        let edges = [
+            [v(0.0, 0.0), v(10.0, 0.0)],
+            [v(10.0, 0.0), v(10.0, 10.0)],
+            [v(10.0, 10.0), v(0.0, 10.0)],
+            [v(0.0, 10.0), v(0.0, 0.0)],
+        ];
+        let mut first = None;
+        for rotate in 0..4 {
+            let mut segments = Vec::new();
+            for i in 0..4 {
+                segments.extend(edges[(i + rotate) % 4]);
+            }
+            let polygons = join_segments(&segments);
+            assert_eq!(polygons.len(), 1);
+            let mut corners = polygons[0].clone();
+            assert_eq!(corners.len(), 4, "{corners:?}");
+            corners.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+            assert_eq!(*first.get_or_insert(corners.clone()), corners);
+        }
     }
 }

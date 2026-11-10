@@ -76,32 +76,32 @@ impl MultiFileDialog {
 
 impl Task for FileDialog {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
-        let result = self.promise.ready();
-        if let Some(data) = result
-            && let Some(handle) = data
-        {
-            let path = handle.path();
-            let mut tasks = Vec::new();
-            self.func.take().unwrap()(app, path, &mut tasks);
-            PollResult::complete().with_tasks(tasks)
-        } else {
-            PollResult::pending()
-        }
+        let Some(data) = self.promise.ready() else {
+            return PollResult::pending();
+        };
+        // Cancelled, or already handled.
+        let (Some(handle), Some(func)) = (data, self.func.take()) else {
+            return PollResult::complete();
+        };
+        let path = handle.path();
+        let mut tasks = Vec::new();
+        func(app, path, &mut tasks);
+        PollResult::complete().with_tasks(tasks)
     }
 }
 
 impl Task for MultiFileDialog {
     fn poll(&mut self, app: &mut TaskApp) -> PollResult {
-        let result = self.promise.ready();
-        if let Some(data) = result
-            && let Some(handle) = data
-        {
-            let paths = handle.iter().map(|x| x.path()).collect();
-            let mut tasks = Vec::new();
-            self.func.take().unwrap()(app, paths, &mut tasks);
-            PollResult::complete().with_tasks(tasks)
-        } else {
-            PollResult::pending()
-        }
+        let Some(data) = self.promise.ready() else {
+            return PollResult::pending();
+        };
+        // Cancelled, or already handled.
+        let (Some(handle), Some(func)) = (data, self.func.take()) else {
+            return PollResult::complete();
+        };
+        let paths = handle.iter().map(|x| x.path()).collect();
+        let mut tasks = Vec::new();
+        func(app, paths, &mut tasks);
+        PollResult::complete().with_tasks(tasks)
     }
 }

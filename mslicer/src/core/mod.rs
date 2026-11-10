@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Instant};
+use std::path::PathBuf;
 
 use egui::{Context, Theme, ViewportCommand, Visuals};
 use egui_tracing::EventCollector;
@@ -30,13 +30,16 @@ use crate::{
 };
 
 pub mod config;
+pub mod focus;
 pub mod history;
 pub mod hollow;
 pub mod islands;
+pub mod issues;
 pub mod palette;
 pub mod project;
 pub mod selected;
 pub mod slice;
+pub mod stack;
 pub mod state;
 
 pub struct App {
@@ -115,13 +118,6 @@ impl App {
     /// is on, starts building acceleration structures for every model that
     /// lacks them.
     fn prepare_models(&mut self) {
-        for model in &mut self.project.models {
-            if model.supports.take_removed_by_move() {
-                let text = format!("Supports of `{}` removed. Ctrl+Z to undo.", model.name);
-                self.state.notice = Some((text, Instant::now()));
-            }
-        }
-
         // A move that clears a model's supports leaves their selection behind.
         let models = &self.project.models;
         // Only the selected models' supports can be selected.
@@ -202,6 +198,7 @@ impl eframe::App for App {
         self.popup().render(ctx);
         self.tasks().poll();
         islands::update(self);
+        stack::update(self);
         hollow::update(self);
 
         // todo: only update the visuals if the theme has changed?

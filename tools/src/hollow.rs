@@ -56,12 +56,14 @@ pub struct Cavity {
 }
 
 /// One void of a cavity.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CavityPart {
     pub volume: f32,
     pub lowest: Vector3<f32>,
     pub min: Vector3<f32>,
     pub max: Vector3<f32>,
+    /// The part's vertices in the cavity's vertex list.
+    pub vertices: std::ops::Range<usize>,
 }
 
 /// A round hole drilled into a model.
@@ -1310,6 +1312,7 @@ fn into_parts(vertices: Vec<Vector3<f32>>, mut faces: Vec<[u32; 3]>, cell: f32) 
             lowest: Vector3::repeat(f32::MAX),
             min: Vector3::repeat(f32::MAX),
             max: Vector3::repeat(f32::MIN),
+            vertices: 0..0,
         };
         let first = cavity.vertices.len();
         for face in part_faces {
@@ -1325,6 +1328,7 @@ fn into_parts(vertices: Vec<Vector3<f32>>, mut faces: Vec<[u32; 3]>, cell: f32) 
             }));
         }
         part.lowest = lowest(&cavity.vertices[first..], part.min.z + cell);
+        part.vertices = first..cavity.vertices.len();
         cavity.parts.push(part);
     }
     cavity
@@ -1486,7 +1490,7 @@ mod tests {
         let mesh = cube(20.0);
         let cavity = cavity(&mesh, 2.0, 0.5, 2.0, &Progress::new());
         assert_eq!(cavity.parts.len(), 1);
-        let part = cavity.parts[0];
+        let part = cavity.parts[0].clone();
         // A 16 mm cube, rounded a little at its edges by the sampling.
         assert!(
             (part.volume - 4096.0).abs() < 4096.0 * 0.06,
@@ -1527,7 +1531,7 @@ mod tests {
         let mut mesh = cube(20.0);
         mesh.set_position(Vector3::new(50.0, -30.0, 5.0));
         let cavity = cavity(&mesh, 2.0, 0.5, 2.0, &Progress::new());
-        let part = cavity.parts[0];
+        let part = cavity.parts[0].clone();
         let center = (part.min + part.max) / 2.0;
         let expected = mesh.transform(&Vector3::repeat(10.0));
         assert!((center - expected).norm() < 0.3, "{center} vs {expected}");

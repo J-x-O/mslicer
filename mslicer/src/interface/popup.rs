@@ -65,6 +65,17 @@ impl PopupManager {
 
         self.popups.push(popup);
     }
+
+    /// Passes on the value, or shows the error in a popup.
+    pub fn report<T>(&mut self, title: &str, result: anyhow::Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(e) => {
+                self.open(Popup::simple(title, PopupIcon::Error, format!("{e:#}")));
+                None
+            }
+        }
+    }
 }
 
 impl<'a> PopupManagerRef<'a> {
@@ -305,4 +316,19 @@ pub fn confirm_unsaved(
 
             cancel || dont_save || save
         }));
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::PopupManager;
+
+    #[test]
+    fn a_reported_error_opens_one_popup() {
+        let mut popups = PopupManager::default();
+        assert_eq!(popups.report("Title", Ok(3)), Some(3));
+        assert_eq!(popups.report::<()>("Title", Err(anyhow!("broken"))), None);
+        assert_eq!(popups.popups.len(), 1);
+    }
 }

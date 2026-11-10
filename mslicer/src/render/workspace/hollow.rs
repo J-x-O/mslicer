@@ -18,7 +18,7 @@ use wgpu::{
 
 use crate::{
     core::{
-        App,
+        App, focus,
         hollow::HoleRef,
         project::{
             hollow::ModelCavity,
@@ -315,12 +315,12 @@ impl CavityPass {
         self.shown = app.panels.find_tab(&Tab::Hollow).is_some();
         let cut = app.state.cut_height.unwrap_or(f32::MAX);
         let wanted: Vec<_> = (app.project.models.iter())
-            .filter(|m| !m.hidden)
+            .filter(|m| !m.hidden && !focus::hidden(app.state.show_up_to, m).hollow)
             .filter_map(|m| {
                 // The last cavity, even while a new one is computed: it is in
                 // the model's coordinates, so it follows a move or a scale.
-                m.hollow.spec.shell?;
-                let cavity = m.hollow.cavity.clone()?;
+                m.hollow_shell()?;
+                let cavity = m.hollow.cavity.latest().cloned()?;
                 Some((m.id, cavity, m))
             })
             .collect();
@@ -361,7 +361,7 @@ impl CavityPass {
             let color = accent.push(CAVITY_ALPHA);
             (self.cavities[index].batch).uniform(gcx, (view, matrix), local, color, cut);
 
-            if let Some((mesh, faces)) = model.supports.mesh() {
+            if let Some((mesh, faces)) = model.active_supports().and_then(|s| s.mesh().as_ref()) {
                 let at = match self.supports.iter().position(|g| g.model == id) {
                     Some(at) => at,
                     None => {
@@ -449,9 +449,10 @@ fn gather(app: &App) -> Holes {
         picked: Shape::default(),
         failed: Shape::default(),
     };
-    for model in app.project.models.iter().filter(|m| !m.hidden) {
+    let shown = |m: &&Model| !m.hidden && !focus::hidden(app.state.show_up_to, m).hollow;
+    for model in app.project.models.iter().filter(shown) {
         // Holes drain a cavity: only a hollowed model has them.
-        let Some(shell) = model.hollow.spec.shell else {
+        let Some(shell) = model.hollow_shell() else {
             continue;
         };
         for (index, hole) in model.hollow.spec.holes.iter().enumerate() {

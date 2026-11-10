@@ -6,12 +6,15 @@ use egui::{
     Align, Align2, Button, Context, FontId, Frame, Grid, Id, Layout, PopupAnchor, ProgressBar,
     Stroke, StrokeKind, TopBottomPanel, Ui, vec2,
 };
-use egui_phosphor::regular::{CARDS, FILE_TEXT, GIT_DIFF, HAMMER, HOURGLASS, LIFEBUOY, STACK};
+use egui_phosphor::regular::{
+    CARDS, CHECK_CIRCLE, FILE_TEXT, GIT_DIFF, HAMMER, HOURGLASS, LIFEBUOY, STACK, WARNING_CIRCLE,
+};
 
 #[cfg(windows)]
 use crate::system::windows::launch_install;
 use crate::{
-    core::{App, project::Collection},
+    core::{App, project::Collection, slice::key::slice_key},
+    engine::Status,
     interface::{
         components::{labeled_separator, link_button},
         panels::Tab,
@@ -86,7 +89,7 @@ pub fn ui(app: &mut App, ctx: &Context) {
                         ui.menu_button("Recent", |ui| {
                             let mut load = None;
                             for path in app.config.recent_projects.iter() {
-                                let name = path.file_name().unwrap().to_string_lossy();
+                                let name = crate::task::file_name(path);
                                 if ui.button(name).clicked() {
                                     ui.close();
                                     load = Some(path.clone());
@@ -227,6 +230,7 @@ pub fn ui(app: &mut App, ctx: &Context) {
                     );
                     slice_button.clicked().then(|| app.slice());
                 });
+                live_status(app, ui);
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(2.0);
@@ -275,6 +279,39 @@ fn actions_menu(app: &mut App, ui: &mut Ui) {
         ui.close();
         app.history().undo_to(index);
     }
+}
+
+/// Up to date, computing or stale: whether what is shown matches the
+/// project, with the details on hover.
+fn live_status(app: &App, ui: &mut Ui) {
+    let mut status = Status::of(&app.project);
+    status.add(app.state.layer_preview.state());
+    let rerouting = (app.project.models.iter()).any(|m| m.supports.needs_reroute());
+    let sliced = (app.slice_operation.as_ref()).and_then(|op| op.key);
+    let slice = match sliced {
+        None => "not sliced yet",
+        Some(key) if key == slice_key(&app.project) => "up to date",
+        Some(_) => "outdated",
+    };
+
+    let (icon, text) = if status.computing > 0 || app.is_slicing() {
+        (HOURGLASS, "Computing")
+    } else if status.stale > 0 || rerouting {
+        (WARNING_CIRCLE, "Stale")
+    } else {
+        (CHECK_CIRCLE, "Up to date")
+    };
+    ui.weak(format!("{icon} {text}")).on_hover_ui(|ui| {
+        ui.label(format!(
+            "Results computing: {}",
+            status.computing + app.is_slicing() as usize
+        ));
+        ui.label(format!("Results waiting: {}", status.stale));
+        if rerouting {
+            ui.label("Supports wait to be re-routed after a change.");
+        }
+        ui.label(format!("Full slice: {slice}"));
+    });
 }
 
 fn tasks_button(app: &mut App, ctx: &Context, ui: &mut Ui) {
